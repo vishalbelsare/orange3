@@ -16,9 +16,10 @@ import scipy.stats as ss
 import scipy.sparse as sp
 from AnyQt.QtCore import Qt, QSize, QRectF, QModelIndex, pyqtSlot, \
     QItemSelection, QItemSelectionRange, QItemSelectionModel
-from AnyQt.QtGui import QPainter, QColor
+from AnyQt.QtGui import QPainter, QColor, QPalette, QFontMetrics
 from AnyQt.QtWidgets import QStyledItemDelegate, QGraphicsScene, QTableView, \
-    QHeaderView, QStyle, QStyleOptionViewItem
+    QHeaderView, QStyle, QStyleOptionViewItem, \
+    QGraphicsView, QGraphicsItemGroup
 
 import Orange.statistics.util as ut
 from Orange.data import Table, StringVariable, DiscreteVariable, \
@@ -31,6 +32,8 @@ from Orange.widgets.settings import Setting, ContextSetting, \
 from Orange.widgets.utils.itemmodels import DomainModel, AbstractSortTableModel
 from Orange.widgets.utils.signals import Input, Output
 from Orange.widgets.utils.widgetpreview import WidgetPreview
+from Orange.widgets.visualize.utils import CanvasRectangle, CanvasText
+from Orange.widgets.visualize.utils.plotutils import wrap_legend_items
 
 
 def _categorical_entropy(x):
@@ -84,19 +87,19 @@ def format_time_diff(start, end, round_up_after=2):
 
     # Check which resolution is most appropriate
     if years >= round_up_after:
-        return '~%d years' % years
+        return f'~{years} years'
     elif months >= round_up_after:
-        return '~%d months' % months
+        return f'~{months} months'
     elif weeks >= round_up_after:
-        return '~%d weeks' % weeks
+        return f'~{weeks} weeks'
     elif days >= round_up_after:
-        return '~%d days' % days
+        return f'~{days} days'
     elif hours >= round_up_after:
-        return '~%d hours' % hours
+        return f'~{hours} hours'
     elif minutes >= round_up_after:
-        return '~%d minutes' % minutes
+        return f'~{minutes} minutes'
     else:
-        return '%d seconds' % seconds
+        return f'{seconds} seconds'
 
 
 class FeatureStatisticsTableModel(AbstractSortTableModel):
@@ -110,8 +113,8 @@ class FeatureStatisticsTableModel(AbstractSortTableModel):
     HIDDEN_VAR_TYPES = (StringVariable,)
 
     class Columns(IntEnum):
-        ICON, NAME, DISTRIBUTION, CENTER, MEDIAN, DISPERSION, MIN, MAX, \
-        MISSING = range(9)
+        ICON, NAME, DISTRIBUTION, CENTER, MODE, MEDIAN, DISPERSION, MIN, MAX, \
+        MISSING = range(10)
 
         @property
         def name(self):
@@ -119,6 +122,7 @@ class FeatureStatisticsTableModel(AbstractSortTableModel):
                     self.NAME: 'Name',
                     self.DISTRIBUTION: 'Distribution',
                     self.CENTER: 'Mean',
+                    self.MODE: 'Mode',
                     self.MEDIAN: 'Median',
                     self.DISPERSION: 'Dispersion',
                     self.MIN: 'Min.',
@@ -159,7 +163,8 @@ class FeatureStatisticsTableModel(AbstractSortTableModel):
 
         no_data = np.array([])
         self._variable_types = self._variable_names = no_data
-        self._min = self._max = self._center = self._median = no_data
+        self._min = self._max = no_data
+        self._center = self._median = self._mode = no_data
         self._dispersion = no_data
         self._missing = no_data
         # Clear model initially to set default values
@@ -227,7 +232,7 @@ class FeatureStatisticsTableModel(AbstractSortTableModel):
 
     def __filter_attributes(self, attributes, matrix):
         """Filter out variables which shouldn't be visualized."""
-        attributes, matrix = np.asarray(attributes), matrix
+        attributes = np.asarray(attributes)
         mask = [idx for idx, attr in enumerate(attributes)
                 if not isinstance(attr, self.HIDDEN_VAR_TYPES)]
         return attributes[mask], matrix[:, mask]
@@ -283,59 +288,54 @@ class FeatureStatisticsTableModel(AbstractSortTableModel):
             time_f=lambda x: ut.nanmean(x, axis=0),
         )
 
-        self._median = self.__compute_stat(
+        self._mode = self.__compute_stat(
             matrices,
             discrete_f=lambda x: __mode(x, axis=0),
+            continuous_f=lambda x: __mode(x, axis=0),
+            time_f=lambda x: __mode(x, axis=0),
+        )
+
+        self._median = self.__compute_stat(
+            matrices,
+            discrete_f=None,
             continuous_f=lambda x: ut.nanmedian(x, axis=0),
             time_f=lambda x: ut.nanmedian(x, axis=0),
         )
 
-    def get_statistics_matrix(self, variables=None, return_labels=False):
-        """Get the numeric computed statistics in a single matrix. Optionally,
-        we can specify for which variables we want the stats. Also, we can get
-        the string column names as labels if desired.
+    def get_statistics_table(self):
+        """Get the numeric computed statistics in a single matrix."""
+        if self.table is None or not self.rowCount():
+            return None
 
-        Parameters
-        ----------
-        variables : Iterable[Union[Variable, int, str]]
-            Return statistics for only the variables specified. Accepts all
-            formats supported by `domain.index`
-        return_labels : bool
-            In addition to the statistics matrix, also return string labels for
-            the columns of the matrix e.g. 'Mean' or 'Dispersion', as specified
-            in `Columns`.
+        # don't match TimeVariable, pylint: disable=unidiomatic-typecheck
+        contivars = [type(var) is ContinuousVariable for var in self.variables]
+        if any(contivars):
+            def c(column):
+                return np.choose(contivars, [np.nan, column])
 
-        Returns
-        -------
-        Union[Tuple[List[str], np.ndarray], np.ndarray]
-
-        """
-        if self.table is None:
-            return np.atleast_2d([])
-
-        # If a list of variables is given, select only corresponding stats
-        # variables can be a list or array, pylint: disable=len-as-condition
-        if variables is not None and len(variables) != 0:
-            indices = [self.domain.index(var) for var in variables]
+            x = np.vstack((
+                c(self._center), c(self._median), self._dispersion,
+                c(self._min), c(self._max), self._missing,
+            )).T
+            attrs = [ContinuousVariable(column.name) for column in (
+                self.Columns.CENTER, self.Columns.MEDIAN,
+                self.Columns.DISPERSION,
+                self.Columns.MIN, self.Columns.MAX, self.Columns.MISSING)]
         else:
-            indices = ...
+            x = np.vstack((self._dispersion, self._missing)).T
+            attrs = [ContinuousVariable(name)
+                     for name in ("Entropy", self.Columns.MISSING.name)]
 
-        matrix = np.vstack((
-            self._center[indices], self._median[indices],
-            self._dispersion[indices],
-            self._min[indices], self._max[indices], self._missing[indices],
-        )).T
+        names = [var.name for var in self.variables]
+        modes = [var.str_val(val)
+                 for var, val in zip(self.variables, self._mode)]
+        metas = np.vstack((names, modes)).T
+        meta_attrs = [StringVariable('Feature'), StringVariable('Mode')]
 
-        # Return string labels for the returned matrix columns e.g. 'Mean',
-        # 'Dispersion' if requested
-        if return_labels:
-            labels = [self.Columns.CENTER.name, self.Columns.MEDIAN.name,
-                      self.Columns.DISPERSION.name,
-                      self.Columns.MIN.name, self.Columns.MAX.name,
-                      self.Columns.MISSING.name]
-            return labels, matrix
-
-        return matrix
+        domain = Domain(attributes=attrs, metas=meta_attrs)
+        statistics = Table.from_numpy(domain, x, metas=metas)
+        statistics.name = f'{self.table.name} (Feature Statistics)'
+        return statistics
 
     def __compute_stat(self, matrices, discrete_f=None, continuous_f=None,
                        time_f=None, string_f=None, default_val=np.nan):
@@ -418,6 +418,13 @@ class FeatureStatisticsTableModel(AbstractSortTableModel):
         elif column == self.Columns.CENTER:
             # Sorting discrete or string values by mean makes no sense
             vals = np.array(self._center)
+            vals[disc_idx] = var_name_indices[disc_idx]
+            vals[str_idx] = var_name_indices[str_idx]
+            return np.vstack((var_types_indices, np.zeros_like(vals), vals)).T
+        # Sort by: (type, mode)
+        elif column == self.Columns.MODE:
+            # Sorting discrete or string values by mode makes no sense
+            vals = np.array(self._mode)
             vals[disc_idx] = var_name_indices[disc_idx]
             vals[str_idx] = var_name_indices[str_idx]
             return np.vstack((var_types_indices, np.zeros_like(vals), vals)).T
@@ -562,6 +569,7 @@ class FeatureStatisticsTableModel(AbstractSortTableModel):
                             variable=attribute,
                             color_attribute=self.target_var,
                             border=(0, 0, 2, 0),
+                            bottom_padding=4,
                             border_color='#ccc',
                         )
                         scene.addItem(histogram)
@@ -569,13 +577,15 @@ class FeatureStatisticsTableModel(AbstractSortTableModel):
                     return self.__distributions_cache[row]
             elif column == self.Columns.CENTER:
                 return render_value(self._center[row])
+            elif column == self.Columns.MODE:
+                return render_value(self._mode[row])
             elif column == self.Columns.MEDIAN:
                 return render_value(self._median[row])
             elif column == self.Columns.DISPERSION:
                 if isinstance(attribute, TimeVariable):
                     return format_time_diff(self._min[row], self._max[row])
                 elif isinstance(attribute, DiscreteVariable):
-                    return "%.3g" % self._dispersion[row]
+                    return f"{self._dispersion[row]:.3g}"
                 else:
                     return render_value(self._dispersion[row])
             elif column == self.Columns.MIN:
@@ -585,10 +595,9 @@ class FeatureStatisticsTableModel(AbstractSortTableModel):
                 if not isinstance(attribute, DiscreteVariable):
                     return render_value(self._max[row])
             elif column == self.Columns.MISSING:
-                return '%d (%d%%)' % (
-                    self._missing[row],
-                    100 * self._missing[row] / self.n_instances
-                )
+                missing = self._missing[row]
+                perc = int(round(100 * missing / self.n_instances))
+                return f'{missing} ({perc} %)'
             return None
 
         roles = {Qt.BackgroundRole: background,
@@ -680,7 +689,7 @@ class FeatureStatisticsTableView(QTableView):
         if logical_index is not self.model().Columns.DISTRIBUTION.index:
             return
         ratio_width, ratio_height = self.HISTOGRAM_ASPECT_RATIO
-        unit_width = new_size / ratio_width
+        unit_width = new_size // ratio_width
         new_height = unit_width * ratio_height
         effective_height = max(new_height, self.MINIMUM_HISTOGRAM_HEIGHT)
         effective_height = min(effective_height, self.MAXIMUM_HISTOGRAM_HEIGHT)
@@ -752,13 +761,29 @@ class OWFeatureStatistics(widget.OWWidget):
 
         self.data = None  # type: Optional[Table]
 
-        # Main area
         self.model = FeatureStatisticsTableModel(parent=self)
         self.table_view = FeatureStatisticsTableView(self.model, parent=self)
         self.table_view.selectionModel().selectionChanged.connect(self.on_select)
         self.table_view.horizontalHeader().sectionClicked.connect(self.on_header_click)
 
-        self.controlArea.layout().addWidget(self.table_view)
+        box = gui.vBox(self.controlArea)
+        box.setContentsMargins(0, 0, 0, 4)
+        pal = QPalette()
+        pal.setColor(QPalette.Window,
+                     self.table_view.palette().color(QPalette.Base))
+        box.setAutoFillBackground(True)
+        box.setPalette(pal)
+
+        box.layout().addWidget(self.table_view)
+
+        self.legend_items = []
+        self.legend = QGraphicsScene()
+        self.legend_view = u = QGraphicsView(self.legend)
+        u.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing)
+        u.setFrameStyle(QGraphicsView.NoFrame)
+        u.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        u.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        box.layout().addWidget(u)
 
         self.color_var_model = DomainModel(
             valid_types=(ContinuousVariable, DiscreteVariable),
@@ -775,8 +800,12 @@ class OWFeatureStatistics(widget.OWWidget):
         gui.auto_send(self.buttonsArea, self, "auto_commit")
 
     @staticmethod
-    def sizeHint():
+    def sizeHint():  # pylint: disable=arguments-differ
         return QSize(1050, 500)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update_legend()
 
     @Inputs.data
     def set_data(self, data):
@@ -805,7 +834,8 @@ class OWFeatureStatistics(widget.OWWidget):
         self.__restore_sorting()
         self.__color_var_changed()
 
-        self.commit()
+        self.commit_statistics()
+        self.commit.now()
 
     def __restore_selection(self):
         """Restore the selection on the table view from saved settings."""
@@ -839,33 +869,64 @@ class OWFeatureStatistics(widget.OWWidget):
     def __color_var_changed(self, *_):
         if self.model is not None:
             self.model.set_target_var(self.color_var)
+            self.update_legend_items()
+            self.update_legend()
+
+    def update_legend_items(self):
+        self.legend.clear()
+        if self.color_var is None or not self.color_var.is_discrete:
+            self.legend_items = []
+            return
+        self.legend_items = []
+        size = QFontMetrics(self.font()).height()
+        for name, color in zip(self.color_var.values, self.color_var.palette.qcolors):
+            item = QGraphicsItemGroup()
+            item.addToGroup(
+                CanvasRectangle(None, -size / 2, -size / 2, size, size,
+                                Qt.gray, color))
+            item.addToGroup(
+                CanvasText(None, name, size, 0, Qt.AlignVCenter))
+            self.legend_items.append(item)
+
+    def update_legend(self):
+        view = self.legend_view
+
+        if not self.legend_items:
+            self.legend.clear()
+            view.hide()
+            return
+
+        size = QFontMetrics(self.font()).height()
+        legend = wrap_legend_items(
+            self.legend_items,
+            self.width() - 30, size, size * 1.75)
+        self.legend.addItem(legend)
+        legend.setPos(15, 0)
+        view.setFixedHeight(int(legend.boundingRect().height()) + size)
+        view.show()
 
     def on_select(self):
         selection_indices = list(self.model.mapToSourceRows([
             i.row() for i in self.table_view.selectionModel().selectedRows()
         ]))
         self.selected_vars = list(self.model.variables[selection_indices])
-        self.commit()
+        self.commit.deferred()
 
+    @gui.deferred
     def commit(self):
         if not self.selected_vars:
             self.Outputs.reduced_data.send(None)
+        else:
+            # Send a table with only selected columns to output
+            self.Outputs.reduced_data.send(self.data[:, self.selected_vars])
+
+    def commit_statistics(self):
+        if not self.data:
             self.Outputs.statistics.send(None)
             return
 
-        # Send a table with only selected columns to output
-        variables = self.selected_vars
-        self.Outputs.reduced_data.send(self.data[:, variables])
-
         # Send the statistics of the selected variables to ouput
-        labels, data = self.model.get_statistics_matrix(variables, return_labels=True)
-        var_names = np.atleast_2d([var.name for var in variables]).T
-        domain = Domain(
-            attributes=[ContinuousVariable(name) for name in labels],
-            metas=[StringVariable('Feature')]
-        )
-        statistics = Table(domain, data, metas=var_names)
-        statistics.name = '%s (Feature Statistics)' % self.data.name
+        statistics = self.model.get_statistics_table()
         self.Outputs.statistics.send(statistics)
 
     def send_report(self):

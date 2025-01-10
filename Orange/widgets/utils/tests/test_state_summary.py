@@ -1,13 +1,22 @@
 import unittest
+from unittest.mock import patch, Mock
 import datetime
 from collections import namedtuple
 
 import numpy as np
 
+from AnyQt.QtCore import Qt
+from AnyQt.QtWidgets import QTableView
+
+from orangecanvas.scheme.signalmanager import LazyValue
+from orangewidget.utils.signals import summarize
+
 from Orange.data import Table, Domain, StringVariable, ContinuousVariable, \
     DiscreteVariable, TimeVariable
+from Orange.misc import DistMatrix
+from Orange.widgets.tests.base import WidgetTest
 from Orange.widgets.utils.state_summary import format_summary_details, \
-    format_multiple_summaries
+    format_multiple_summaries, summarize_matrix
 
 VarDataPair = namedtuple('VarDataPair', ['variable', 'data'])
 
@@ -101,17 +110,24 @@ def make_table(attributes, target=None, metas=None):
 
 
 class TestUtils(unittest.TestCase):
+    @WidgetTest.skipNonEnglish
     def test_details(self):
         """Check if details part of the summary is formatted correctly"""
         data = Table('zoo')
         n_features = len(data.domain.variables) + len(data.domain.metas)
-        details = f'zoo: {len(data)} instance, ' \
+        details = f'zoo: {len(data)} instances, ' \
                   f'{n_features} variables\n' \
                   f'Features: {len(data.domain.attributes)} categorical ' \
                   f'(no missing values)\n' \
                   f'Target: categorical\n' \
                   f'Metas: string'
         self.assertEqual(details, format_summary_details(data))
+
+        details = f'Table with {n_features} variables\n' \
+                  f'Features: {len(data.domain.attributes)} categorical\n' \
+                  f'Target: categorical\n' \
+                  f'Metas: string'
+        self.assertEqual(details, format_summary_details(data.domain))
 
         data = Table('housing')
         n_features = len(data.domain.variables) + len(data.domain.metas)
@@ -136,7 +152,7 @@ class TestUtils(unittest.TestCase):
             target=[rgb_full, rgb_missing], metas=[ints_full, ints_missing]
         )
         n_features = len(data.domain.variables) + len(data.domain.metas)
-        details = f'{len(data)} instances, ' \
+        details = f'Table with {len(data)} instances, ' \
                   f'{n_features} variables\n' \
                   f'Features: {len(data.domain.attributes)} numeric ' \
                   f'(10.0% missing values)\n' \
@@ -150,7 +166,7 @@ class TestUtils(unittest.TestCase):
             metas=[string_full, string_missing]
         )
         n_features = len(data.domain.variables) + len(data.domain.metas)
-        details = f'{len(data)} instances, ' \
+        details = f'Table with {len(data)} instances, ' \
                   f'{n_features} variables\n' \
                   f'Features: {len(data.domain.attributes)} ' \
                   f'(2 categorical, 1 numeric, 1 time) (5.0% missing values)\n' \
@@ -161,7 +177,7 @@ class TestUtils(unittest.TestCase):
 
         data = make_table([time_full, time_missing], target=[ints_missing],
                           metas=None)
-        details = f'{len(data)} instances, ' \
+        details = f'Table with {len(data)} instances, ' \
                   f'{len(data.domain.variables)} variables\n' \
                   f'Features: {len(data.domain.attributes)} time ' \
                   f'(10.0% missing values)\n' \
@@ -169,7 +185,7 @@ class TestUtils(unittest.TestCase):
         self.assertEqual(details, format_summary_details(data))
 
         data = make_table([rgb_full, ints_full], target=None, metas=None)
-        details = f'{len(data)} instances, ' \
+        details = f'Table with {len(data)} instances, ' \
                   f'{len(data.domain.variables)} variables\n' \
                   f'Features: {len(data.domain.variables)} categorical ' \
                   f'(no missing values)\n' \
@@ -177,22 +193,32 @@ class TestUtils(unittest.TestCase):
         self.assertEqual(details, format_summary_details(data))
 
         data = make_table([rgb_full], target=None, metas=None)
-        details = f'{len(data)} instances, ' \
+        details = f'Table with {len(data)} instances, ' \
                   f'{len(data.domain.variables)} variable\n' \
                   f'Features: categorical (no missing values)\n' \
                   f'Target: —'
         self.assertEqual(details, format_summary_details(data))
 
+        data = Table.from_numpy(domain=None, X=np.random.random((10000, 1000)))
+        details = f'Table with {len(data):n} instances, ' \
+                  f'{len(data.domain.variables)} variables\n' \
+                  f'Features: {len(data.domain.variables)} numeric\n' \
+                  f'Target: —'
+        with patch.object(Table, "get_nan_frequency_attribute") as mock:
+            self.assertEqual(details, format_summary_details(data))
+            mock.assert_not_called()
+
         data = None
         self.assertEqual('', format_summary_details(data))
 
+    @WidgetTest.skipNonEnglish
     def test_multiple_summaries(self):
         data = Table('zoo')
         extra_data = Table('zoo')[20:]
         n_features_data = len(data.domain.variables) + len(data.domain.metas)
         n_features_extra_data = len(extra_data.domain.variables) + \
                                 len(extra_data.domain.metas)
-        details = f'Data:<br>zoo: {len(data)} instance, ' \
+        details = f'Data:<br>zoo: {len(data)} instances, ' \
                   f'{n_features_data} variables<br>' \
                   f'Features: {len(data.domain.attributes)} categorical ' \
                   f'(no missing values)<br>' \
@@ -207,7 +233,7 @@ class TestUtils(unittest.TestCase):
         inputs = [('Data', data), ('Extra Data', extra_data)]
         self.assertEqual(details, format_multiple_summaries(inputs))
 
-        details = f'zoo: {len(data)} instance, ' \
+        details = f'zoo: {len(data)} instances, ' \
                   f'{n_features_data} variables<br>' \
                   f'Features: {len(data.domain.attributes)} categorical ' \
                   f'(no missing values)<br>' \
@@ -233,6 +259,80 @@ class TestUtils(unittest.TestCase):
         outputs = [('', None), ('Extra data', extra_data), ('', None)]
         self.assertEqual(details,
                          format_multiple_summaries(outputs, type_io='output'))
+
+
+class TestSummarize(unittest.TestCase):
+    @patch("Orange.widgets.utils.state_summary._table_previewer")
+    def test_summarize_table(self, previewer):
+        data = Table('zoo')
+        summary = summarize(data)
+        self.assertEqual(summary.summary, len(data))
+        self.assertEqual(summary.details,
+                         format_summary_details(data, format=Qt.RichText))
+        previewer.assert_not_called()
+        summary.preview_func()
+        previewer.assert_called_with(data)
+
+    @patch("Orange.widgets.utils.state_summary._table_previewer")
+    def test_summarize_lazy_table(self, previewer):
+        data = Table('zoo')
+
+        # lazy_data of unknown length and domain
+        lazy_data = LazyValue[Table](lambda: data)
+        lazy_data.get_value = Mock(return_value=data)
+        summary = summarize(lazy_data)
+        self.assertEqual(summary.summary, "?")
+        self.assertIsInstance(summary.details, str)
+        lazy_data.get_value.assert_not_called()
+        previewer.assert_not_called()
+        summary.preview_func()
+        lazy_data.get_value.assert_called()
+        previewer.assert_called_with(data)
+        previewer.reset_mock()
+
+        # lazy_data with length and domain hint
+        lazy_data = LazyValue[Table](
+            lambda: data, length=123, domain=data.domain)
+        lazy_data.get_value = Mock(return_value=data)
+        summary = summarize(lazy_data)
+        self.assertEqual(summary.summary, 123)
+        self.assertEqual(summary.details,
+                         format_summary_details(data.domain, format=Qt.RichText))
+        lazy_data.get_value.assert_not_called()
+        previewer.assert_not_called()
+        summary.preview_func()
+        lazy_data.get_value.assert_called()
+        previewer.assert_called_with(data)
+        previewer.reset_mock()
+
+        # lazy_data that is already cached: complete summary even without hints
+        lazy_data = LazyValue[Table](lambda: data)
+        lazy_data.get_value()
+        summary = summarize(lazy_data)
+        self.assertEqual(summary.summary, len(data))
+        self.assertEqual(summary.details,
+                         format_summary_details(data, format=Qt.RichText))
+        previewer.assert_not_called()
+        summary.preview_func()
+        previewer.assert_called_with(data)
+
+
+class TestSummarizeMatrix(WidgetTest):
+    def test_summarize_matrix(self):
+        matrix = DistMatrix(np.arange(9).reshape(3, 3))
+        summary = summarize_matrix(matrix)
+        self.assertEqual(summary.summary, "3×3")
+        self.assertEqual(summary.details, "<nobr>3×3 distance matrix</nobr>")
+        view = summary.preview_func()
+        self.assertIsInstance(view, QTableView)
+
+    def test_summarize_matrix_empty(self):
+        matrix = DistMatrix(np.empty((0, 0)))
+        summary = summarize_matrix(matrix)
+        self.assertEqual(summary.summary, "0×0")
+        self.assertEqual(summary.details, "<nobr>0×0 distance matrix</nobr>")
+        view = summary.preview_func()
+        self.assertIsInstance(view, QTableView)
 
 
 if __name__ == "__main__":

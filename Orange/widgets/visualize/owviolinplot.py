@@ -29,7 +29,7 @@ from Orange.widgets.utils.sql import check_sql_input
 from Orange.widgets.visualize.owboxplot import SortProxyModel
 from Orange.widgets.visualize.utils.customizableplot import \
     CommonParameterSetter, Updater
-from Orange.widgets.visualize.utils.plotutils import AxisItem
+from Orange.widgets.visualize.utils.plotutils import AxisItem, PlotWidget
 from Orange.widgets.widget import OWWidget, Input, Output, Msg
 
 # scaling types
@@ -369,14 +369,15 @@ class SelectionRect(pg.GraphicsObject):
         painter.restore()
 
 
-class ViolinPlot(pg.PlotWidget):
+class ViolinPlot(PlotWidget):
     VIOLIN_PADDING_FACTOR = 1.25
     SELECTION_PADDING_FACTOR = 1.20
     selection_changed = Signal(list, list)
 
     def __init__(self, parent: OWWidget, kernel: str, scale: int,
                  orientation: Qt.Orientations, show_box_plot: bool,
-                 show_strip_plot: bool, show_rug_plot: bool, sort_items: bool):
+                 show_strip_plot: bool, show_rug_plot: bool, show_grid: bool,
+                 sort_items: bool):
 
         # data
         self.__values: Optional[np.ndarray] = None
@@ -391,6 +392,7 @@ class ViolinPlot(pg.PlotWidget):
         self.__show_box_plot = show_box_plot
         self.__show_strip_plot = show_strip_plot
         self.__show_rug_plot = show_rug_plot
+        self.__show_grid = show_grid
         self.__sort_items = sort_items
 
         # items
@@ -405,7 +407,7 @@ class ViolinPlot(pg.PlotWidget):
 
         view_box = ViolinPlotViewBox(self)
         super().__init__(parent, viewBox=view_box,
-                         background="w", enableMenu=False,
+                         enableMenu=False,
                          axisItems={"bottom": AxisItem("bottom"),
                                     "left": AxisItem("left")})
         self.setAntialiasing(True)
@@ -485,6 +487,11 @@ class ViolinPlot(pg.PlotWidget):
             self.__show_rug_plot = show
             for item in self.__violin_items:
                 item.set_show_rug_plot(show)
+
+    def set_show_grid(self, show: bool):
+        if self.__show_grid != show:
+            self.__show_grid = show
+            self._update_grid()
 
     def set_sort_items(self, sort_items: bool):
         if self.__sort_items != sort_items:
@@ -578,6 +585,11 @@ class ViolinPlot(pg.PlotWidget):
 
         # apply selection ranges
         self._selection_ranges = ranges
+        self._update_grid()
+
+    def _update_grid(self):
+        self.showGrid(x=self.__show_grid and self.__orientation == Qt.Horizontal,
+                      y=self.__show_grid and self.__orientation == Qt.Vertical)
 
     def _set_violin_item(self, values: np.ndarray, color: QColor):
         values = values[~np.isnan(values)]
@@ -639,8 +651,8 @@ class ViolinPlot(pg.PlotWidget):
         self.__selection_rects.clear()
 
     def _clear_axes(self):
-        self.setAxisItems({"bottom": AxisItem(orientation="bottom"),
-                           "left": AxisItem(orientation="left")})
+        self.getAxis("left").setTicks(None)
+        self.getAxis("bottom").setTicks(None)
         Updater.update_axes_titles_font(
             self.parameter_setter.axis_items,
             **self.parameter_setter.titles_settings
@@ -718,7 +730,7 @@ class OWViolinPlot(OWWidget):
                   " values in a violin plot."
     icon = "icons/ViolinPlot.svg"
     priority = 110
-    keywords = ["kernel", "density"]
+    keywords = "violin plot, kernel, density"
 
     class Inputs:
         data = Input("Data", Table)
@@ -743,6 +755,7 @@ class OWViolinPlot(OWWidget):
     show_box_plot = Setting(True)
     show_strip_plot = Setting(False)
     show_rug_plot = Setting(False)
+    show_grid = Setting(False)
     order_violins = Setting(False)
     orientation_index = Setting(1)  # Vertical
     kernel_index = Setting(0)  # Normal kernel
@@ -750,7 +763,7 @@ class OWViolinPlot(OWWidget):
     selection_ranges = Setting([], schema_only=True)
     visual_settings = Setting({}, schema_only=True)
 
-    graph_name = "graph.plotItem"
+    graph_name = "graph.plotItem"  # QGraphicsView (pg.PlotWidget -> ViolinPlot)
     buttons_area_orientation = None
 
     def __init__(self):
@@ -781,7 +794,8 @@ class OWViolinPlot(OWWidget):
         self.graph = ViolinPlot(self, self.kernel,
                                 self.scale_index, self.orientation,
                                 self.show_box_plot, self.show_strip_plot,
-                                self.show_rug_plot, self.order_violins)
+                                self.show_rug_plot, self.show_grid,
+                                self.order_violins)
         self.graph.selection_changed.connect(self.__selection_changed)
         box.layout().addWidget(self.graph)
 
@@ -836,13 +850,17 @@ class OWViolinPlot(OWWidget):
                        sizePolicy=(QSizePolicy.Minimum, QSizePolicy.Maximum))
         gui.checkBox(box, self, "show_box_plot", "Box plot",
                      callback=self.__show_box_plot_changed)
-        gui.checkBox(box, self, "show_strip_plot", "Strip plot",
+        gui.checkBox(box, self, "show_strip_plot", "Density dots",
                      callback=self.__show_strip_plot_changed)
-        gui.checkBox(box, self, "show_rug_plot", "Rug plot",
+        gui.checkBox(box, self, "show_rug_plot", "Density lines",
                      callback=self.__show_rug_plot_changed)
         self._order_violins_cb = gui.checkBox(
             box, self, "order_violins", "Order subgroups",
             callback=self.__order_violins_changed,
+        )
+        gui.checkBox(
+            box, self, "show_grid", "Show grid",
+            callback=self.__show_grid_changed,
         )
         gui.radioButtons(box, self, "orientation_index",
                          ["Horizontal", "Vertical"], label="Orientation: ",
@@ -888,6 +906,9 @@ class OWViolinPlot(OWWidget):
 
     def __order_violins_changed(self):
         self.graph.set_sort_items(self.order_violins)
+
+    def __show_grid_changed(self):
+        self.graph.set_show_grid(self.show_grid)
 
     def __orientation_changed(self):
         self.graph.set_orientation(self.orientation)
@@ -975,7 +996,7 @@ class OWViolinPlot(OWWidget):
         def compute_score(attr):
             if attr is group_var:
                 return 3
-            col = self.data.get_column_view(attr)[0].astype(float)
+            col = self.data.get_column(attr)
             groups = (col[group_col == i] for i in range(n_groups))
             groups = (col[~np.isnan(col)] for col in groups)
             groups = [group for group in groups if len(group)]
@@ -989,7 +1010,7 @@ class OWViolinPlot(OWWidget):
         group_var = self.group_var
         if self.order_by_importance and group_var is not None:
             n_groups = len(group_var.values)
-            group_col = self.data.get_column_view(group_var)[0].astype(float)
+            group_col = self.data.get_column(group_var)
             self._sort_list(self._value_var_model, self._value_var_view,
                             compute_score)
         else:
@@ -1001,7 +1022,7 @@ class OWViolinPlot(OWWidget):
                 return 3
             if group is None:
                 return -1
-            col = self.data.get_column_view(group)[0].astype(float)
+            col = self.data.get_column(group)
             groups = (value_col[col == i] for i in range(len(group.values)))
             groups = (col[~np.isnan(col)] for col in groups)
             groups = [group for group in groups if len(group)]
@@ -1014,7 +1035,7 @@ class OWViolinPlot(OWWidget):
             return
         value_var = self.value_var
         if self.order_grouping_by_importance:
-            value_col = self.data.get_column_view(value_var)[0].astype(float)
+            value_col = self.data.get_column(value_var)
             self._sort_list(self._group_var_model, self._group_var_view,
                             compute_stat)
         else:
@@ -1047,10 +1068,10 @@ class OWViolinPlot(OWWidget):
         if not self.data:
             return
 
-        y = self.data.get_column_view(self.value_var)[0].astype(float)
+        y = self.data.get_column(self.value_var)
         x = None
         if self.group_var:
-            x = self.data.get_column_view(self.group_var)[0].astype(float)
+            x = self.data.get_column(self.group_var)
         self.graph.set_data(y, self.value_var, x, self.group_var)
 
     def apply_selection(self):

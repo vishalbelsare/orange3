@@ -219,7 +219,7 @@ class TestOWCurveFit(WidgetTest, WidgetLearnerTestMixin):
 
     def test_output_model(self):  # overwritten
         self.assertIsNone(self.get_output(self.widget.Outputs.model))
-        self.widget.apply_button.button.click()
+        self.click_apply()
         self.assertIsNone(self.get_output(self.widget.Outputs.model))
 
         self.__init_widget()
@@ -358,13 +358,22 @@ class TestOWCurveFit(WidgetTest, WidgetLearnerTestMixin):
                 insert("2")
             else:
                 simulate.combobox_activate_index(feature_combo, 1)
-            self.widget.apply_button.button.click()
+            self.click_apply()
 
             self.assertIsNotNone(self.get_output(self.widget.Outputs.learner))
             self.assertFalse(self.widget.Error.no_parameter.is_shown())
             self.assertFalse(self.widget.Error.invalid_exp.is_shown())
             model = self.get_output(self.widget.Outputs.model)
             coefficients = self.get_output(self.widget.Outputs.coefficients)
+            if f in ["inf", "nan", "arccos", "arccosh", "arcsin", "arctanh"]:
+                # These functions produce objective function values with NaN.
+                # Different implementations of optimization that scipy uses get
+                # different results: one stops optimization immediately with some
+                # results, the other stops when maximum number of iterations
+                # (and errors with fitting_failed). The optimization implementation
+                # can be different even with same scipy version (in my case, between
+                # pypi and conda-forge package). Thus, we skip these.
+                continue
             if f == "gcd":
                 self.assertTrue(self.widget.Error.fitting_failed.is_shown())
                 self.assertIsNone(model)
@@ -402,13 +411,13 @@ class TestOWCurveFit(WidgetTest, WidgetLearnerTestMixin):
         self.__init_widget()
         self.assertFalse(self.widget.Error.invalid_exp.is_shown())
         self.widget._OWCurveFit__insert_into_expression(" + ")
-        self.widget.apply_button.button.click()
+        self.click_apply()
         self.assertTrue(self.widget.Error.invalid_exp.is_shown())
         self.widget._OWCurveFit__insert_into_expression(" 2 ")
-        self.widget.apply_button.button.click()
+        self.click_apply()
         self.assertFalse(self.widget.Error.invalid_exp.is_shown())
         self.widget._OWCurveFit__insert_into_expression(" + ")
-        self.widget.apply_button.button.click()
+        self.click_apply()
         self.assertTrue(self.widget.Error.invalid_exp.is_shown())
         self.send_signal(self.widget.Inputs.data, None)
         self.assertFalse(self.widget.Error.invalid_exp.is_shown())
@@ -443,10 +452,10 @@ class TestOWCurveFit(WidgetTest, WidgetLearnerTestMixin):
     def test_no_parameter(self):
         self.send_signal(self.widget.Inputs.data, self.housing)
         self.widget._OWCurveFit__expression_edit.setText("LSTAT + 1")
-        self.widget.apply_button.button.click()
+        self.click_apply()
         self.assertTrue(self.widget.Error.no_parameter.is_shown())
         self.widget._OWCurveFit__expression_edit.setText("LSTAT + a")
-        self.widget.apply_button.button.click()
+        self.click_apply()
         self.assertFalse(self.widget.Error.no_parameter.is_shown())
 
     def test_unused_parameter(self):
@@ -456,11 +465,11 @@ class TestOWCurveFit(WidgetTest, WidgetLearnerTestMixin):
         self.assertFalse(self.widget.Warning.unused_parameter.is_shown())
 
         self.widget._OWCurveFit__expression_edit.setText("p1 + LSTAT + p2")
-        self.widget.apply_button.button.click()
+        self.click_apply()
         self.assertFalse(self.widget.Warning.unused_parameter.is_shown())
 
         self.widget._OWCurveFit__expression_edit.setText("p1 + LSTAT")
-        self.widget.apply_button.button.click()
+        self.click_apply()
         self.assertTrue(self.widget.Warning.unused_parameter.is_shown())
 
         self.send_signal(self.widget.Inputs.data, None)
@@ -471,11 +480,11 @@ class TestOWCurveFit(WidgetTest, WidgetLearnerTestMixin):
         self.__add_button.click()
 
         self.widget._OWCurveFit__expression_edit.setText("p1 + LSTAT")
-        self.widget.apply_button.button.click()
+        self.click_apply()
         self.assertFalse(self.widget.Error.unknown_parameter.is_shown())
 
         self.widget._OWCurveFit__expression_edit.setText("p2 + LSTAT")
-        self.widget.apply_button.button.click()
+        self.click_apply()
         self.assertTrue(self.widget.Error.unknown_parameter.is_shown())
 
         self.send_signal(self.widget.Inputs.data, None)
@@ -528,7 +537,7 @@ class TestOWCurveFit(WidgetTest, WidgetLearnerTestMixin):
             self.__add_button.click()
         exp = "p1 * exp(-p2 * LSTAT) + p3"
         self.widget._OWCurveFit__expression_edit.setText(exp)
-        self.widget.apply_button.button.click()
+        self.click_apply()
         learner = self.get_output(self.widget.Outputs.learner)
         self.assertIsInstance(learner, CurveFitLearner)
         model = self.get_output(self.widget.Outputs.model)

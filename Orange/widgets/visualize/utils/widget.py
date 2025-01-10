@@ -24,6 +24,7 @@ from Orange.widgets.utils.annotated_data import (
 )
 from Orange.widgets.utils.plot import OWPlotGUI
 from Orange.widgets.utils.sql import check_sql_input
+from Orange.widgets.utils.localization import pl
 from Orange.widgets.visualize.owscatterplotgraph import (
     OWScatterPlotBase, MAX_COLORS
 )
@@ -143,9 +144,7 @@ class OWProjectionWidgetBase(OWWidget, openclass=True):
             assert attr.is_discrete
             return attr.values
 
-        all_data = self.data.get_column_view(attr)[0]
-        if all_data.dtype == object and attr.is_primitive():
-            all_data = all_data.astype(float)
+        all_data = self.data.get_column(attr)
         if filter_valid and self.valid_data is not None:
             all_data = all_data[self.valid_data]
         if not needs_merging:
@@ -299,24 +298,24 @@ class OWProjectionWidgetBase(OWWidget, openclass=True):
 
     # Tooltip
     def _point_tooltip(self, point_id, skip_attrs=()):
-        def show_part(_point_data, singular, plural, max_shown, _vars):
+        def show_part(_point_data, name, max_shown, _vars):
             cols = [escape('{} = {}'.format(var.name, _point_data[var]))
                     for var in _vars[:max_shown + 2]
-                    if _vars == domain.class_vars
+                    if _vars == dom.class_vars
                     or var not in skip_attrs][:max_shown]
             if not cols:
                 return ""
             n_vars = len(_vars)
             if n_vars > max_shown:
-                cols[-1] = "... and {} others".format(n_vars - max_shown + 1)
-            return \
-                "<b>{}</b>:<br/>".format(singular if n_vars < 2 else plural) \
-                + "<br/>".join(cols)
+                over = n_vars - max_shown + 1
+                cols[-1] = f"... and {over} {pl(over, 'other')}"
+            return f"<b>{name}</b>:<br/>" + "<br/>".join(cols)
 
-        domain = self.data.domain
-        parts = (("Class", "Classes", 4, domain.class_vars),
-                 ("Meta", "Metas", 4, domain.metas),
-                 ("Feature", "Features", 10, domain.attributes))
+        dom = self.data.domain
+        parts = (
+            (f"{pl(len(dom.class_vars), 'Class|Classes')}", 4, dom.class_vars),
+            (f"{pl(len(dom.metas), 'Meta')}", 4, dom.metas),
+            (f"{pl(len(dom.attributes), 'Feature')}", 10, dom.attributes))
 
         point_data = self.data[point_id]
         return "<br/>".join(show_part(point_data, *columns)
@@ -339,7 +338,7 @@ class OWProjectionWidgetBase(OWWidget, openclass=True):
         text = "<hr/>".join(self._point_tooltip(point_id)
                             for point_id in point_ids[:MAX_POINTS_IN_TOOLTIP])
         if len(point_ids) > MAX_POINTS_IN_TOOLTIP:
-            text = "{} instances<hr/>{}<hr/>...".format(len(point_ids), text)
+            text = f"{len(point_ids)} instances<hr/>{text}<hr/>..."
         return text
 
     def keyPressEvent(self, event):
@@ -388,7 +387,7 @@ class OWDataProjectionWidget(OWProjectionWidgetBase, openclass=True):
 
     GRAPH_CLASS = OWScatterPlotBase
     graph = SettingProvider(OWScatterPlotBase)
-    graph_name = "graph.plot_widget.plotItem"
+    graph_name = "graph.plot_widget.plotItem"  # pg.GraphicsItem  (pg.PlotItem)
     embedding_variables_names = ("proj-x", "proj-y")
     buttons_area_orientation = Qt.Vertical
 
@@ -455,7 +454,10 @@ class OWDataProjectionWidget(OWProjectionWidgetBase, openclass=True):
         self.openContext(self.data)
         self._invalidated = not (
             data_existed and self.data is not None and
-            array_equal(effective_data.X, self.effective_data.X))
+            array_equal(effective_data.X, self.effective_data.X) and
+            array_equal(effective_data.Y, self.effective_data.Y) and
+            array_equal(effective_data.metas, self.effective_data.metas)
+        )
         self._domain_invalidated = not (
             data_existed and self.data is not None and
             effective_data.domain.checksum()
@@ -648,6 +650,7 @@ class OWDataProjectionWidget(OWProjectionWidgetBase, openclass=True):
     def clear(self):
         self.selection = None
         self.graph.selection = None
+        self.graph.clear()
 
     def onDeleteWidget(self):
         super().onDeleteWidget()

@@ -28,7 +28,7 @@ from Orange.widgets.visualize.owscatterplotgraph import LegendItem
 from Orange.widgets.visualize.utils.customizableplot import Updater, \
     CommonParameterSetter
 from Orange.widgets.visualize.utils.plotutils import AxisItem, \
-    HelpEventDelegate
+    HelpEventDelegate, PlotWidget
 from Orange.widgets.widget import OWWidget, Input, Output, Msg
 
 MAX_INSTANCES = 200
@@ -140,7 +140,7 @@ class ParameterSetter(CommonParameterSetter):
         return self.master.legend.items
 
 
-class BarPlotGraph(pg.PlotWidget):
+class BarPlotGraph(PlotWidget):
     selection_changed = Signal(list)
     bar_width = 0.7
 
@@ -152,7 +152,7 @@ class BarPlotGraph(pg.PlotWidget):
         super().__init__(
             parent=parent,
             viewBox=BarPlotViewBox(self),
-            background="w", enableMenu=False,
+            enableMenu=False,
             axisItems={"bottom": AxisItem(orientation="bottom",
                                           rotate_ticks=True),
                        "left": AxisItem(orientation="left")}
@@ -370,7 +370,7 @@ class OWBarPlot(OWWidget):
     description = "Visualizes comparisons among categorical variables."
     icon = "icons/BarPlot.svg"
     priority = 190
-    keywords = ["chart"]
+    keywords = "bar plot, chart"
 
     class Inputs:
         data = Input("Data", Table, default=True)
@@ -391,7 +391,7 @@ class OWBarPlot(OWWidget):
     visual_settings = Setting({}, schema_only=True)
 
     graph = SettingProvider(BarPlotGraph)
-    graph_name = "graph.plotItem"
+    graph_name = "graph.plotItem"  # QGraphicsView (pg.PlotWidget -> BarPlotGraph)
 
     class Error(OWWidget.Error):
         no_cont_features = Msg("Plotting requires a numeric feature.")
@@ -496,7 +496,7 @@ class OWBarPlot(OWWidget):
         if self.data:
             indices = np.arange(len(self.data))
             if self.group_var:
-                group_by = self.data.get_column_view(self.group_var)[0]
+                group_by = self.data.get_column(self.group_var)
                 indices = np.argsort(group_by, kind="mergesort")
         return indices
 
@@ -564,7 +564,7 @@ class OWBarPlot(OWWidget):
     def get_values(self) -> Optional[np.ndarray]:
         if not self.data or not self.selected_var:
             return None
-        return self.grouped_data.get_column_view(self.selected_var)[0]
+        return self.grouped_data.get_column(self.selected_var)
 
     def get_labels(self) -> Optional[Union[List, np.ndarray]]:
         if not self.data:
@@ -572,7 +572,10 @@ class OWBarPlot(OWWidget):
         elif not self.annot_var:
             return []
         elif self.annot_var == self.enumeration:
-            return np.arange(1, len(self.data) + 1)[self.grouped_indices]
+            return [
+                str(x)
+                for x in np.arange(1, len(self.data) + 1)[self.grouped_indices]
+            ]
         else:
             return [self.annot_var.str_val(row[self.annot_var])
                     for row in self.grouped_data]
@@ -608,7 +611,7 @@ class OWBarPlot(OWWidget):
             return [create_color(np.nan, id_) for id_ in self.grouped_data.ids]
         else:
             assert self.color_var.is_discrete
-            col = self.grouped_data.get_column_view(self.color_var)[0]
+            col = self.grouped_data.get_column(self.color_var)
             return [create_color(i, id_) for id_, i in
                     zip(self.grouped_data.ids, col)]
 

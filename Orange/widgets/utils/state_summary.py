@@ -1,13 +1,19 @@
 from datetime import date
 from html import escape
+from typing import Union
 
 from AnyQt.QtCore import Qt
 
-from orangewidget.utils.signals import summarize, PartialSummary
+from Orange.widgets.utils.localization import pl
+from orangewidget.utils.signals import summarize, PartialSummary, LazyValue
+from Orange.widgets.utils.itemmodels import TableModel
+from Orange.widgets.utils.tableview import TableView
+from Orange.widgets.utils.distmatrixmodel import \
+    DistMatrixModel, DistMatrixView
 
 from Orange.data import (
     StringVariable, DiscreteVariable, ContinuousVariable, TimeVariable,
-    Table
+    Table, Domain
 )
 
 from Orange.evaluation import Results
@@ -16,6 +22,9 @@ from Orange.preprocess import Preprocess, PreprocessorList
 from Orange.preprocess.score import Scorer
 from Orange.widgets.utils.signals import AttributeList
 from Orange.base import Model, Learner
+
+
+COMPUTE_NANS_LIMIT = 1e7
 
 
 def format_variables_string(variables):
@@ -53,63 +62,67 @@ def format_variables_string(variables):
     return var_string
 
 
-def _plural(number):
-    return 's' * (number % 100 != 1)
-
-
 # `format` is a good name for the argument, pylint: disable=redefined-builtin
-def format_summary_details(data, format=Qt.PlainText):
+def format_summary_details(data: Union[Table, Domain],
+                           format=Qt.PlainText, missing=None):
     """
     A function that forms the entire descriptive part of the input/output
     summary.
 
     :param data: A dataset
-    :type data: Orange.data.Table
+    :type data: Orange.data.Table or Orange.data.Domain
     :return: A formatted string
     """
     if data is None:
         return ""
 
-    if format == Qt.PlainText:
-        def b(s):
-            return s
-    else:
-        def b(s):
-            return f"<b>{s}</b>"
-
-    features = format_variables_string(data.domain.attributes)
-    targets = format_variables_string(data.domain.class_vars)
-    metas = format_variables_string(data.domain.metas)
-
-    features_missing = missing_values(data.has_missing_attribute()
-                                      and data.get_nan_frequency_attribute())
-    n_features = len(data.domain.variables) + len(data.domain.metas)
-    name = getattr(data, "name", None)
-    if name == "untitled":
+    features_missing = "" if missing is None else missing_values(missing)
+    if isinstance(data, Domain):
+        domain = data
         name = None
-    basic = f'{len(data):n} instance{_plural(len(data))}, ' \
-            f'{n_features} variable{_plural(n_features)}'
+        basic = ""
+    else:
+        assert isinstance(data, Table)
+        domain = data.domain
+        if not features_missing and \
+                len(data) * len(domain.attributes) < COMPUTE_NANS_LIMIT:
+            features_missing \
+                = missing_values(data.get_nan_frequency_attribute())
+        name = getattr(data, "name", None)
+        if name == "untitled":
+            name = None
+        basic = f'{len(data):n} {pl(len(data), "instance")}, '
+
+    n_features = len(domain.variables) + len(domain.metas)
+    basic += f'{n_features} {pl(n_features, "variable")}'
+
+    features = format_variables_string(domain.attributes)
+    features = f'Features: {features}{features_missing}'
+
+    targets = format_variables_string(domain.class_vars)
+    targets = f'Target: {targets}'
+
+    metas = format_variables_string(domain.metas)
+    metas = f'Metas: {metas}'
 
     if format == Qt.PlainText:
-        details = \
-            (f"{name}: " if name else "") + basic \
-            + f'\nFeatures: {features} {features_missing}' \
-            + f'\nTarget: {targets}'
-        if data.domain.metas:
-            details += f'\nMetas: {metas}'
+        details = f"{name}: " if name else "Table with "
+        details += f"{basic}\n{features}\n{targets}"
+        if domain.metas:
+            details += f"\n{metas}"
     else:
         descs = []
         if name:
             descs.append(_nobr(f"<b><u>{escape(name)}</u></b>: {basic}"))
         else:
-            descs.append(_nobr(f'{basic}'))
+            descs.append(_nobr(f"Table with {basic}"))
 
-        if data.domain.variables:
-            descs.append(_nobr(f'Features: {features} {features_missing}'))
-        if data.domain.class_vars:
-            descs.append(_nobr(f"Target: {targets}"))
-        if data.domain.metas:
-            descs.append(_nobr(f"Metas: {metas}"))
+        if domain.variables:
+            descs.append(_nobr(features))
+        if domain.class_vars:
+            descs.append(_nobr(targets))
+        if domain.metas:
+            descs.append(_nobr(metas))
 
         details = '<br/>'.join(descs)
 
@@ -118,9 +131,11 @@ def format_summary_details(data, format=Qt.PlainText):
 
 def missing_values(value):
     if value:
-        return f'({value*100:.1f}% missing values)'
+        return f' ({value*100:.1f}% missing values)'
+    elif value is None:
+        return ''
     else:
-        return '(no missing values)'
+        return ' (no missing values)'
 
 
 def format_multiple_summaries(data_list, type_io='input'):
@@ -162,29 +177,77 @@ def _nobr(s):
 
 
 @summarize.register
-def summarize_(data: Table):
+def summarize_table(data: Table):  # pylint: disable=function-redefined
     return PartialSummary(
         data.approx_len(),
-        format_summary_details(data, format=Qt.RichText))
+        format_summary_details(data, format=Qt.RichText),
+        lambda: _table_previewer(data))
 
 
 @summarize.register
-def summarize_(matrix: DistMatrix):  # pylint: disable=function-redefined
-    n, m = matrix.shape
-    return PartialSummary(f"{n}×{m}", _nobr(f"{n}×{m} distance matrix"))
+def summarize_table(data: LazyValue[Table]):
+    if data.is_cached:
+        return summarize(data.get_value())
+
+    length = getattr(data, "length", "?")
+    details = format_summary_details(data.domain, format=Qt.RichText,
+                                     missing=getattr(data, "missing", None)) \
+        if hasattr(data, "domain") else "data available, but not prepared yet"
+    return PartialSummary(
+        length,
+        details,
+        lambda: _table_previewer(data.get_value()))
+
+
+def _table_previewer(data):
+    view = TableView(selectionMode=TableView.NoSelection)
+    view.setModel(TableModel(data))
+    return view
 
 
 @summarize.register
-def summarize_(results: Results):  # pylint: disable=function-redefined
+def summarize_matrix(matrix: DistMatrix):  # pylint: disable=function-redefined
+    def previewer():
+        view = DistMatrixView(selectionMode=TableView.NoSelection)
+        model = DistMatrixModel()
+        model.set_data(matrix)
+        col_labels = matrix.get_labels(matrix.col_items)
+        row_labels = matrix.get_labels(matrix.row_items)
+        if matrix.is_symmetric() and (
+                (col_labels is None) is not (row_labels is None)):
+            if col_labels is None:
+                col_labels = row_labels
+            else:
+                row_labels = col_labels
+        if col_labels is None:
+            col_labels = [str(x) for x in range(w)]
+        if row_labels is None:
+            row_labels = [str(x) for x in range(h)]
+        model.set_labels(Qt.Horizontal, col_labels)
+        model.set_labels(Qt.Vertical, row_labels)
+        view.setModel(model)
+
+        return view
+
+    h, w = matrix.shape
+    return PartialSummary(
+        f"{w}×{h}",
+        _nobr(f"{w}×{h} distance matrix"),
+        previewer
+    )
+
+
+@summarize.register
+def summarize_results(results: Results):  # pylint: disable=function-redefined
     nmethods, ninstances = results.predicted.shape
     summary = f"{nmethods}×{ninstances}"
-    details = f"{nmethods} method{_plural(nmethods)} " \
-              f"on {ninstances} test instance{_plural(ninstances)}"
+    details = f"{nmethods} {pl(nmethods, 'method')} " \
+              f"on {ninstances} test {pl(ninstances, 'instance')}"
     return PartialSummary(summary, _nobr(details))
 
 
 @summarize.register
-def summarize_(attributes: AttributeList):  # pylint: disable=function-redefined
+def summarize_attributes(attributes: AttributeList):  # pylint: disable=function-redefined
     n = len(attributes)
     if n == 0:
         details = "empty list"
@@ -197,7 +260,7 @@ def summarize_(attributes: AttributeList):  # pylint: disable=function-redefined
 
 
 @summarize.register
-def summarize_(preprocessor: Preprocess):
+def summarize_preprocessor(preprocessor: Preprocess):  # pylint: disable=function-redefined
     if isinstance(preprocessor, PreprocessorList):
         if preprocessor.preprocessors:
             details = "<br/>".join(map(_name_of, preprocessor.preprocessors))

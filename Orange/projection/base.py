@@ -1,3 +1,5 @@
+import warnings
+
 import copy
 import inspect
 import threading
@@ -9,6 +11,7 @@ from Orange.base import ReprableWithPreprocessors
 from Orange.data.util import SharedComputeValue, get_unique_names
 from Orange.misc.wrapper_meta import WrapperMeta
 from Orange.preprocess import RemoveNaNRows
+from Orange.util import dummy_callback, wrap_callback, OrangeDeprecationWarning
 import Orange.preprocess
 
 __all__ = ["LinearCombinationSql", "Projector", "Projection", "SklProjector",
@@ -44,17 +47,36 @@ class Projector(ReprableWithPreprocessors):
         raise NotImplementedError(
             "Classes derived from Projector must overload method fit")
 
-    def __call__(self, data):
-        data = self.preprocess(data)
+    def __call__(self, data, progress_callback=None):
+        if progress_callback is None:
+            progress_callback = dummy_callback
+        progress_callback(0, "Preprocessing...")
+        try:
+            cb = wrap_callback(progress_callback, end=0.1)
+            data = self.preprocess(data, progress_callback=cb)
+        except TypeError:
+            data = self.preprocess(data)
+            warnings.warn("A keyword argument 'progress_callback' has been "
+                          "added to the preprocess() signature. Implementing "
+                          "the method without the argument is deprecated and "
+                          "will result in an error in the future.",
+                          OrangeDeprecationWarning, stacklevel=2)
         self.domain = data.domain
+        progress_callback(0.1, "Fitting...")
         clf = self.fit(data.X, data.Y)
         clf.pre_domain = data.domain
         clf.name = self.name
+        progress_callback(1)
         return clf
 
-    def preprocess(self, data):
-        for pp in self.preprocessors:
+    def preprocess(self, data, progress_callback=None):
+        if progress_callback is None:
+            progress_callback = dummy_callback
+        n_pps = len(self.preprocessors)
+        for i, pp in enumerate(self.preprocessors):
+            progress_callback(i / n_pps)
             data = pp(data)
+        progress_callback(1)
         return data
 
     # Projectors implemented using `fit` access the `domain` through the
@@ -85,7 +107,8 @@ class Projector(ReprableWithPreprocessors):
 
 class Projection:
     def __init__(self, proj):
-        self.__dict__.update(proj.__dict__)
+        if proj is not None:
+            self.__dict__.update(proj.__dict__)
         self.proj = proj
 
     def transform(self, X):
@@ -97,26 +120,70 @@ class Projection:
     def __repr__(self):
         return self.name
 
+    def __eq__(self, other):
+        if self is other:
+            return True
+        return type(self) is type(other) \
+            and self.proj == other.proj
+
+    def __hash__(self):
+        return hash(self.proj)
+
 
 class TransformDomain:
     def __init__(self, projection):
         self.projection = projection
+        self._hash = None
 
     def __call__(self, data):
         if data.domain != self.projection.pre_domain:
             data = data.transform(self.projection.pre_domain)
         return self.projection.transform(data.X)
 
+    def __eq__(self, other):
+        if self is other:
+            return True
+        return type(self) is type(other) \
+            and self.projection == other.projection
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._hash = None
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        del state["_hash"]
+        return state
+
+    def __hash__(self):
+        if self._hash is None:
+            self._hash = hash(self.projection)
+        return self._hash
+
 
 class ComputeValueProjector(SharedComputeValue):
-    def __init__(self, projection, feature, transform):
+    def __init__(self, projection=None, feature=None, transform=None):
         super().__init__(transform)
+        if projection is not None:
+            warnings.warn("Argument projection is unused and will be removed.",
+                          OrangeDeprecationWarning, stacklevel=2)
         self.projection = projection
         self.feature = feature
         self.transformed = None
 
     def compute(self, data, space):
         return space[:, self.feature]
+
+    def __eq__(self, other):
+        if self is other:
+            return True
+        return super().__eq__(other) \
+            and self.projection == other.projection \
+            and self.feature == other.feature \
+            and self.transformed == other.transformed
+
+    def __hash__(self):
+        return hash((super().__hash__(), self.projection, self.feature, self.transformed))
 
 
 class DomainProjection(Projection):
@@ -127,7 +194,7 @@ class DomainProjection(Projection):
 
         def proj_variable(i, name):
             v = Orange.data.ContinuousVariable(
-                name, compute_value=ComputeValueProjector(self, i, transformer)
+                name, compute_value=ComputeValueProjector(feature=i, transform=transformer)
             )
             v.to_sql = LinearCombinationSql(
                 domain.attributes, self.components_[i, :],
@@ -153,6 +220,21 @@ class DomainProjection(Projection):
         model.pre_domain = self.pre_domain.copy()
         model.name = self.name
         return model
+
+    def __eq__(self, other):
+        # see comment in __hash__() about .domain
+        if self is other:
+            return True
+        return super().__eq__(other) \
+            and self.n_components == other.n_components \
+            and self.orig_domain == other.orig_domain \
+            and self.var_prefix == other.var_prefix
+
+    def __hash__(self):
+        # hashing self.domain would cause infinite recursion;
+        # because it is only constructed from .orig_domain, .n_components
+        # and .proj (dealt with in the superclass), we do not need it
+        return hash((super().__hash__(), self.n_components, self.orig_domain, self.var_prefix))
 
 
 class LinearProjector(Projector):
@@ -208,8 +290,8 @@ class SklProjector(Projector, metaclass=WrapperMeta):
             raise TypeError("Wrapper does not define '__wraps__'")
         return params
 
-    def preprocess(self, data):
-        data = super().preprocess(data)
+    def preprocess(self, data, progress_callback=None):
+        data = super().preprocess(data, progress_callback)
         if any(v.is_discrete and len(v.values) > 2
                for v in data.domain.attributes):
             raise ValueError("Wrapped scikit-learn methods do not support "

@@ -1,6 +1,8 @@
 import re
+import types
 import warnings
 from collections.abc import Iterable
+from typing import Sequence
 
 from datetime import datetime, timedelta, timezone
 from numbers import Number, Real, Integral
@@ -8,9 +10,11 @@ from math import isnan, floor
 from pickle import PickleError
 
 import numpy as np
+import pandas
 import scipy.sparse as sp
 
 from Orange.data import _variable
+from Orange.data.util import redefines_eq_and_hash
 from Orange.util import Registry, Reprable, OrangeDeprecationWarning
 
 
@@ -157,6 +161,8 @@ class Value(float):
         :param value: value
         """
         if variable.is_primitive():
+            if isinstance(variable, DiscreteVariable) and isinstance(value, str):
+                value = variable.to_val(value)
             self = super().__new__(cls, value)
             self.variable = variable
             self._value = None
@@ -167,6 +173,44 @@ class Value(float):
             self.variable = variable
             self._value = value
         return self
+
+    @staticmethod
+    def _as_values_primitive(variable, data) -> Sequence['Value']:
+        assert variable.is_primitive()
+        _Value = Value
+        _float_new = float.__new__
+        res = [Value(variable, np.nan)] * len(data)
+        for i, v in enumerate(data):
+            v = _float_new(_Value, v)
+            v.variable = variable
+            res[i] = v
+        return res
+
+    @staticmethod
+    def _as_values_non_primitive(variable, data) -> Sequence['Value']:
+        assert not variable.is_primitive()
+        _Value = Value
+        _float_new = float.__new__
+        data_arr = np.array(data, dtype=object)
+        NA = data_arr == variable.Unknown
+        fdata = np.full(len(data), np.finfo(float).min)
+        fdata[NA] = np.nan
+        res = [Value(variable, Variable.Unknown)] * len(data)
+        for i, (v, fval) in enumerate(zip(data, fdata)):
+            val = _float_new(_Value, fval)
+            val.variable = variable
+            val._value = v
+            res[i] = val
+        return res
+
+    @staticmethod
+    def _as_values(variable, data):
+        """Equivalent but faster then `[Value(variable, v) for v in data]
+        """
+        if variable.is_primitive():
+            return Value._as_values_primitive(variable, data)
+        else:
+            return Value._as_values_non_primitive(variable, data)
 
     def __init__(self, _, __=Unknown):
         # __new__ does the job, pylint: disable=super-init-not-called
@@ -328,6 +372,17 @@ class Variable(Reprable, metaclass=VariableMeta):
             warnings.warn("Variable must have a name", OrangeDeprecationWarning,
                           stacklevel=3)
         self._name = name
+
+        if compute_value is not None \
+                and not isinstance(compute_value, (types.BuiltinFunctionType,
+                                                   types.FunctionType)) \
+                and not redefines_eq_and_hash(compute_value) \
+                and not type(compute_value).__dict__.get("InheritEq", False):
+            warnings.warn(f"{type(compute_value).__name__} should define "
+                          "__eq__ and __hash__ to be used for compute_value\n"
+                          "or set InheritEq = True if inherited methods suffice",
+                          stacklevel=3)
+
         self._compute_value = compute_value
         self.unknown_str = MISSING_VALUES
         self.source_variable = None
@@ -579,7 +634,7 @@ class ContinuousVariable(Variable):
         """
         return _variable.val_from_str_add_cont(self, s)
 
-    def repr_val(self, val):
+    def repr_val(self, val: float):
         """
         Return the value as a string with the prescribed number of decimals.
         """
@@ -635,6 +690,8 @@ class DiscreteVariable(Variable):
         values = tuple(values)  # some people (including me) pass a generator
         if not all(isinstance(value, str) for value in values):
             raise TypeError("values of DiscreteVariables must be strings")
+        if len(set(values)) < len(values):
+            raise ValueError("Duplicate values in DiscreteVariable")
 
         super().__init__(name, compute_value, sparse=sparse)
         self._values = values
@@ -851,6 +908,8 @@ class StringVariable(Variable):
             if not val.value:
                 return "?"
             val = val.value
+        if pandas.isnull(val):
+            return "?"
         return str(val)
 
     def repr_val(self, val):
@@ -870,7 +929,7 @@ class TimeVariable(ContinuousVariable):
 
     If time is specified without a date, Unix epoch is assumed.
 
-    If time is specified wihout an UTC offset, localtime is assumed.
+    If time is specified without an UTC offset, localtime is assumed.
     """
     _all_vars = {}
     TYPE_HEADERS = ('time', 't')
@@ -923,15 +982,90 @@ class TimeVariable(ContinuousVariable):
              r'\d{1,4}(-?\d{2,3})?'
              r')$')
 
+    ADDITIONAL_FORMATS = {
+        "2021-11-25": (("%Y-%m-%d",), 1, 0),
+        "25.11.2021": (("%d.%m.%Y", "%d. %m. %Y"), 1, 0),
+        "25.11.21": (("%d.%m.%y", "%d. %m. %y"), 1, 0),
+        "11/25/2021": (("%m/%d/%Y",), 1, 0),
+        "11/25/21": (("%m/%d/%y",), 1, 0),
+        "20211125": (("%Y%m%d",), 1, 0),
+        # it would be too many options if we also include all time formats with
+        # with lengths up to minutes, up to seconds and up to milliseconds,
+        # joining all tree options under 00:00:00
+        "2021-11-25 00:00:00": (
+            (
+                "%Y-%m-%d %H:%M",
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d %H:%M:%S.%f",
+                # times with timezone offsets
+                "%Y-%m-%d %H:%M%z",
+                "%Y-%m-%d %H:%M:%S%z",
+                "%Y-%m-%d %H:%M:%S.%f%z",
+            ),
+            1,
+            1,
+        ),
+        "25.11.2021 00:00:00": (
+            (
+                "%d.%m.%Y %H:%M",
+                "%d. %m. %Y %H:%M",
+                "%d.%m.%Y %H:%M:%S",
+                "%d. %m. %Y %H:%M:%S",
+                "%d.%m.%Y %H:%M:%S.%f",
+                "%d. %m. %Y %H:%M:%S.%f",
+            ),
+            1,
+            1,
+        ),
+        "25.11.21 00:00:00": (
+            (
+                "%d.%m.%y %H:%M",
+                "%d. %m. %y %H:%M",
+                "%d.%m.%y %H:%M:%S",
+                "%d. %m. %y %H:%M:%S",
+                "%d.%m.%y %H:%M:%S.%f",
+                "%d. %m. %y %H:%M:%S.%f",
+            ),
+            1,
+            1,
+        ),
+        "11/25/2021 00:00:00": (
+            (
+                "%m/%d/%Y %H:%M",
+                "%m/%d/%Y %H:%M:%S",
+                "%m/%d/%Y %H:%M:%S.%f",
+            ),
+            1,
+            1,
+        ),
+        "11/25/21 00:00:00": (
+            (
+                "%m/%d/%y %H:%M",
+                "%m/%d/%y %H:%M:%S",
+                "%m/%d/%y %H:%M:%S.%f",
+            ),
+            1,
+            1,
+        ),
+        "20211125000000": (("%Y%m%d%H%M", "%Y%m%d%H%M%S", "%Y%m%d%H%M%S.%f"), 1, 1),
+        "00:00:00": (("%H:%M", "%H:%M:%S", "%H:%M:%S.%f"), 0, 1),
+        "000000": (("%H%M", "%H%M%S", "%H%M%S.%f"), 0, 1),
+        "2021": (("%Y",), 1, 0),
+        "11-25": (("%m-%d",), 1, 0),
+        "25.11.": (("%d.%m.", "%d. %m."), 1, 0),
+        "11/25": (("%m/%d",), 1, 0),
+        "1125": (("%m%d",), 1, 0),
+    }
+
     class InvalidDateTimeFormatError(ValueError):
         def __init__(self, date_string):
             super().__init__(
-                "Invalid datetime format '{}'. "
-                "Only ISO 8601 supported.".format(date_string))
+                f"Invalid datetime format '{date_string}'. Only ISO 8601 supported."
+            )
 
     _matches_iso_format = re.compile(REGEX).match
 
-    # If parsed datetime values provide an offset or timzone, it is used for display. 
+    # If parsed datetime values provide an offset or timzone, it is used for display.
     # If not all values have the same offset, +0000 (=UTC) timezone is used
     _timezone = None
 
@@ -978,8 +1112,14 @@ class TimeVariable(ContinuousVariable):
             return str(val.value) if isinstance(val, Value) else str(val)
 
         # If you know how to simplify this, be my guest
+        # first, round to 6 decimals. By skipping this, you risk that
+        # microseconds would be rounded to 1_000_000 two lines later
+        val = round(val, 6)
         seconds = int(val)
+        # Rounding is needed to avoid rounding down; it will never be rounded
+        # to 1_000_000 because of the round we have above
         microseconds = int(round((val - seconds) * 1e6))
+        # If you know how to simplify this, be my guest
         if val < 0:
             if microseconds:
                 seconds, microseconds = seconds - 1, int(1e6) + microseconds
@@ -1011,6 +1151,7 @@ class TimeVariable(ContinuousVariable):
         """
         if datestr in MISSING_VALUES:
             return Unknown
+
         datestr = datestr.strip().rstrip('Z')
         datestr = self._tzre_sub(datestr)
 

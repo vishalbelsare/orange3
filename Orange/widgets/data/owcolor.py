@@ -18,6 +18,7 @@ from Orange.util import color_to_hex, hex_to_color
 from Orange.widgets import widget, settings, gui
 from Orange.widgets.gui import HorizontalGridDelegate
 from Orange.widgets.utils import itemmodels, colorpalettes
+from Orange.widgets.utils.localization import pl
 from Orange.widgets.utils.widgetpreview import WidgetPreview
 from Orange.widgets.report import colored_square as square
 from Orange.widgets.widget import Input, Output
@@ -41,7 +42,9 @@ class AttrDesc:
         new_name (str or `None`): a changed name or `None`
     """
     def __init__(self, var):
-        self.var = var
+        # these objects are stored within context settings;
+        # avoid storing compute_values
+        self.var = var.copy(compute_value=None)
         self.new_name = None
 
     def reset(self):
@@ -117,9 +120,9 @@ class DiscAttrDesc(AttrDesc):
             self.new_values = list(self.var.values)
         self.new_values[i] = value
 
-    def create_variable(self):
-        new_var = self.var.copy(name=self.name, values=self.values,
-                                compute_value=Identity(self.var))
+    def create_variable(self, base_var):
+        new_var = base_var.copy(name=self.name, values=self.values,
+                                compute_value=Identity(base_var))
         new_var.colors = np.asarray(self.colors)
         return new_var
 
@@ -208,9 +211,9 @@ class ContAttrDesc(AttrDesc):
     def palette_name(self, palette_name):
         self.new_palette_name = palette_name
 
-    def create_variable(self):
-        new_var = self.var.copy(name=self.name,
-                                compute_value=Identity(self.var))
+    def create_variable(self, base_var):
+        new_var = base_var.copy(name=self.name,
+                                compute_value=Identity(base_var))
         new_var.attributes["palette"] = self.palette_name
         return new_var
 
@@ -435,7 +438,7 @@ class ColorStripDelegate(HorizontalGridDelegate):
         strip = index.data(StripRole)
         rect = option.rect
         painter.drawPixmap(
-            rect.x() + 13, rect.y() + (rect.height() - strip.height()) / 2,
+            rect.x() + 13, int(rect.y() + (rect.height() - strip.height()) / 2),
             strip)
         super().paint(painter, option, index)
 
@@ -745,7 +748,7 @@ class OWColor(widget.OWWidget):
             for var in variables:
                 source = disc_dict if var.is_discrete else cont_dict
                 desc = source.get(var.name)
-                new_vars.append(desc.create_variable() if desc else var)
+                new_vars.append(desc.create_variable(var) if desc else var)
             return new_vars
 
         if self.data is None:
@@ -802,7 +805,7 @@ class OWColor(widget.OWWidget):
             (name, _report_variables(variables))
             for name, variables in (
                 ("Features", dom.attributes),
-                ("Outcome" + "s" * (len(dom.class_vars) > 1), dom.class_vars),
+                (f'{pl(len(dom.class_vars), "Outcome")}', dom.class_vars),
                 ("Meta attributes", dom.metas)))
         table = "".join(f"<tr><th>{name}</th></tr>{rows}"
                         for name, rows in sections if rows)

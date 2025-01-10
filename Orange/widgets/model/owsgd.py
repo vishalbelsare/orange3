@@ -25,7 +25,7 @@ class OWSGD(OWBaseLearner):
         "Orange.widgets.regression.owsgdregression.OWSGDRegression",
     ]
     priority = 90
-    keywords = ["sgd"]
+    keywords = "stochastic gradient descent, sgd"
 
     settings_version = 2
 
@@ -59,7 +59,6 @@ class OWSGD(OWBaseLearner):
         ('Optimal', 'optimal'),
         ('Inverse scaling', 'invscaling'))
 
-    learner_name = Setting('SGD')
     #: Loss function index for classification problems
     cls_loss_function_index = Setting(0)
     #: Epsilon loss function parameter for classification problems

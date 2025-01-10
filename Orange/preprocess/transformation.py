@@ -1,8 +1,15 @@
+from typing import TYPE_CHECKING, Mapping, Optional
+
 import numpy as np
 import scipy.sparse as sp
+from pandas import isna
 
-from Orange.data import Instance, Table, Domain
-from Orange.util import Reprable
+from Orange.data import Instance, Table, Domain, Variable
+from Orange.misc.collections import DictMissingConst
+from Orange.util import Reprable, nan_eq, nan_hash_stand, frompyfunc
+
+if TYPE_CHECKING:
+    from numpy.typing import DTypeLike
 
 
 class Transformation(Reprable):
@@ -77,10 +84,19 @@ class Transformation(Reprable):
 class Identity(Transformation):
     """Return an untransformed value of `c`.
     """
+    InheritEq = True
+
     def transform(self, c):
         return c
 
+    def __eq__(self, other):  # pylint: disable=useless-parent-delegation
+        return super().__eq__(other)
 
+    def __hash__(self):
+        return super().__hash__()
+
+
+# pylint: disable=abstract-method
 class _Indicator(Transformation):
     def __init__(self, variable, value):
         """
@@ -99,14 +115,47 @@ class _Indicator(Transformation):
     def __hash__(self):
         return hash((type(self), self.variable, self.value))
 
+    @staticmethod
+    def _nan_fixed(c, transformed):
+        if np.isscalar(c):
+            if c != c:  # pylint: disable=comparison-with-itself
+                transformed = np.nan
+            else:
+                transformed = float(transformed)
+        else:
+            transformed = transformed.astype(float)
+            transformed[np.isnan(c)] = np.nan
+        return transformed
+
 
 class Indicator(_Indicator):
     """
     Return an indicator value that equals 1 if the variable has the specified
     value and 0 otherwise.
     """
+
+    InheritEq = True
+
     def transform(self, c):
-        return c == self.value
+        if sp.issparse(c):
+            if self.value != 0:
+                # If value is nonzero, the matrix will become sparser:
+                # we transform the data and remove zeros
+                transformed = c.copy()
+                transformed.data = self.transform(c.data)
+                transformed.eliminate_zeros()
+                return transformed
+            else:
+                # Otherwise, it becomes dense anyway (or it wasn't really sparse
+                # before), so we just convert it to sparse before transforming
+                c = c.toarray().ravel()
+        return self._nan_fixed(c, c == self.value)
+
+    def __eq__(self, other):  # pylint: disable=useless-parent-delegation
+        return super().__eq__(other)
+
+    def __hash__(self):
+        return super().__hash__()
 
 
 class Indicator1(_Indicator):
@@ -114,8 +163,14 @@ class Indicator1(_Indicator):
     Return an indicator value that equals 1 if the variable has the specified
     value and -1 otherwise.
     """
-    def transform(self, c):
-        return (c == self.value) * 2 - 1
+
+    InheritEq = True
+
+    def transform(self, column):
+        # The result of this is always dense
+        if sp.issparse(column):
+            column = column.toarray().ravel()
+        return self._nan_fixed(column, (column == self.value) * 2 - 1)
 
 
 class Normalizer(Transformation):
@@ -187,5 +242,83 @@ class Lookup(Transformation):
                and np.allclose(self.unknown, other.unknown, equal_nan=True)
 
     def __hash__(self):
-        return hash((type(self), self.variable,
-                     tuple(self.lookup_table), self.unknown))
+        return hash(
+            (
+                type(self),
+                self.variable,
+                # nan value does not have constant hash in Python3.10
+                # to avoid different hashes for the same array change to None
+                # issue: https://bugs.python.org/issue43475#msg388508
+                tuple(None if isna(x) else x for x in self.lookup_table),
+                nan_hash_stand(self.unknown),
+            )
+        )
+
+
+class MappingTransform(Transformation):
+    """
+    Map values via a dictionary lookup.
+
+    Parameters
+    ----------
+    variable: Variable
+    mapping: Mapping
+        The mapping (for the non NA values).
+    dtype: Optional[DTypeLike]
+        The optional target dtype.
+    unknown: Any
+        The constant with whitch to replace unknown values in input.
+    """
+    def __init__(
+            self,
+            variable: Variable,
+            mapping: Mapping,
+            dtype: Optional['DTypeLike'] = None,
+            unknown=np.nan,
+    ) -> None:
+        super().__init__(variable)
+        if any(nan_eq(k, np.nan) for k in mapping.keys()):  # ill-defined mapping
+            raise ValueError("'nan' value in mapping.keys()")
+        self.mapping = mapping
+        self.dtype = dtype
+        self.unknown = unknown
+        self._mapper = self._make_dict_mapper(
+            DictMissingConst(unknown, mapping), dtype
+        )
+
+    @staticmethod
+    def _make_dict_mapper(mapping, dtype):
+        return frompyfunc(mapping.__getitem__, 1, 1, dtype)
+
+    def transform(self, c):
+        return self._mapper(c)
+
+    def __reduce_ex__(self, protocol):
+        return type(self), (self.variable, self.mapping, self.dtype, self.unknown)
+
+    def __eq__(self, other):
+        return super().__eq__(other) \
+               and nan_mapping_eq(self.mapping, other.mapping) \
+               and self.dtype == other.dtype \
+               and nan_eq(self.unknown, other.unknown)
+
+    def __hash__(self):
+        return hash((type(self), self.variable, nan_mapping_hash(self.mapping),
+                     self.dtype, nan_hash_stand(self.unknown)))
+
+
+def nan_mapping_hash(a: Mapping) -> int:
+    return hash(tuple((k, nan_hash_stand(v)) for k, v in a.items()))
+
+
+def nan_mapping_eq(a: Mapping, b: Mapping) -> bool:
+    if len(a) != len(b):
+        return False
+    try:
+        for k, va in a.items():
+            vb = b[k]
+            if not nan_eq(va, vb):
+                return False
+    except LookupError:
+        return False
+    return True

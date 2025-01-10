@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from random import random
 from unittest.mock import MagicMock, call, patch
 
 import numpy as np
@@ -22,11 +23,15 @@ class DummyResponse:
         self.content = content
 
 
-def make_dummy_post(response, sleep=0):
+def make_dummy_post(response):
     @staticmethod
     # pylint: disable=unused-argument
-    async def dummy_post(url, headers, data):
-        await asyncio.sleep(sleep)
+    async def dummy_post(url, headers, content=None, data=None):
+        # when sleeping some workers to still compute while other are done
+        # it causes that not all embeddings are computed if we do not wait all
+        # workers to finish
+        assert (content is None) ^ (data is None)
+        await asyncio.sleep(random() / 10)
         return DummyResponse(content=response)
 
     return dummy_post
@@ -124,15 +129,6 @@ class TestServerEmbedder(unittest.TestCase):
         # pylint: disable=protected-access
         self.assertEqual(200, len(self.embedder._cache._cache_dict))
 
-    @patch(_HTTPX_POST_METHOD, regular_dummy_sr)
-    def test_embedding_cancelled(self):
-        # pylint: disable=protected-access
-        # test for the server embedders
-        self.assertFalse(self.embedder._cancelled)
-        self.embedder.set_cancelled()
-        with self.assertRaises(Exception):
-            self.embedder.embedd_data(self.test_data)
-
     @patch(_HTTPX_POST_METHOD, side_effect=OSError)
     def test_connection_error(self, _):
         for num_rows in range(1, 20):
@@ -157,6 +153,11 @@ class TestServerEmbedder(unittest.TestCase):
                 self.embedder.embedd_data(test_data)
             self.setUp()  # to init new embedder
 
+    @patch(_HTTPX_POST_METHOD, side_effect=ValueError)
+    def test_other_errors(self, _):
+        with self.assertRaises(ValueError):
+            self.embedder.embedd_data(self.test_data)
+
     @patch(_HTTPX_POST_METHOD, regular_dummy_sr)
     def test_encode_data_instance(self):
         mocked_fun = self.embedder._encode_data_instance = AsyncMock(
@@ -167,3 +168,20 @@ class TestServerEmbedder(unittest.TestCase):
         mocked_fun.assert_has_calls(
             [call(item) for item in self.test_data], any_order=True
         )
+
+    @patch(_HTTPX_POST_METHOD, return_value=DummyResponse(b''), new_callable=AsyncMock)
+    def test_retries(self, mock):
+        self.embedder.embedd_data(self.test_data)
+        self.assertEqual(len(self.test_data) * 3, mock.call_count)
+
+    @patch(_HTTPX_POST_METHOD, regular_dummy_sr)
+    def test_callback(self):
+        mock = MagicMock()
+        self.embedder.embedd_data(self.test_data, callback=mock)
+
+        process_items = [call(x) for x in np.linspace(0, 1, len(self.test_data))]
+        mock.assert_has_calls(process_items)
+
+
+if __name__ == "__main__":
+    unittest.main()

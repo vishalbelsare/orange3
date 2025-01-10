@@ -1,4 +1,6 @@
 import itertools
+from math import log10, floor, ceil
+from typing import Union, Optional, Callable
 
 import numpy as np
 
@@ -6,10 +8,11 @@ from AnyQt.QtCore import (
     QRectF, QLineF, QObject, QEvent, Qt, pyqtSignal as Signal
 )
 from AnyQt.QtGui import QTransform, QFontMetrics, QStaticText, QBrush, QPen, \
-    QFont
+    QFont, QPalette
 from AnyQt.QtWidgets import (
     QGraphicsLineItem, QGraphicsSceneMouseEvent, QPinchGesture,
-    QGraphicsItemGroup, QWidget)
+    QGraphicsItemGroup, QWidget, QGraphicsWidget
+)
 
 import pyqtgraph as pg
 import pyqtgraph.functions as fn
@@ -32,11 +35,12 @@ class TextItem(pg.TextItem):
         return point.x(), point.y()
 
 
-class AnchorItem(pg.GraphicsObject):
+class AnchorItem(pg.GraphicsWidget):
     def __init__(self, parent=None, line=QLineF(), text="", **kwargs):
         super().__init__(parent, **kwargs)
         self._text = text
-        self.setFlag(pg.GraphicsObject.ItemHasNoContents)
+        self.setFlag(QGraphicsWidget.ItemSendsScenePositionChanges)
+        self.setFlag(QGraphicsWidget.ItemHasNoContents)
 
         self._spine = QGraphicsLineItem(line, self)
         angle = line.angle()
@@ -49,9 +53,12 @@ class AnchorItem(pg.GraphicsObject):
         self._label = TextItem(text=text, color=(10, 10, 10))
         self._label.setParentItem(self)
         self._label.setPos(*self.get_xy())
+        self._label.setColor(self.palette().color(QPalette.Text))
 
         if parent is not None:
             self.setParentItem(parent)
+
+        self.__updateLayout()
 
     def get_xy(self):
         point = self._spine.line().p2()
@@ -121,6 +128,23 @@ class AnchorItem(pg.GraphicsObject):
 
         self._arrow.setPos(self._spine.line().p2())
         self._arrow.setRotation(180 - angle)
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.PaletteChange:
+            self._label.setColor(self.palette().color(QPalette.Text))
+        super().changeEvent(event)
+
+    def itemChange(self, change, value):
+        if change in (
+                QGraphicsWidget.ItemParentHasChanged,
+                QGraphicsWidget.ItemSceneHasChanged,
+                # ItemScenePositionHasChanged seems to trigger for any scene
+                # transform change (even if the pos has not actually changed).
+                # Das ist gut.
+                QGraphicsWidget.ItemScenePositionHasChanged,
+        ):
+            self.__updateLayout()
+        return super().itemChange(change, value)
 
 
 class HelpEventDelegate(QObject):
@@ -211,13 +235,15 @@ class InteractiveViewBox(pg.ViewBox):
                 self.safe_update_scale_box(ev.buttonDownPos(), ev.pos())
                 if ev.isFinish():
                     self._updateDragtipShown(False)
-                    self.graph.unsuspend_jittering()
+                    if hasattr(self.graph, "unsuspend_jittering"):
+                        self.graph.unsuspend_jittering()
                     self.rbScaleBox.hide()
                     value_rect = get_mapped_rect()
                     self.graph.select_by_rectangle(value_rect)
                 else:
                     self._updateDragtipShown(True)
-                    self.graph.suspend_jittering()
+                    if hasattr(self.graph, "suspend_jittering"):
+                        self.graph.suspend_jittering()
                     self.safe_update_scale_box(ev.buttonDownPos(), ev.pos())
 
         def zoom():
@@ -237,7 +263,7 @@ class InteractiveViewBox(pg.ViewBox):
             # uses mapRectFromParent. We don't want to copy the parts of the
             # method that work, hence we only use our code under the following
             # conditions.
-            if ev.button() & (Qt.LeftButton | Qt.MidButton) \
+            if ev.button() & (Qt.LeftButton | Qt.MiddleButton) \
                     and self.state['mouseMode'] == pg.ViewBox.RectMode \
                     and ev.isFinish():
                 zoom()
@@ -258,7 +284,10 @@ class InteractiveViewBox(pg.ViewBox):
             lastview = self.axHistory[self.axHistoryPointer]
             inters = currentview & lastview
             united = currentview.united(lastview)
-            if inters.width()*inters.height()/(united.width()*united.height()) > 0.95:
+            # multiplication instead of division to avoid occasional
+            # division by zero in tests on github
+            if inters.width() * inters.height() \
+                    > 0.95 * united.width() * united.height():
                 return
         self.axHistoryPointer += 1
         self.axHistory = self.axHistory[:self.axHistoryPointer] + \
@@ -420,17 +449,74 @@ class ElidedLabelsAxis(pg.AxisItem):
     def generateDrawSpecs(self, p):
         axis_spec, tick_specs, text_specs = super().generateDrawSpecs(p)
         bounds = self.mapRectFromParent(self.geometry())
-        max_width = 0.9 * bounds.width() / (len(text_specs) or 1)
+        max_width = int(0.9 * bounds.width() / (len(text_specs) or 1))
         elide = QFontMetrics(QWidget().font()).elidedText
         text_specs = [(rect, flags, elide(text, Qt.ElideRight, max_width))
                       for rect, flags, text in text_specs]
         return axis_spec, tick_specs, text_specs
 
 
+class DiscretizedScale:
+    """
+    Compute suitable bins for continuous value from its minimal and
+    maximal value.
+
+    The width of the bin is a power of 10 (including negative powers).
+    The minimal value is rounded up and the maximal is rounded down. If this
+    gives less than 3 bins, the width is divided by four; if it gives
+    less than 6, it is halved.
+
+    .. attribute:: offset
+        The start of the first bin.
+
+    .. attribute:: width
+        The width of the bins
+
+    .. attribute:: bins
+        The number of bins
+
+    .. attribute:: decimals
+        The number of decimals used for printing out the boundaries
+    """
+    def __init__(self, min_v, max_v):
+        """
+        :param min_v: Minimal value
+        :type min_v: float
+        :param max_v: Maximal value
+        :type max_v: float
+        """
+        super().__init__()
+        dif = max_v - min_v if max_v != min_v else 1
+        if np.isnan(dif):
+            min_v = 0
+            dif = decimals = 1
+        else:
+            decimals = -floor(log10(dif))
+        resolution = 10 ** -decimals
+        bins = ceil(dif / resolution)
+        if bins < 6:
+            decimals += 1
+            if bins < 3:
+                resolution /= 4
+            else:
+                resolution /= 2
+            bins = ceil(dif / resolution)
+        self.offset: Union[int, float] = resolution * floor(min_v // resolution)
+        self.bins = bins
+        self.decimals = max(decimals, 0)
+        self.width: Union[int, float] = resolution
+
+    def get_bins(self):
+        # if width is a very large int, dtype of width * np.arange is object
+        # hence we cast it to float
+        return self.offset + float(self.width) * np.arange(self.bins + 1)
+
+
 class PaletteItemSample(ItemSample):
     """A color strip to insert into legends for discretized continuous values"""
 
-    def __init__(self, palette, scale, label_formatter=None):
+    def __init__(self, palette, scale,
+                 label_formatter: Optional[Callable[[float], str]] = None):
         """
         :param palette: palette used for showing continuous values
         :type palette: BinnedContinuousPalette
@@ -443,7 +529,9 @@ class PaletteItemSample(ItemSample):
         self.scale = scale
         if label_formatter is None:
             label_formatter = "{{:.{}f}}".format(scale.decimals).format
-        cuts = [label_formatter(scale.offset + i * scale.width)
+        # offset and width can be in, but label_formatter expects float
+        # (because it can be ContinuousVariable.str_val), hence cast to float
+        cuts = [label_formatter(float(scale.offset + i * scale.width))
                 for i in range(scale.bins + 1)]
         self.labels = [QStaticText("{} - {}".format(fr, to))
                        for fr, to in zip(cuts, cuts[1:])]
@@ -474,12 +562,13 @@ class PaletteItemSample(ItemSample):
         p.translate(5, 5)
         p.setFont(self.font)
         colors = self.palette.qcolors
+        foreground = super().palette().color(QPalette.Text)
         h = self.bin_height
         for i, color, label in zip(itertools.count(), colors, self.labels):
             p.setPen(Qt.NoPen)
             p.setBrush(QBrush(color))
             p.drawRect(0, i * h, h, h)
-            p.setPen(QPen(Qt.black))
+            p.setPen(QPen(foreground))
             p.drawStaticText(h + 5, i * h + 1, label)
 
 
@@ -497,7 +586,57 @@ class SymbolItemSample(ItemSample):
         drawSymbol(p, self.__symbol, self.__size, self.__pen, self.__brush)
 
 
-class AxisItem(pg.AxisItem):
+class StyledAxisItem(pg.AxisItem):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.label.setDefaultTextColor(self.palette().color(QPalette.Text))
+
+    def changeEvent(self, event: QEvent) -> None:
+        if event.type() == QEvent.FontChange:
+            self.picture = None
+            self.update()
+        elif event.type() == QEvent.PaletteChange:
+            self.picture = None
+            self.label.setDefaultTextColor(self.palette().color(QPalette.Text))
+            self.update()
+        super().changeEvent(event)
+
+    __hasTextPen = False
+
+    def setTextPen(self, *args, **kwargs):
+        self.__hasTextPen = args or kwargs
+        super().setTextPen(*args, **kwargs)
+        if not self.__hasTextPen:
+            self.__clear_labelStyle_color()
+
+    def textPen(self):
+        if self.__hasTextPen:
+            return super().textPen()
+        else:  # bypass pg.AxisItem
+            return QPen(self.palette().brush(QPalette.Text), 1)
+
+    __hasPen = False
+
+    def setPen(self, *args, **kwargs):
+        self.__hasPen = bool(args or kwargs)
+        super().setPen(*args, **kwargs)
+        if not self.__hasPen:
+            self.__clear_labelStyle_color()
+
+    def pen(self):
+        if self.__hasPen:
+            return super().pen()
+        else:  # bypass pg.AxisItem
+            return QPen(self.palette().brush(QPalette.Text), 1)
+
+    def __clear_labelStyle_color(self):
+        try:
+            self.labelStyle.pop("color")
+        except AttributeError:
+            pass
+
+
+class AxisItem(StyledAxisItem):
     def __init__(self, orientation, rotate_ticks=False, **kwargs):
         super().__init__(orientation, **kwargs)
         self.style["rotateTicks"] = rotate_ticks
@@ -543,3 +682,85 @@ class AxisItem(pg.AxisItem):
             self._updateMaxTextSize(max_text_size + offset)
         else:
             super().drawPicture(p, axisSpec, tickSpecs, textSpecs)
+
+
+class PlotWidget(pg.PlotWidget):
+    """
+    A pyqtgraph.PlotWidget with better QPalette integration.
+
+    A default constructed plot will respect and adapt to the current palette
+    """
+    def __init__(self, *args, background=None, **kwargs):
+        axisItems = kwargs.pop("axisItems", None)
+        if axisItems is None:  # Use palette aware AxisItems
+            axisItems = {"left": AxisItem("left"), "bottom": AxisItem("bottom")}
+        super().__init__(*args, background=background, axisItems=axisItems,
+                         **kwargs)
+        if background is None:
+            # Revert the pg.PlotWidget's modifications, use default
+            # for QGraphicsView background role
+            self.setBackgroundRole(QPalette.Base)
+        # Reset changes to the palette (undo changes from pg.GraphicsView)
+        self.setPalette(QPalette())
+        self.__updateScenePalette()
+
+    def setScene(self, scene):
+        super().setScene(scene)
+        self.__updateScenePalette()
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.PaletteChange:
+            self.__updateScenePalette()
+            self.resetCachedContent()
+        super().changeEvent(event)
+
+    def __updateScenePalette(self):
+        scene = self.scene()
+        if scene is not None:
+            scene.setPalette(self.palette())
+
+
+class GraphicsView(pg.GraphicsView):
+    """
+    A pyqtgraph.GraphicsView with better QPalette integration.
+
+    A default constructed plot will respect and adapt to the current palette
+    """
+    def __init__(self, *args, background=None, **kwargs):
+        super().__init__(*args, background=background, **kwargs)
+        if background is None:
+            # Revert the pg.PlotWidget's modifications, use default
+            # for QGraphicsView
+            self.setBackgroundRole(QPalette.Base)
+        # Reset changes to the palette (undo changes from pg.GraphicsView)
+        self.setPalette(QPalette())
+        self.__updateScenePalette()
+
+    def setScene(self, scene):
+        super().setScene(scene)
+        self.__updateScenePalette()
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.PaletteChange:
+            self.__updateScenePalette()
+            self.resetCachedContent()
+
+        super().changeEvent(event)
+
+    def __updateScenePalette(self):
+        scene = self.scene()
+        if scene is not None:
+            scene.setPalette(self.palette())
+
+
+class PlotItem(pg.PlotItem):
+    """
+    A pyqtgraph.PlotItem with better QPalette integration.
+
+    A default constructed plot will respect and adapt to the current palette
+    """
+    def __init__(self, *args, **kwargs):
+        axisItems = kwargs.pop("axisItems", None)
+        if axisItems is None:
+            axisItems = {"left": AxisItem("left"), "bottom": AxisItem("bottom")}
+        super().__init__(*args, axisItems=axisItems, **kwargs)

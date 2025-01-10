@@ -2,8 +2,10 @@
 # pylint: disable=protected-access
 import unittest
 from unittest.mock import Mock, patch
+from packaging.version import parse as parse_version
 
 import numpy as np
+from sklearn import __version__ as sklearn_version
 from AnyQt.QtCore import Qt
 from AnyQt.QtTest import QTest
 from AnyQt.QtWidgets import QApplication
@@ -16,12 +18,11 @@ from Orange.data import Table, Domain, DiscreteVariable, ContinuousVariable
 from Orange.evaluation import Results, TestOnTestData, scoring
 from Orange.evaluation.scoring import ClassificationScore, RegressionScore, \
     Score
-from Orange.base import Learner
+from Orange.base import Learner, Model
 from Orange.modelling import ConstantLearner
-from Orange.regression import MeanLearner
+from Orange.regression import MeanLearner, PLSRegressionLearner
 from Orange.widgets.evaluate.owtestandscore import (
     OWTestAndScore, results_one_vs_rest)
-from Orange.widgets.evaluate.utils import BUILTIN_SCORERS_ORDER
 from Orange.widgets.settings import (
     ClassValuesContextHandler, PerfectDomainContextHandler)
 from Orange.widgets.tests.base import WidgetTest
@@ -154,6 +155,11 @@ class TestOWTestAndScore(WidgetTest):
         self.widget.migrate_settings(settings, 2)
         self.assertEqual(settings['context_settings'], [context_valid])
 
+    def test_migrate_shown_scores(self):
+        settings = {"score_table": {"shown_scores": {"Sensitivity"}}}
+        self.widget.migrate_settings(settings, 3)
+        self.assertTrue(settings["score_table"]["show_score_hints"]["Sensitivity"])
+
     def test_memory_error(self):
         """
         Handling memory error.
@@ -178,7 +184,7 @@ class TestOWTestAndScore(WidgetTest):
         table = Table.from_list(
             Domain(
                 [ContinuousVariable("a"), ContinuousVariable("b")],
-                [DiscreteVariable("c", values=("y", ))]),
+                [DiscreteVariable("c", values=("y",))]),
             list(zip(
                 [42.48, 16.84, 15.23, 23.8],
                 [1., 2., 3., 4.],
@@ -186,14 +192,15 @@ class TestOWTestAndScore(WidgetTest):
         )
         self.widget.n_folds = 0
         self.assertFalse(self.widget.Error.train_data_error.is_shown())
-        self.send_signal("Data", table)
-        self.send_signal("Learner", MajorityLearner(), 0, wait=1000)
+        self.send_signal(self.widget.Inputs.train_data, table)
+        self.send_signal(self.widget.Inputs.learner, MajorityLearner(), 0, wait=1000)
         self.assertTrue(self.widget.Error.train_data_error.is_shown())
 
     def test_data_errors(self):
         """ Test all data_errors """
+
         def assertErrorShown(data, is_shown, message):
-            self.send_signal("Data", data)
+            self.send_signal(self.widget.Inputs.train_data, data)
             self.assertEqual(is_shown, self.widget.Error.train_data_error.is_shown())
             self.assertEqual(message, str(self.widget.Error.train_data_error))
 
@@ -224,34 +231,39 @@ class TestOWTestAndScore(WidgetTest):
             # These classes are registered, pylint: disable=unused-variable
             class NewScore(Score):
                 class_types = (DiscreteVariable, ContinuousVariable)
+                name = "new scorer"
+
+                @staticmethod
+                def is_compatible(domain: Domain) -> bool:
+                    return True
 
             class NewClassificationScore(ClassificationScore):
-                pass
+                name = "new classification scorer"
+                default_visible = False
 
             class NewRegressionScore(RegressionScore):
                 pass
 
-            builtins = BUILTIN_SCORERS_ORDER
-            self.send_signal("Data", Table("iris"))
-            scorer_names = [scorer.name for scorer in self.widget.scorers]
-            self.assertEqual(
-                tuple(scorer_names[:len(builtins[DiscreteVariable])]),
-                builtins[DiscreteVariable])
-            self.assertIn("NewScore", scorer_names)
-            self.assertIn("NewClassificationScore", scorer_names)
+            widget = self.create_widget(OWTestAndScore)
+            header = widget.score_table.view.horizontalHeader()
+            self.send_signal(widget.Inputs.train_data, Table("iris"))
+            scorer_names = [scorer.name for scorer in widget.scorers]
+            self.assertIn("new scorer", scorer_names)
+            self.assertFalse(header.isSectionHidden(3 + scorer_names.index("new scorer")))
+            self.assertIn("new classification scorer", scorer_names)
+            self.assertTrue(header.isSectionHidden(3 + scorer_names.index("new classification scorer")))
             self.assertNotIn("NewRegressionScore", scorer_names)
+            model = widget.score_table.model
 
-            self.send_signal("Data", Table("housing"))
-            scorer_names = [scorer.name for scorer in self.widget.scorers]
-            self.assertEqual(
-                tuple(scorer_names[:len(builtins[ContinuousVariable])]),
-                builtins[ContinuousVariable])
-            self.assertIn("NewScore", scorer_names)
-            self.assertNotIn("NewClassificationScore", scorer_names)
+
+            self.send_signal(widget.Inputs.train_data, Table("housing"))
+            scorer_names = [scorer.name for scorer in widget.scorers]
+            self.assertIn("new scorer", scorer_names)
+            self.assertNotIn("new classification scorer", scorer_names)
             self.assertIn("NewRegressionScore", scorer_names)
 
-            self.send_signal("Data", None)
-            self.assertEqual(self.widget.scorers, [])
+            self.send_signal(widget.Inputs.train_data, None)
+            self.assertEqual(widget.scorers, [])
         finally:
             del Score.registry["NewScore"]  # pylint: disable=no-member
             del Score.registry["NewClassificationScore"]  # pylint: disable=no-member
@@ -315,7 +327,7 @@ class TestOWTestAndScore(WidgetTest):
         header = view.horizontalHeader()
         p = header.rect().center()
         # second visible header section (after 'Model')
-        _, idx, *_ = (i for i in range(header.count())
+        _, _, idx, *_ = (i for i in range(header.count())
                       if not header.isSectionHidden(i))
         p.setX(header.sectionPosition(idx) + 5)
         QTest.mouseClick(header.viewport(), Qt.LeftButton, pos=p)
@@ -357,13 +369,17 @@ class TestOWTestAndScore(WidgetTest):
             list(zip(*self.scores_table_values + [list("yyyn")]))
         )
 
-        self.assertTupleEqual(
-            self._test_scores(
-                table, table[:3], ConstantLearner(),
-                OWTestAndScore.TestOnTest, None
-            ),
-            (None, 1, 1, 1, 1)
+        scores = self._test_scores(
+            table, table[:3], ConstantLearner(),
+            OWTestAndScore.TestOnTest, None
         )
+        self.assertTupleEqual(scores[1:], (1, 1, 1, 1))
+
+        # Sklearn, we love you.
+        if parse_version(sklearn_version) < parse_version("1.6dev"):
+            self.assertIsNone(scores[0])
+        else:
+            self.assertTrue(np.isnan(scores[0]))
 
     def test_scores_log_reg_overfitted(self):
         table = Table.from_list(
@@ -374,7 +390,7 @@ class TestOWTestAndScore(WidgetTest):
         self.assertTupleEqual(self._test_scores(
             table, table, LogisticRegressionLearner(),
             OWTestAndScore.TestOnTest, None),
-                              (1, 1, 1, 1, 1))
+            (1, 1, 1, 1, 1))
 
     def test_scores_log_reg_bad(self):
         table_train = Table.from_list(
@@ -389,7 +405,7 @@ class TestOWTestAndScore(WidgetTest):
         self.assertTupleEqual(self._test_scores(
             table_train, table_test, LogisticRegressionLearner(),
             OWTestAndScore.TestOnTest, None),
-                              (0, 0, 0, 0, 0))
+            (0, 0, 0, 0, 0))
 
     def test_scores_log_reg_bad2(self):
         table_train = Table.from_list(
@@ -513,24 +529,21 @@ class TestOWTestAndScore(WidgetTest):
         rbs[OWTestAndScore.KFold].click()
         self.get_output(self.widget.Outputs.evaluations_results, wait=5000)
         self.assertIsNotNone(w.comparison_table.cellWidget(0, 1))
-        self.assertTrue(w.modcompbox.isEnabled())
-        self.assertTrue(w.comparison_table.isEnabled())
+        self.assertTrue(w.compbox.isEnabled())
         baycomp.two_on_single.assert_called()
         baycomp.two_on_single.reset_mock()
 
         rbs[OWTestAndScore.LeaveOneOut].click()
         self.get_output(self.widget.Outputs.evaluations_results, wait=5000)
         self.assertIsNone(w.comparison_table.cellWidget(0, 1))
-        self.assertFalse(w.modcompbox.isEnabled())
-        self.assertFalse(w.comparison_table.isEnabled())
+        self.assertFalse(w.compbox.isEnabled())
         baycomp.two_on_single.assert_not_called()
         baycomp.two_on_single.reset_mock()
 
         rbs[OWTestAndScore.KFold].click()
         self.get_output(self.widget.Outputs.evaluations_results, wait=5000)
         self.assertIsNotNone(w.comparison_table.cellWidget(0, 1))
-        self.assertTrue(w.modcompbox.isEnabled())
-        self.assertTrue(w.comparison_table.isEnabled())
+        self.assertTrue(w.compbox.isEnabled())
         baycomp.two_on_single.assert_called()
         baycomp.two_on_single.reset_mock()
 
@@ -716,12 +729,64 @@ class TestOWTestAndScore(WidgetTest):
         selection_model = view.selectionModel()
         selection_model.select(model.index(0, 0),
                                selection_model.Select | selection_model.Rows)
-
         self.widget.copy_to_clipboard()
         clipboard_text = QApplication.clipboard().text()
+        # Tests appear to register additional scorers, so we clip the list
+        # to what we know to be there and visible
+        clipboard_text = "\t".join(clipboard_text.split("\t")[:6]).strip()
         view_text = "\t".join([str(model.data(model.index(0, i)))
-                               for i in (0, 3, 4, 5, 6, 7)]) + "\r\n"
+                               for i in (0, 3, 4, 5, 6, 7)]).strip()
         self.assertEqual(clipboard_text, view_text)
+
+    def test_multi_target_input(self):
+        class NewScorer(Score):
+            class_types = (
+                ContinuousVariable,
+                DiscreteVariable,
+            )
+
+            @staticmethod
+            def is_compatible(domain: Domain) -> bool:
+                return True
+
+            def compute_score(self, results):
+                return [0.75]
+
+        domain = Domain([ContinuousVariable('var1')],
+                        class_vars=[
+                            ContinuousVariable('c1'),
+                            DiscreteVariable('c2', values=('no', 'yes'))
+                        ])
+        data = Table.from_list(domain, [[1, 5, 0], [2, 10, 1], [2, 10, 1]])
+
+        mock_model = Mock(spec=Model, return_value=np.asarray([0.2, 0.1, 0.2]))
+        mock_model.name = 'Mockery'
+        mock_model.domain = domain
+        mock_learner = Mock(spec=Learner, return_value=mock_model)
+        mock_learner.name = 'Mockery'
+
+        widget = self.create_widget(OWTestAndScore)
+        widget.resampling = OWTestAndScore.TestOnTrain
+        self.send_signal(widget.Inputs.train_data, data)
+        self.send_signal(widget.Inputs.learner, MajorityLearner(), 0)
+        self.send_signal(widget.Inputs.learner, mock_learner, 1)
+        _ = self.get_output(widget.Outputs.evaluations_results, wait=5000)
+        self.assertTrue(len(widget.scorers) == 1)
+        self.assertTrue(NewScorer in widget.scorers)
+        self.assertTrue(len(widget._successful_slots()) == 1)
+
+    def test_multiple_targets_pls(self):
+        housing = Table("housing")
+        class_vars = [housing.domain.class_var, housing.domain.attributes[0]]
+        domain = Domain(housing.domain.attributes[1:], class_vars=class_vars)
+        multiple_targets_data = housing.transform(domain)
+
+        self.widget.error = Mock()
+        self.send_signal(self.widget.Inputs.train_data, multiple_targets_data)
+        self.send_signal(self.widget.Inputs.learner, PLSRegressionLearner())
+        self.wait_until_finished()
+        self.assertIn("Multiple targets are not supported.",
+                      self.widget.error.call_args[0][0])
 
 
 class TestHelpers(unittest.TestCase):

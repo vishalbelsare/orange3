@@ -1,8 +1,8 @@
-from collections import namedtuple
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Dict, List, Optional, Set
+from typing import \
+    Any, Dict, List, Optional, Set, Union, NamedTuple, Callable, Type
 
 import pandas as pd
 from numpy import nan
@@ -18,13 +18,14 @@ from AnyQt.QtWidgets import (
     QCheckBox,
     QGridLayout,
     QHeaderView,
-    QListView,
     QTableView,
 )
 from orangewidget.settings import ContextSetting, Setting
-from orangewidget.utils.listview import ListViewSearch
+from orangewidget.utils.listview import ListViewFilter
 from orangewidget.utils.signals import Input, Output
+from orangewidget.utils import enum_as_int
 from orangewidget.widget import Msg
+from pandas.core.dtypes.common import is_datetime64_any_dtype
 
 from Orange.data import (
     ContinuousVariable,
@@ -38,13 +39,19 @@ from Orange.data import (
 from Orange.data.aggregate import OrangeTableGroupBy
 from Orange.util import wrap_callback
 from Orange.widgets import gui
-from Orange.widgets.data.oweditdomain import disconnected
 from Orange.widgets.settings import DomainContextHandler
 from Orange.widgets.utils.concurrent import ConcurrentWidgetMixin, TaskState
 from Orange.widgets.utils.itemmodels import DomainModel
 from Orange.widgets.widget import OWWidget
 
-Aggregation = namedtuple("Aggregation", ["function", "types"])
+
+class Aggregation(NamedTuple):
+    function: Union[str, Callable]
+    types: Set[Type[Variable]]
+    # Gives the type of the result,
+    # or True to copy the original variable,
+    # or False to create a new variable of the same type as the input
+    result_type: Union[Type[Variable], bool]
 
 
 def concatenate(x):
@@ -55,44 +62,123 @@ def concatenate(x):
     return " ".join(str(v) for v in x if not pd.isnull(v) and len(str(v)) > 0)
 
 
+def std(s):
+    """
+    Std that also handle time variable. Pandas's std return Timedelta object in
+    case of datetime columns - transform TimeDelta to seconds
+    """
+    std_ = s.std()
+    if isinstance(std_, pd.Timedelta):
+        return std_.total_seconds()
+    # std returns NaT when cannot compute value - change it to nan to keep colum numeric
+    return nan if pd.isna(std_) else std_
+
+
+def var(s):
+    """
+    Variance that also handle time variable. Pandas's variance function somehow
+    doesn't support DateTimeArray - this function fist converts datetime series
+    to UNIX epoch and then computes variance
+    """
+    if is_datetime64_any_dtype(s):
+        initial_ts = pd.Timestamp("1970-01-01", tz=None if s.dt.tz is None else "UTC")
+        s = (s - initial_ts) / pd.Timedelta("1s")
+    var_ = s.var()
+    return var_.total_seconds() if isinstance(var_, pd.Timedelta) else var_
+
+
+def span(s):
+    """
+    Span that also handle time variable. Time substitution return Timedelta
+    object in case of datetime columns - transform TimeDelta to seconds
+    """
+    span_ = pd.Series.max(s) - pd.Series.min(s)
+    return span_.total_seconds() if isinstance(span_, pd.Timedelta) else span_
+
+
 AGGREGATIONS = {
-    "Mean": Aggregation("mean", {ContinuousVariable, TimeVariable}),
-    "Median": Aggregation("median", {ContinuousVariable, TimeVariable}),
+    "Mean": Aggregation(
+        "mean",
+        {ContinuousVariable, TimeVariable},
+        False),
+    "Median": Aggregation(
+        "median",
+        {ContinuousVariable, TimeVariable},
+        True),
+    "Q1": Aggregation(
+        lambda s: s.quantile(0.25),
+        {ContinuousVariable, TimeVariable},
+        True),
+    "Q3": Aggregation(
+        lambda s: s.quantile(0.75),
+        {ContinuousVariable, TimeVariable},
+        True),
+    "Min. value": Aggregation(
+        "min",
+        {ContinuousVariable, TimeVariable},
+        True),
+    "Max. value": Aggregation(
+        "max",
+        {ContinuousVariable, TimeVariable},
+        True),
     "Mode": Aggregation(
-        lambda x: pd.Series.mode(x).get(0, nan), {ContinuousVariable, TimeVariable}
+        lambda x: pd.Series.mode(x).get(0, nan),
+        {ContinuousVariable, DiscreteVariable, TimeVariable},
+        True
     ),
-    "Standard deviation": Aggregation("std", {ContinuousVariable, TimeVariable}),
-    "Variance": Aggregation("var", {ContinuousVariable, TimeVariable}),
-    "Sum": Aggregation("sum", {ContinuousVariable, TimeVariable}),
+    "Standard deviation": Aggregation(
+        std,
+        {ContinuousVariable, TimeVariable},
+        ContinuousVariable
+    ),
+    "Variance": Aggregation(
+        var,
+        {ContinuousVariable, TimeVariable},
+        ContinuousVariable
+    ),
+    "Sum": Aggregation(
+        "sum",
+        {ContinuousVariable},
+        True),
     "Concatenate": Aggregation(
         concatenate,
         {ContinuousVariable, DiscreteVariable, StringVariable, TimeVariable},
+        StringVariable
     ),
-    "Min. value": Aggregation("min", {ContinuousVariable, TimeVariable}),
-    "Max. value": Aggregation("max", {ContinuousVariable, TimeVariable}),
     "Span": Aggregation(
-        lambda x: pd.Series.max(x) - pd.Series.min(x),
+        span,
         {ContinuousVariable, TimeVariable},
+        ContinuousVariable
     ),
     "First value": Aggregation(
-        "first", {ContinuousVariable, DiscreteVariable, StringVariable, TimeVariable}
+        "first",
+        {ContinuousVariable, DiscreteVariable, StringVariable, TimeVariable},
+        True
     ),
     "Last value": Aggregation(
-        "last", {ContinuousVariable, DiscreteVariable, StringVariable, TimeVariable}
+        "last",
+        {ContinuousVariable, DiscreteVariable, StringVariable, TimeVariable},
+        True
     ),
     "Random value": Aggregation(
         lambda x: x.sample(1, random_state=0),
         {ContinuousVariable, DiscreteVariable, StringVariable, TimeVariable},
+        True
     ),
     "Count defined": Aggregation(
-        "count", {ContinuousVariable, DiscreteVariable, StringVariable, TimeVariable}
+        "count",
+        {ContinuousVariable, DiscreteVariable, StringVariable, TimeVariable},
+        ContinuousVariable
     ),
     "Count": Aggregation(
-        "size", {ContinuousVariable, DiscreteVariable, StringVariable, TimeVariable}
+        "size",
+        {ContinuousVariable, DiscreteVariable, StringVariable, TimeVariable},
+        ContinuousVariable
     ),
     "Proportion defined": Aggregation(
         lambda x: x.count() / x.size,
         {ContinuousVariable, DiscreteVariable, StringVariable, TimeVariable},
+        ContinuousVariable
     ),
 }
 # list of ordered aggregation names is required on several locations so we
@@ -132,7 +218,7 @@ def _run(
 
     aggregations = {
         var: [
-            (agg, AGGREGATIONS[agg].function)
+            (agg, AGGREGATIONS[agg].function, AGGREGATIONS[agg].result_type)
             for agg in sorted(aggs, key=AGGREGATIONS_ORD.index)
         ]
         for var, aggs in aggregations.items()
@@ -210,7 +296,7 @@ class VarTableModel(QAbstractTableModel):
         return super().headerData(i, orientation, role)
 
 
-class AggregateListViewSearch(ListViewSearch):
+class AggregateListViewSearch(ListViewFilter):
     """ListViewSearch that disables unselecting all items in the list"""
 
     def selectionCommand(
@@ -278,7 +364,7 @@ class CheckBox(QCheckBox):
                     self.setCheckState(Qt.PartiallyChecked)
                     # since checkbox state stay same signal is not emitted
                     # automatically but we need a callback call so we emit it
-                    self.stateChanged.emit(Qt.PartiallyChecked)
+                    self.stateChanged.emit(enum_as_int(Qt.PartiallyChecked))
             else:  # self.checkState() == Qt.Unchecked
                 # if unchecked: check if all can be checked else partially check
                 self.setCheckState(
@@ -300,7 +386,8 @@ class OWGroupBy(OWWidget, ConcurrentWidgetMixin):
     description = ""
     category = "Transform"
     icon = "icons/GroupBy.svg"
-    keywords = ["aggregate", "group by"]
+    keywords = "aggregate, group by"
+    priority = 1210
 
     class Inputs:
         data = Input("Data", Table, doc="Input data table")
@@ -335,13 +422,16 @@ class OWGroupBy(OWWidget, ConcurrentWidgetMixin):
 
     def __init_control_area(self) -> None:
         """Init all controls in the control area"""
-        box = gui.vBox(self.controlArea, "Group by")
-        self.gb_attrs_view = AggregateListViewSearch(
-            selectionMode=QListView.ExtendedSelection
+        gui.listView(
+            self.controlArea,
+            self,
+            "gb_attrs",
+            box="Group by",
+            model=self.gb_attrs_model,
+            viewType=AggregateListViewSearch,
+            callback=self.__gb_changed,
+            selectionMode=ListViewFilter.ExtendedSelection,
         )
-        self.gb_attrs_view.setModel(self.gb_attrs_model)
-        self.gb_attrs_view.selectionModel().selectionChanged.connect(self.__gb_changed)
-        box.layout().addWidget(self.gb_attrs_view)
 
         gui.auto_send(self.buttonsArea, self, "auto_commit")
 
@@ -363,7 +453,7 @@ class OWGroupBy(OWWidget, ConcurrentWidgetMixin):
 
         col = 0
         row = 0
-        break_rows = (5, 5, 99)
+        break_rows = (6, 6, 99)
         for agg in AGGREGATIONS:
             self.agg_checkboxes[agg] = cb = CheckBox(agg, self)
             cb.setDisabled(True)
@@ -397,14 +487,7 @@ class OWGroupBy(OWWidget, ConcurrentWidgetMixin):
                 )
 
     def __gb_changed(self) -> None:
-        """
-        Callback for Group-by attributes selection change; update attribute
-        and call commit
-        """
-        rows = self.gb_attrs_view.selectionModel().selectedRows()
-        values = self.gb_attrs_view.model()[:]
-        self.gb_attrs = [values[row.row()] for row in sorted(rows)]
-        # everything cached in result should be recomputed on gb change
+        """Callback for Group-by attributes selection change"""
         self.result = Result()
         self.commit.deferred()
 
@@ -434,7 +517,7 @@ class OWGroupBy(OWWidget, ConcurrentWidgetMixin):
         self.result = Result()
         self.Outputs.data.send(None)
         self.gb_attrs_model.set_domain(data.domain if data else None)
-        self.gb_attrs = data.domain[:1] if data else []
+        self.gb_attrs = self.gb_attrs_model[:1] if self.gb_attrs_model else []
         self.aggregations = (
             {
                 attr: DEFAULT_AGGREGATIONS[type(attr)].copy()
@@ -443,8 +526,13 @@ class OWGroupBy(OWWidget, ConcurrentWidgetMixin):
             if data
             else {}
         )
+        default_aggregations = self.aggregations.copy()
 
         self.openContext(self.data)
+
+        # restore aggregations
+        self.aggregations.update({k: v for k, v in default_aggregations.items()
+                                  if k not in self.aggregations})
 
         # update selections in widgets and re-plot
         self.agg_table_model.set_domain(data.domain if data else None)
@@ -484,19 +572,32 @@ class OWGroupBy(OWWidget, ConcurrentWidgetMixin):
         return [vars_[index.row()] for index in sel_rows]
 
     def _set_gb_selection(self) -> None:
-        """Set selection in groupby list according to self.gb_attrs"""
-        sm = self.gb_attrs_view.selectionModel()
+        """
+        Update selected attributes. When context includes variable hidden in
+        data, it will match and gb_attrs may include hidden attribute. Remove it
+        since otherwise widget groups by attribute that is not present in view.
+        """
         values = self.gb_attrs_model[:]
-        with disconnected(sm.selectionChanged, self.__gb_changed):
-            for val in self.gb_attrs:
-                index = values.index(val)
-                model_index = self.gb_attrs_model.index(index, 0)
-                sm.select(model_index, QItemSelectionModel.Select)
+        self.gb_attrs = [var_ for var_ in self.gb_attrs if var_ in values]
+        if not self.gb_attrs and self.gb_attrs_model:
+            # if gb_attrs empty select first
+            self.gb_attrs = self.gb_attrs_model[:1]
 
     @staticmethod
     def __aggregation_compatible(agg, attr):
         """Check a compatibility of aggregation with the variable"""
         return type(attr) in AGGREGATIONS[agg].types
+
+    @classmethod
+    def migrate_context(cls, context, _):
+        """
+        Before widget allowed using Sum on Time variable, now it is forbidden.
+        This function removes Sum from the context for TimeVariables (104)
+        """
+        for var_, v in context.values["aggregations"][0].items():
+            if len(var_) == 2:
+                if var_[1] == 104:
+                    v.discard("Sum")
 
 
 if __name__ == "__main__":

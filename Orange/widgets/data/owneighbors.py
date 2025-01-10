@@ -153,20 +153,24 @@ class OWNeighbors(OWWidget):
         up_to = len(dist) - np.sum(inrefs)
         if self.limit_neighbors and self.n_neighbors < up_to:
             up_to = self.n_neighbors
-        return np.argpartition(dist, up_to - 1)[:up_to]
+        # get indexes of N neighbours in unsorted order - faster than argsort
+        idx = np.argpartition(dist, up_to - 1)[:up_to]
+        # sort selected N neighbours according to distances
+        sorted_subset_idx = np.argsort(dist[idx])
+        # map sorted indexes back to original index space
+        return idx[sorted_subset_idx]
 
     def _data_with_similarity(self, indices):
-        data = self.data
-        varname = get_unique_names(data.domain, "distance")
-        metas = data.domain.metas + (ContinuousVariable(varname), )
-        domain = Domain(data.domain.attributes, data.domain.class_vars, metas)
-        data_metas = self.distances[indices].reshape((-1, 1))
-        if data.domain.metas:
-            data_metas = np.hstack((data.metas[indices], data_metas))
-        neighbors = Table(domain, data.X[indices], data.Y[indices], data_metas)
-        neighbors.ids = data.ids[indices]
-        neighbors.attributes = self.data.attributes
-        return neighbors
+        domain = self.data.domain
+        dist_var = ContinuousVariable(get_unique_names(domain, "distance"))
+        metas = domain.metas + (dist_var, )
+        domain = Domain(domain.attributes, domain.class_vars, metas)
+        neighbours = self.data.from_table(domain, self.data, row_indices=indices)
+        distances = self.distances[indices]
+        with neighbours.unlocked(neighbours.metas):
+            if distances.size > 0:
+                neighbours.set_column(dist_var, distances)
+        return neighbours
 
 
 if __name__ == "__main__":  # pragma: no cover

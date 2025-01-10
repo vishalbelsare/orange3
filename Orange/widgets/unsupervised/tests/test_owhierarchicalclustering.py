@@ -10,6 +10,7 @@ from AnyQt.QtTest import QTest
 import Orange.misc
 from Orange.data import Table, Domain, ContinuousVariable, DiscreteVariable
 from Orange.distance import Euclidean
+from Orange.misc import DistMatrix
 from Orange.widgets.tests.base import WidgetTest, WidgetOutputsTestMixin
 from Orange.widgets.unsupervised.owhierarchicalclustering import \
     OWHierarchicalClustering
@@ -22,7 +23,7 @@ class TestOWHierarchicalClustering(WidgetTest, WidgetOutputsTestMixin):
         WidgetOutputsTestMixin.init(cls)
 
         cls.distances = Euclidean(cls.data)
-        cls.signal_name = "Distances"
+        cls.signal_name = OWHierarchicalClustering.Inputs.distances
         cls.signal_data = cls.distances
         cls.same_input_output_domain = False
 
@@ -139,6 +140,20 @@ class TestOWHierarchicalClustering(WidgetTest, WidgetOutputsTestMixin):
         self.send_signal(self.widget.Inputs.distances, self.distances)
         self.assertFalse(self.widget.Error.not_finite_distances.is_shown())
 
+    def test_not_symmetric(self):
+        w = self.widget
+        self.send_signal(w.Inputs.distances, DistMatrix([[1, 2, 3], [4, 5, 6]]))
+        self.assertTrue(w.Error.not_symmetric.is_shown())
+        self.send_signal(w.Inputs.distances, None)
+        self.assertFalse(w.Error.not_symmetric.is_shown())
+
+    def test_empty_matrix(self):
+        w = self.widget
+        self.send_signal(w.Inputs.distances, DistMatrix([[]]))
+        self.assertTrue(w.Error.empty_matrix.is_shown())
+        self.send_signal(w.Inputs.distances, None)
+        self.assertFalse(w.Error.empty_matrix.is_shown())
+
     def test_output_cut_ratio(self):
         self.send_signal(self.widget.Inputs.distances, self.distances)
 
@@ -147,6 +162,7 @@ class TestOWHierarchicalClustering(WidgetTest, WidgetOutputsTestMixin):
         annotated = self.get_output(self.widget.Outputs.annotated_data)
         self.assertIsNotNone(annotated)
 
+        self.widget.grab()  # Force layout
         # selecting clusters with cutoff should select all data
         QTest.mousePress(
             self.widget.view.headerView().viewport(),
@@ -191,3 +207,22 @@ class TestOWHierarchicalClustering(WidgetTest, WidgetOutputsTestMixin):
         annotated = [(a.name, a.attributes['cluster']) for a in o.domain.attributes]
         self.assertEqual(annotated, [('sepal length', 1), ('petal width', 2),
                                      ('sepal width', 3), ('petal length', 3)])
+
+    def test_many_values_warning(self):
+        w = self.widget
+
+        self.send_signal(self.widget.Inputs.distances, self.distances)
+        w.top_n = 21
+        w.selection_box.buttons[2].click()
+        self.assertTrue(w.Warning.many_clusters.is_shown())
+
+        w.top_n = 20
+        w.selection_box.buttons[2].click()
+        self.assertFalse(w.Warning.many_clusters.is_shown())
+
+        w.top_n = 21
+        w.selection_box.buttons[2].click()
+        self.assertTrue(w.Warning.many_clusters.is_shown())
+
+        self.send_signal(self.widget.Inputs.distances, None)
+        self.assertFalse(w.Warning.many_clusters.is_shown())

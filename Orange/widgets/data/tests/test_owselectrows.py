@@ -1,6 +1,6 @@
 # Test methods with long descriptive names can omit docstrings
 # pylint: disable=missing-docstring,unsubscriptable-object
-import time
+import unittest
 from unittest.mock import patch
 import numpy as np
 
@@ -47,9 +47,13 @@ SFValues = {
     FilterString.Between: ["aardwark", "cat"],
     FilterString.Outside: ["aardwark"],
     FilterString.Contains: ["aa"],
+    FilterString.NotContain: ["bb"],
     FilterString.StartsWith: ["aa"],
+    FilterString.NotStartsWith: ["bb"],
     FilterString.EndsWith: ["ark"],
-    FilterString.IsDefined: []
+    FilterString.NotEndsWith: ["zz"],
+    FilterString.IsDefined: [],
+    FilterString.NotIsDefined: [], # TODO: needs test data
 }
 
 DFValues = {
@@ -81,7 +85,7 @@ class TestOWSelectRows(WidgetTest):
         self.widget.auto_commit = True
         self.widget.set_data(iris)
 
-        for i, (op, _) in enumerate(OWSelectRows.Operators[ContinuousVariable]):
+        for i, (op, *_) in enumerate(OWSelectRows.Operators[ContinuousVariable]):
             self.widget.remove_all()
             self.widget.add_row(iris.domain[0], i, CFValues[op])
             self.widget.conditions_changed()
@@ -92,7 +96,7 @@ class TestOWSelectRows(WidgetTest):
             Domain([], metas=[iris.domain.attributes[0]]), iris
         )
         self.widget.set_data(iris)
-        for i, (op, _) in enumerate(OWSelectRows.Operators[ContinuousVariable]):
+        for i, (op, *_) in enumerate(OWSelectRows.Operators[ContinuousVariable]):
             self.widget.remove_all()
             self.widget.add_row(iris.domain.metas[0], i, CFValues[op])
             self.widget.conditions_changed()
@@ -102,7 +106,7 @@ class TestOWSelectRows(WidgetTest):
         zoo = Table("zoo")[::5]
         self.widget.auto_commit = False
         self.widget.set_data(zoo)
-        for i, (op, _) in enumerate(OWSelectRows.Operators[StringVariable]):
+        for i, (op, *_) in enumerate(OWSelectRows.Operators[StringVariable]):
             self.widget.remove_all()
             self.widget.add_row(zoo.domain.metas[0], i, SFValues[op])
             self.widget.conditions_changed()
@@ -135,7 +139,7 @@ class TestOWSelectRows(WidgetTest):
         self.widget.auto_commit = False
         self.widget.set_data(data)
 
-        for i, (op, _) in enumerate(OWSelectRows.Operators[TimeVariable]):
+        for i, (op, *_) in enumerate(OWSelectRows.Operators[TimeVariable]):
             self.widget.remove_all()
             self.widget.add_row(data.domain["breach_start"], i, TFValues[op])
             self.widget.conditions_changed()
@@ -146,7 +150,7 @@ class TestOWSelectRows(WidgetTest):
             Domain([], metas=[data.domain["breach_start"]]), data
         )
         self.widget.set_data(data)
-        for i, (op, _) in enumerate(OWSelectRows.Operators[TimeVariable]):
+        for i, (op, *_) in enumerate(OWSelectRows.Operators[TimeVariable]):
             self.widget.remove_all()
             self.widget.add_row(data.domain.metas[0], i, TFValues[op])
             self.widget.conditions_changed()
@@ -310,37 +314,6 @@ class TestOWSelectRows(WidgetTest):
         self.assertEqual(condition[1], 2)
         self.assertEqual(condition[2], (2, ))  # index of value + 1
 
-    def test_backward_compat_match_values(self):
-        iris = Table("iris")
-        domain = iris.domain
-        class_var = domain.class_var
-        self.widget = self.widget_with_context(
-            domain, [[class_var.name, 1, 2, (1, 2)]])
-
-        new_class_var = DiscreteVariable(class_var.name, class_var.values[1:])
-        new_domain = Domain(domain.attributes, new_class_var)
-        non0 = iris.Y != 0
-        iris2 = Table.from_numpy(new_domain, iris.X[non0], iris.Y[non0] - 1)
-        self.send_signal(self.widget.Inputs.data, iris2)
-        condition = self.widget.conditions[0]
-        self.assertIs(condition[0], new_class_var)
-        self.assertEqual(condition[1], 2)
-        self.assertEqual(condition[2], (1, 2))  # index of value + 1
-
-        # reset to [0] if out of range
-        self.widget = self.widget_with_context(
-            domain, [[class_var.name, 1, 2, (1, 3)]])
-
-        new_class_var = DiscreteVariable(class_var.name, class_var.values[1:])
-        new_domain = Domain(domain.attributes, new_class_var)
-        non0 = iris.Y != 0
-        iris2 = Table.from_numpy(new_domain, iris.X[non0], iris.Y[non0] - 1)
-        self.send_signal(self.widget.Inputs.data, iris2)
-        condition = self.widget.conditions[0]
-        self.assertIs(condition[0], new_class_var)
-        self.assertEqual(condition[1], 2)
-        self.assertEqual(condition[2], (0, ))  # index of value + 1
-
     @override_locale(QLocale.C)
     def test_partial_matches_with_missing_vars(self):
         iris = Table("iris")
@@ -387,9 +360,10 @@ class TestOWSelectRows(WidgetTest):
 
         self.enterFilter(data.domain["c2"], "is defined")
         self.assertFalse(self.widget.Error.parsing_error.is_shown())
-        self.assertEqual(len(self.get_output("Matching Data")), 3)
-        self.assertEqual(len(self.get_output("Unmatched Data")), 1)
-        self.assertEqual(len(self.get_output("Data")), len(data))
+        outputs = self.widget.Outputs
+        self.assertEqual(len(self.get_output(outputs.matching_data)), 3)
+        self.assertEqual(len(self.get_output(outputs.unmatched_data)), 1)
+        self.assertEqual(len(self.get_output(outputs.annotated_data)), len(data))
 
         # Test saving of settings
         self.widget.settingsHandler.pack_data(self.widget)
@@ -404,14 +378,15 @@ class TestOWSelectRows(WidgetTest):
         self.send_signal(self.widget.Inputs.data, data)
 
         self.enterFilter(data.domain[0], "is below", "-1")
-        self.assertIsNone(self.get_output("Matching Data"))
-        self.assertEqual(len(self.get_output("Unmatched Data")), len_data)
-        self.assertEqual(len(self.get_output("Data")), len_data)
+        outputs = self.widget.Outputs
+        self.assertIsNone(self.get_output(outputs.matching_data))
+        self.assertEqual(len(self.get_output(outputs.unmatched_data)), len_data)
+        self.assertEqual(len(self.get_output(outputs.annotated_data)), len_data)
         self.widget.remove_all_button.click()
         self.enterFilter(data.domain[0], "is below", "10")
-        self.assertIsNone(self.get_output("Unmatched Data"))
-        self.assertEqual(len(self.get_output("Matching Data")), len_data)
-        self.assertEqual(len(self.get_output("Data")), len_data)
+        self.assertIsNone(self.get_output(outputs.unmatched_data))
+        self.assertEqual(len(self.get_output(outputs.matching_data)), len_data)
+        self.assertEqual(len(self.get_output(outputs.annotated_data)), len_data)
 
     def test_annotated_data(self):
         iris = Table("iris")
@@ -421,7 +396,7 @@ class TestOWSelectRows(WidgetTest):
 
         annotated = self.get_output(self.widget.Outputs.annotated_data)
         self.assertEqual(len(annotated), 150)
-        annotations = annotated.get_column_view(ANNOTATED_DATA_FEATURE_NAME)[0]
+        annotations = annotated.get_column(ANNOTATED_DATA_FEATURE_NAME)
         np.testing.assert_equal(annotations[:50], True)
         np.testing.assert_equal(annotations[50:], False)
 
@@ -472,14 +447,15 @@ class TestOWSelectRows(WidgetTest):
 
         # first displayed date is min date
         self.assertEqual(value_combo.date(), QDate(2014, 1, 23))
-        self.assertEqual(len(self.get_output("Matching Data")), 691)
+        outputs = self.widget.Outputs
+        self.assertEqual(len(self.get_output(outputs.matching_data)), 691)
         self.widget.remove_all_button.click()
         self.enterFilter("Date_Posted_or_Updated", "is below",
                          QDate(2014, 4, 17))
-        self.assertEqual(len(self.get_output("Matching Data")), 840)
+        self.assertEqual(len(self.get_output(outputs.matching_data)), 840)
         self.enterFilter("Date_Posted_or_Updated", "is greater than",
                          QDate(2014, 6, 30))
-        self.assertIsNone(self.get_output("Matching Data"))
+        self.assertIsNone(self.get_output(outputs.matching_data))
         self.widget.remove_all_button.click()
         # date is in range min-max date
         self.enterFilter("Date_Posted_or_Updated", "equals", QDate(2013, 1, 1))
@@ -495,7 +471,7 @@ class TestOWSelectRows(WidgetTest):
         self.widget.remove_all_button.click()
         self.enterFilter("Date_Posted_or_Updated", "is between",
                          QDate(2014, 4, 17), QDate(2014, 4, 30))
-        self.assertEqual(len(self.get_output("Matching Data")), 58)
+        self.assertEqual(len(self.get_output(outputs.matching_data)), 58)
 
     @patch.object(owselectrows.QMessageBox, "question",
                   return_value=owselectrows.QMessageBox.Ok)
@@ -532,43 +508,15 @@ class TestOWSelectRows(WidgetTest):
         self.enterFilter(zoo.domain[1], "is one of")
         self.widget.send_report()  # don't crash
 
-    # Uncomment this on 2022/2/2
-    #
-    # def test_migration_to_version_1(self):
-    #     iris = Table("iris")
-    #
-    #     ch = SelectRowsContextHandler()
-    #     context = ch.new_context(iris.domain, *ch.encode_domain(iris.domain))
-    #     context.values = dict(conditions=[["petal length", 2, (5.2,)]])
-    #     settings = dict(context_settings=[context])
-    #     widget = self.create_widget(OWSelectRows, settings)
-    #     self.assertEqual(widget.conditions, [])
-
-    @override_locale(QLocale.C)
-    def test_support_old_settings(self):
+    def test_migration_to_version_1(self):
         iris = Table("iris")
-        self.widget = self.widget_with_context(
-            iris.domain, [["sepal length", 2, ("5.2",)]])
-        self.send_signal(self.widget.Inputs.data, iris)
-        condition = self.widget.conditions[0]
-        self.assertEqual(condition[0], iris.domain["sepal length"])
-        self.assertEqual(condition[1], 2)
-        self.assertTrue(condition[2][0].startswith("5.2"))
 
-    def test_end_support_for_version_1(self):
-        if time.gmtime() >= (2022, 2, 2):
-            self.fail("""
-Happy 22/2/2!
-
-Now remove support for version==None settings in
-SelectRowsContextHandler.decode_setting and SelectRowsContextHandler.match,
-and uncomment OWSelectRows.migrate.
-
-In tests, uncomment test_migration_to_version_1,
-and remove test_support_old_settings and this test.
-
-Basically, revert this commit.
-""")
+        ch = SelectRowsContextHandler()
+        context = ch.new_context(iris.domain, *ch.encode_domain(iris.domain))
+        context.values = dict(conditions=[["petal length", 2, (5.2,)]])
+        settings = dict(context_settings=[context])
+        widget = self.create_widget(OWSelectRows, settings)
+        self.assertEqual(widget.conditions, [])
 
     def test_purge_discretized(self):
         housing = Table("housing")
@@ -577,7 +525,9 @@ Basically, revert this commit.
             discretize_class=True, method=method)
         domain = discretizer(housing)
         data = housing.transform(domain)
-        widget = self.widget_with_context(domain, [["MEDV", 101, 2, (2, 3)]])
+        widget = self.widget_with_context(
+            domain, [["MEDV", 101, 2, domain.class_var.values[1:]]]
+        )
         widget.purge_classes = True
         self.send_signal(widget.Inputs.data, data)
         out = self.get_output(widget.Outputs.matching_data)
@@ -614,6 +564,32 @@ Basically, revert this commit.
         # when sending new-same data conditions are restored from the context
         self.send_signal(self.widget.Inputs.data, data)
         self.assertListEqual([c[0] for c in self.widget.conditions], vars_)
+
+    def test_one_of_click(self):
+        """Test items checked in is one of dropdown"""
+        zoo = Table("zoo")
+        self.send_signal(self.widget.Inputs.data, zoo)
+        self.widget.remove_all_button.click()
+        self.enterFilter(zoo.domain[1], "is one of")
+        model = self.widget.cond_list.cellWidget(0, 2).popup.list_view.model()
+
+        output = self.get_output(self.widget.Outputs.matching_data)
+        self.assertEqual(len(zoo), len(output))
+
+        # check second item (group 1) - only 20 elements in this group
+        model.item(1).setCheckState(Qt.Checked)
+        output = self.get_output(self.widget.Outputs.matching_data)
+        self.assertEqual(20, len(output))
+
+        # check first item (group 0) - now all elements should be at the output
+        model.item(0).setCheckState(Qt.Checked)
+        output = self.get_output(self.widget.Outputs.matching_data)
+        self.assertEqual(len(zoo), len(output))
+
+        # uncheck second element (group 1) - only elements fo group 0 at output
+        model.item(1).setCheckState(Qt.Unchecked)
+        output = self.get_output(self.widget.Outputs.matching_data)
+        self.assertEqual(81, len(output))
 
     def widget_with_context(self, domain, conditions):
         ch = SelectRowsContextHandler()
@@ -669,3 +645,7 @@ Basically, revert this commit.
             widget.setDate(value)
         else:
             raise ValueError("Unsupported widget {}".format(widget))
+
+
+if __name__ == "__main__":
+    unittest.main()

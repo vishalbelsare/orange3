@@ -42,7 +42,7 @@ class VariablesListItemView(QListView):
     """
     #: Emitted with a Qt.DropAction when a drag/drop (originating from this
     #: view) completed successfully
-    dragDropActionDidComplete = Signal(int)
+    dragDropActionDidComplete = Signal(Qt.DropAction)
 
     def __init__(self, parent=None, acceptedType=Orange.data.Variable):
         super().__init__(parent)
@@ -134,6 +134,9 @@ class VariableFilterProxyModel(QSortFilterProxyModel):
     def set_filter_string(self, filter):
         self._filter_string = str(filter).lower()
         self.invalidateFilter()
+
+    def filter_string(self):
+        return self._filter_string
 
     def filter_accepts_variable(self, var):
         row_str = var.name + " ".join(("%s=%s" % item)

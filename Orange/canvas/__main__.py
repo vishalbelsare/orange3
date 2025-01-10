@@ -15,8 +15,8 @@ from logging.handlers import RotatingFileHandler
 from collections import defaultdict
 from datetime import date
 from urllib.request import urlopen, Request
+from packaging.version import Version
 
-import pkg_resources
 import yaml
 
 from AnyQt.QtGui import QColor, QDesktopServices, QIcon, QPalette
@@ -101,9 +101,8 @@ def check_for_updates():
                     self.resultReady.emit(contents)
 
         def compare_versions(latest):
-            version = pkg_resources.parse_version
             skipped = settings.value('startup/latest-skipped-version', "", type=str)
-            if version(latest) <= version(current) or \
+            if Version(latest) <= Version(current) or \
                     latest == skipped:
                 return
 
@@ -187,8 +186,6 @@ def pull_notifications():
     if not check_notifs:
         return None
 
-    Version = pkg_resources.parse_version
-
     # create settings_dict for notif requirements purposes (read-only)
     spec = canvasconfig.spec + config.spec
     settings_dict = canvasconfig.Settings(defaults=spec, store=settings)
@@ -198,7 +195,7 @@ def pull_notifications():
                       if ep.dist is not None]
     installed = defaultdict(lambda: "-1")
     for addon in installed_list:
-        installed[addon.project_name] = addon.version
+        installed[addon.name] = addon.version
 
     # get set of already displayed notification IDs, stored in settings["notifications/displayed"]
     displayedIDs = literal_eval(settings.value("notifications/displayed", "set()", str))
@@ -361,11 +358,40 @@ class OMain(Main):
             "--clear-widget-settings", action="store_true",
             help="Clear stored widget setting/defaults",
         )
+        parser.add_argument(
+            "--clear-all", action="store_true",
+            help="Clear all settings and caches"
+        )
         return parser
 
     def setup_logging(self):
         super().setup_logging()
         make_sql_logger(self.options.log_level)
+
+    @staticmethod
+    def _rm_tree(path):
+        log.debug("rmtree '%s'", path)
+        shutil.rmtree(path, ignore_errors=True)
+
+    def clear_widget_settings(self):
+        log.info("Clearing widget settings")
+        self._rm_tree(widget_settings_dir(versioned=True))
+        self._rm_tree(widget_settings_dir(versioned=False))
+
+    def clear_caches(self):  # pylint: disable=import-outside-toplevel
+        from Orange.misc import environ
+        log.info("Clearing caches")
+        self._rm_tree(environ.cache_dir())
+        log.info("Clearing data")
+        self._rm_tree(environ.data_dir(versioned=True))
+        self._rm_tree(environ.data_dir(versioned=False))
+
+    def clear_application_settings(self):  # pylint: disable=no-self-use
+        s = QSettings()
+        log.info("Clearing application settings")
+        log.debug("clear '%s'", s.fileName())
+        s.clear()
+        s.sync()
 
     def setup_application(self):
         super().setup_application()
@@ -375,8 +401,12 @@ class OMain(Main):
         options = self.options
         if options.clear_widget_settings or \
                 os.path.isfile(clear_settings_flag):
-            log.info("Clearing widget settings")
-            shutil.rmtree(widget_settings_dir(), ignore_errors=True)
+            self.clear_widget_settings()
+
+        if options.clear_all:
+            self.clear_widget_settings()
+            self.clear_caches()
+            self.clear_application_settings()
 
         notif_server = NotificationServer()
         canvas.notification_server_instance = notif_server
@@ -410,7 +440,7 @@ class OMain(Main):
         app.paletteChanged.connect(onPaletteChange)
         onPaletteChange()
 
-    def show_splash_message(self, message: str, color=QColor("#FFD39F")):
+    def show_splash_message(self, message: str, color=QColor("#FFFFFF")):
         super().show_splash_message(message, color)
 
     def create_main_window(self):
