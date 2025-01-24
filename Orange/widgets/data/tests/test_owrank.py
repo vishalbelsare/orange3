@@ -2,12 +2,16 @@
 import time
 import warnings
 import unittest
+from enum import Enum
+from itertools import count
 from unittest.mock import patch
 
 import numpy as np
 from sklearn.exceptions import ConvergenceWarning
 
-from AnyQt.QtCore import Qt, QItemSelection, QItemSelectionModel
+from AnyQt.QtCore import Qt, QItemSelection, QItemSelectionModel, \
+    QT_VERSION_INFO
+from AnyQt.QtGui import QIcon
 from AnyQt.QtWidgets import QCheckBox, QApplication
 
 from orangewidget.settings import Context, IncompatibleContext
@@ -19,8 +23,9 @@ from Orange.preprocess.score import Scorer
 from Orange.classification import LogisticRegressionLearner
 from Orange.regression import LinearRegressionLearner
 from Orange.projection import PCA
+from Orange.widgets import gui
 from Orange.widgets.data.owrank import OWRank, ProblemType, CLS_SCORES, \
-    REG_SCORES, TableModel
+    REG_SCORES, RankTableModel
 from Orange.widgets.tests.base import WidgetTest, datasets
 from Orange.widgets.widget import AttributeList
 
@@ -31,6 +36,62 @@ class SlowScorer(Scorer):
     def score_data(self, data, feature=None):
         time.sleep(1)
         return np.ones((1, len(data.domain.attributes)))
+
+
+class TestRankModel(GuiTest):
+    def setUp(self):
+        attributes = [DiscreteVariable("ann", values=tuple("ab")),
+                      DiscreteVariable("great", values=tuple("defg"))] \
+            + [ContinuousVariable(x) for x in "def"]
+        self.attributes = attributes
+        attributes[0].attributes["foo"] = "bar"
+        data = [[var, nvals] + [10 * i + j for j in range(3)]
+                for i, var, nvals in zip(count(), attributes,
+                                         (2, 4, np.nan, np.nan, np.nan))]
+        self.model = RankTableModel()
+        self.model.wrap(data)
+
+    def _get(self, row, column, role=Qt.DisplayRole):
+        return self.model.index(row, column).data(role)
+
+    def test_data(self):
+        # scores
+        self.assertEqual(self._get(0, 4), 2)
+        self.assertEqual(self._get(1, 2), 10)
+
+        # n values
+        self.assertEqual(self._get(0, 1), 2)
+        self.assertEqual(self._get(1, 1), 4)
+        self.assertEqual(self._get(2, 1), "")
+
+        # variables
+        self.assertEqual(self._get(0, 0), "ann")
+        self.assertEqual(self._get(1, 0), "great")
+        self.assertEqual(self._get(3, 0), "e")
+
+        self.assertIsInstance(self._get(0, 0, Qt.DecorationRole), QIcon)
+        self.assertIsInstance(self._get(2, 0, Qt.DecorationRole), QIcon)
+
+        self.assertIn("foo", self._get(0, 0, Qt.ToolTipRole))
+        self.assertIn("bar", self._get(0, 0, Qt.ToolTipRole))
+        self.assertNotIn("bar", self._get(1, 0, Qt.ToolTipRole))
+
+        self.assertIs(self._get(0, 0, gui.TableVariable), self.attributes[0])
+        self.assertIs(self._get(3, 0, gui.TableVariable), self.attributes[3])
+
+    def test_sorting(self):
+        self.model.sort(0, Qt.AscendingOrder)
+        self.assertIs(self._get(0, 0, gui.TableVariable), self.attributes[0])
+        self.assertIs(self._get(1, 0, gui.TableVariable), self.attributes[2])
+        self.assertIs(self._get(0, 2 + 1), 1)
+        self.assertIs(self._get(1, 2 + 0), 20)
+
+        self.model.sort(2, Qt.DescendingOrder)
+        self.assertIs(self._get(0, 0, gui.TableVariable), self.attributes[4])
+        self.assertIs(self._get(4, 0, gui.TableVariable), self.attributes[0])
+        self.assertIs(self._get(4, 2 + 1), 1)
+        self.assertIs(self._get(3, 2 + 0), 10)
+        self.assertIs(self._get(0, 2 + 0), 40)
 
 
 class TestOWRank(WidgetTest):
@@ -79,12 +140,12 @@ class TestOWRank(WidgetTest):
             with self.subTest(fitter=fitter),\
                     warnings.catch_warnings():
                 warnings.filterwarnings("ignore", ".*", ConvergenceWarning)
-                self.send_signal("Scorer", fitter, 1)
+                self.send_signal(self.widget.Inputs.scorer, fitter, 1)
 
                 for data in (self.housing,
                              heart_disease):
                     with self.subTest(data=data.name):
-                        self.send_signal('Data', data)
+                        self.send_signal(self.widget.Inputs.data, data)
                         self.wait_until_finished()
                         scores = [model.data(model.index(row, model.columnCount() - 1))
                                   for row in range(model.rowCount())]
@@ -95,7 +156,7 @@ class TestOWRank(WidgetTest):
                             model.columnCount() - 1, Qt.Horizontal).lower()
                         self.assertIn(name, last_column)
 
-                self.send_signal("Scorer", None, 1)
+                self.send_signal(self.widget.Inputs.scorer, None, 1)
                 self.assertEqual(self.widget.scorers, [])
 
     def test_input_scorer_disconnect(self):
@@ -314,17 +375,51 @@ class TestOWRank(WidgetTest):
         order2 = self.widget.ranksModel.mapToSourceRows(...).tolist()
         self.assertNotEqual(order1, order2)
 
+    def test_score_sorting_int(self):
+        """
+        Order setting was previously set to Qt.SortOrder which is in PyQt5
+        int-like PyQt object. Since in PyQt6 it is Enum (non int) object, and it
+        is not nice to have objects in settings we changed it to int. This test
+        cover current case and also case with int-like object before.
+        """
+        self.widget.sorting = (1, 1)  # Gini col, descending order
+        self.send_signal(self.widget.Inputs.data, self.iris)
+        self.wait_until_finished()
+        order = self.widget.ranksModel.mapToSourceRows(...).tolist()
+        self.assertListEqual([2, 3, 0, 1], order)
+
+        self.widget.sorting = (1, 0)  # Gini col, descending order
+        self.send_signal(self.widget.Inputs.data, self.iris)
+        self.wait_until_finished()
+        order = self.widget.ranksModel.mapToSourceRows(...).tolist()
+        self.assertListEqual([1, 0, 3, 2], order)
+
+        # change old setting to int
+        # since test can run in both pyqt5 or 6 we create SortOrder like object
+        class SortOrderE(Enum):  # pyqt6 like
+            ASCENDING = 0
+
+        settings = {"sorting": (1, SortOrderE.ASCENDING), "__version__": 2}
+        w = self.create_widget(OWRank, stored_settings=settings)
+        self.assertEqual(0, w.sorting[1])
+
+        class SortOrderI:  # pyqt5 like
+            ASCENDING = 0
+
+        settings = {"sorting": (1, SortOrderI.ASCENDING), "__version__": 2}
+        w = self.create_widget(OWRank, stored_settings=settings)
+        self.assertEqual(0, w.sorting[1])
+
     def test_scores_nan_sorting(self):
         """Check NaNs are sorted last"""
         data = self.iris.copy()
         with data.unlocked():
-            data.get_column_view('petal length')[0][:] = np.nan
+            data.set_column('petal length', np.nan)
         self.send_signal(self.widget.Inputs.data, data)
         self.wait_until_finished()
 
         # Assert last row is all nan
-        for order in (Qt.AscendingOrder,
-                      Qt.DescendingOrder):
+        for order in (Qt.AscendingOrder, Qt.DescendingOrder):
             self.widget.ranksView.horizontalHeader().setSortIndicator(2, order)
             last_row = self.widget.ranksModel[self.widget.ranksModel.mapToSourceRows(...)[-1]]
             np.testing.assert_array_equal(last_row[1:], np.repeat(np.nan, 3))
@@ -353,6 +448,8 @@ class TestOWRank(WidgetTest):
         self.widget.selected_methods.add('ANOVA')
         self.send_signal(self.widget.Inputs.data, table)
 
+    @unittest.skipIf(lambda: QT_VERSION_INFO < (6,),
+                     "headerState is not restored in Qt6")
     def test_setting_migration_fixes_header_state(self):
         # Settings as of version 3.3.5
         settings = {
@@ -548,25 +645,6 @@ class TestOWRank(WidgetTest):
         self.wait_until_finished()
         output = self.get_output(self.widget.Outputs.reduced_data)
         self.assertEqual(len(output), len(self.housing))
-
-
-class TestRankModel(GuiTest):
-    @staticmethod
-    def test_argsort():
-        func = TableModel()._argsortData  # pylint: disable=protected-access
-        assert_equal = np.testing.assert_equal
-
-        test_array = np.array([4.2, 7.2, np.nan, 1.3, np.nan])
-        assert_equal(func(test_array, Qt.AscendingOrder)[:3], [3, 0, 1])
-        assert_equal(func(test_array, Qt.DescendingOrder)[:3], [1, 0, 3])
-
-        test_array = np.array([4, 7, 2])
-        assert_equal(func(test_array, Qt.AscendingOrder), [2, 0, 1])
-        assert_equal(func(test_array, Qt.DescendingOrder), [1, 0, 2])
-
-        test_array = np.array(["Bertha", "daniela", "ann", "Cecilia"])
-        assert_equal(func(test_array, Qt.AscendingOrder), [2, 0, 3, 1])
-        assert_equal(func(test_array, Qt.DescendingOrder), [1, 3, 0, 2])
 
 
 if __name__ == "__main__":

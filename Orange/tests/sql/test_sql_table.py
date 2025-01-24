@@ -209,6 +209,9 @@ class TestSqlTable(unittest.TestCase, dbt):
     def test_getitem_single_value(self):
         table = SqlTable(self.conn, self.iris, inspect_values=True)
         self.assertAlmostEqual(table[0, 0], 5.1)
+        self.assertAlmostEqual(table[0, table.domain[0]], 5.1)
+        self.assertEqual(table[0, 4], "Iris-setosa")
+        self.assertEqual(table[0, table.domain[4]], "Iris-setosa")
 
     @dbt.run_on(["postgres", "mssql"])
     def test_type_hints(self):
@@ -492,6 +495,7 @@ class TestSqlTable(unittest.TestCase, dbt):
 
         sql_table = SqlTable(conn, table_name, inspect_values=True)
         self.assertFirstAttrIsInstance(sql_table, TimeVariable)
+        self.drop_sql_table(table_name)
 
     @dbt.run_on(["postgres"])
     def test_time_time(self):
@@ -749,6 +753,26 @@ class TestSqlTable(unittest.TestCase, dbt):
         self.assertEqual(iris[0], iris2[0])
 
     @dbt.run_on(["postgres"])
+    def test_pickling_respects_downloaded_state(self):
+        iris = SqlTable(self.conn, self.iris, inspect_values=True)
+        iris2 = pickle.loads(pickle.dumps(iris))
+        # pylint: disable=protected-access
+        self.assertIsNone(iris._X)
+        self.assertIsNone(iris2._X)
+        self.assertIsNone(iris._ids)
+        self.assertIsNone(iris2._ids)
+
+        # trigger download into X, Y, metas
+        iris.X.shape[0]  # pylint: disable=pointless-statement
+        self.assertIsNotNone(iris._X)
+        self.assertIsNotNone(iris._ids)
+        iris2 = pickle.loads(pickle.dumps(iris))
+        self.assertIsNotNone(iris2._X)
+        self.assertIsNotNone(iris2._ids)
+        np.testing.assert_equal(iris.X, iris2.X)
+        self.assertEqual(len(set(iris.ids) | set(iris2.ids)), 300)
+
+    @dbt.run_on(["postgres"])
     def test_list_tables_with_schema(self):
         with self.backend.execute_sql_query("DROP SCHEMA IF EXISTS orange_tests CASCADE") as cur:
             cur.execute("CREATE SCHEMA orange_tests")
@@ -763,6 +787,20 @@ class TestSqlTable(unittest.TestCase, dbt):
         finally:
             with self.backend.execute_sql_query("DROP SCHEMA IF EXISTS orange_tests CASCADE"):
                 pass
+
+    @dbt.run_on(["postgres", "mssql"])
+    def test_nan_frequency(self):
+        ar = np.random.random((4, 3))
+        ar[:2, 1:] = np.nan
+        conn, table_name = self.create_sql_table(ar)
+
+        table = SqlTable(conn, table_name, inspect_values=False)
+        table.domain = Domain(table.domain.attributes[:-1],
+                              table.domain.attributes[-1])
+        self.assertEqual(table.get_nan_frequency_class(), 0.5)
+        self.assertEqual(table.get_nan_frequency_attribute(), 0.25)
+
+        self.drop_sql_table(table_name)
 
     def assertFirstAttrIsInstance(self, table, variable_type):
         self.assertGreater(len(table.domain.variables), 0)

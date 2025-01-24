@@ -2,8 +2,8 @@ from collections import namedtuple
 
 import numpy as np
 
-from AnyQt.QtCore import Qt, QSize
-from AnyQt.QtWidgets import QListWidget, QSizePolicy
+from AnyQt.QtCore import Qt
+from AnyQt.QtWidgets import QListWidget
 
 import pyqtgraph as pg
 
@@ -16,12 +16,13 @@ from Orange.evaluation.performance_curves import Curves
 from Orange.widgets import widget, gui, settings
 from Orange.widgets.evaluate.contexthandlers import \
     EvaluationResultsContextHandler
-from Orange.widgets.evaluate.utils import results_for_preview
+from Orange.widgets.evaluate.utils import results_for_preview, \
+    check_can_calibrate
 from Orange.widgets.utils import colorpalettes
 from Orange.widgets.utils.widgetpreview import WidgetPreview
 from Orange.widgets.visualize.utils.customizableplot import \
     CommonParameterSetter
-from Orange.widgets.visualize.utils.plotutils import AxisItem
+from Orange.widgets.visualize.utils.plotutils import GraphicsView, PlotItem
 from Orange.widgets.widget import Input, Output, Msg
 from Orange.widgets import report
 
@@ -96,7 +97,7 @@ class OWCalibrationPlot(widget.OWWidget):
     description = "Calibration plot based on evaluation of classifiers."
     icon = "icons/CalibrationPlot.svg"
     priority = 1030
-    keywords = []
+    keywords = "calibration plot"
 
     class Inputs:
         evaluation_results = Input("Evaluation Results", Results)
@@ -137,7 +138,7 @@ class OWCalibrationPlot(widget.OWWidget):
     visual_settings = settings.Setting({}, schema_only=True)
     auto_commit = settings.Setting(True)
 
-    graph_name = "plot"
+    graph_name = "plot"  # pg.GraphicsItem (pg.PlotItem)
 
     def __init__(self):
         super().__init__()
@@ -165,9 +166,8 @@ class OWCalibrationPlot(widget.OWWidget):
         self.classifiers_list_box = gui.listBox(
             self.controlArea, self, "selected_classifiers", "classifier_names",
             box="Classifier", selectionMode=QListWidget.ExtendedSelection,
-            sizePolicy=(QSizePolicy.Preferred, QSizePolicy.Preferred),
-            sizeHint=QSize(150, 40),
             callback=self._on_selection_changed)
+        self.classifiers_list_box.setMaximumHeight(100)
 
         box = gui.vBox(self.controlArea, "Metrics")
         combo = gui.comboBox(
@@ -189,19 +189,17 @@ class OWCalibrationPlot(widget.OWWidget):
         self.info_box = gui.widgetBox(self.controlArea, "Info")
         self.info_label = gui.widgetLabel(self.info_box)
 
+        gui.rubber(self.controlArea)
+
         gui.auto_apply(self.buttonsArea, self, "auto_commit")
 
-        self.plotview = pg.GraphicsView(background="w")
-        axes = {"bottom": AxisItem(orientation="bottom"),
-                "left": AxisItem(orientation="left")}
-        self.plot = pg.PlotItem(enableMenu=False, axisItems=axes)
+        self.plotview = GraphicsView()
+        self.plot = PlotItem(enableMenu=False)
         self.plot.parameter_setter = ParameterSetter(self.plot)
         self.plot.setMouseEnabled(False, False)
         self.plot.hideButtons()
-
         for axis_name in ("bottom", "left"):
             axis = self.plot.getAxis(axis_name)
-            axis.setPen(pg.mkPen(color=0.0))
             # Remove the condition (that is, allow setting this for bottom
             # axis) when pyqtgraph is fixed
             # Issue: https://github.com/pyqtgraph/pyqtgraph/issues/930
@@ -489,23 +487,11 @@ class OWCalibrationPlot(widget.OWWidget):
         wrapped = None
         results = self.results
         if results is not None:
-            problems = [
-                msg for condition, msg in (
-                    (len(results.folds) > 1,
-                     "each training data sample produces a different model"),
-                    (results.models is None,
-                     "test results do not contain stored models - try testing "
-                     "on separate data or on training data"),
-                    (len(self.selected_classifiers) != 1,
-                     "select a single model - the widget can output only one"),
-                    (self.score != 0 and len(results.domain.class_var.values) != 2,
-                     "cannot calibrate non-binary classes"))
-                if condition]
-            if len(problems) == 1:
-                self.Information.no_output(problems[0])
-            elif problems:
-                self.Information.no_output(
-                    "".join(f"\n - {problem}" for problem in problems))
+            problems = check_can_calibrate(
+                self.results, self.selected_classifiers,
+                require_binary=self.score != 0)
+            if problems:
+                self.Information.no_output(problems)
             else:
                 clsf_idx = self.selected_classifiers[0]
                 model = results.models[0, clsf_idx]

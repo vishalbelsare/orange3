@@ -1,5 +1,6 @@
 import copy
 import warnings
+import unittest
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -8,57 +9,17 @@ from pyqtgraph import InfiniteLine
 
 from sklearn.exceptions import ConvergenceWarning
 
-from Orange.data import Table, DiscreteVariable, Domain, ContinuousVariable
-import Orange.evaluation
-import Orange.classification
-from Orange.evaluation import Results
-from Orange.evaluation.performance_curves import Curves
+from orangewidget.utils.combobox import qcombobox_emit_activated
 
+from Orange.data import Domain, ContinuousVariable
+from Orange.evaluation.performance_curves import Curves
 from Orange.widgets.evaluate.tests.base import EvaluateTest
 from Orange.widgets.evaluate.owcalibrationplot import OWCalibrationPlot
-from Orange.widgets.tests.base import WidgetTest
-from Orange.tests import test_filename
 
 
-class TestOWCalibrationPlot(WidgetTest, EvaluateTest):
+class TestOWCalibrationPlot(EvaluateTest):
     def setUp(self):
         super().setUp()
-
-        n, p = (0, 1)
-        actual, probs = np.array([
-            (p, .8), (n, .7), (p, .6), (p, .55), (p, .54), (n, .53), (n, .52),
-            (p, .51), (n, .505), (p, .4), (n, .39), (p, .38), (n, .37),
-            (n, .36), (n, .35), (p, .34), (n, .33), (p, .30), (n, .1)]).T
-        self.curves = Curves(actual, probs)
-        probs2 = (probs + 0.5) / 2 + 1
-        self.curves2 = Curves(actual, probs2)
-        pred = probs > 0.5
-        pred2 = probs2 > 0.5
-        probs = np.vstack((1 - probs, probs)).T
-        probs2 = np.vstack((1 - probs2, probs2)).T
-        domain = Domain([], DiscreteVariable("y", values=("a", "b")))
-        self.results = Results(
-            domain=domain,
-            actual=actual,
-            folds=np.array([Ellipsis]),
-            models=np.array([[Mock(), Mock()]]),
-            row_indices=np.arange(19),
-            predicted=np.array((pred, pred2)),
-            probabilities=np.array([probs, probs2]))
-
-        self.lenses = data = Table(test_filename("datasets/lenses.tab"))
-        majority = Orange.classification.MajorityLearner()
-        majority.name = "majority"
-        knn3 = Orange.classification.KNNLearner(n_neighbors=3)
-        knn3.name = "knn-3"
-        knn1 = Orange.classification.KNNLearner(n_neighbors=1)
-        knn1.name = "knn-1"
-        self.lenses_results = Orange.evaluation.TestOnTestData(
-            store_data=True, store_models=True)(
-                data=data[::2], test_data=data[1::2],
-                learners=[majority, knn3, knn1])
-        self.lenses_results.learner_names = ["majority", "knn-3", "knn-1"]
-
         self.widget = self.create_widget(OWCalibrationPlot)  # type: OWCalibrationPlot
         warnings.filterwarnings("ignore", ".*", ConvergenceWarning)
 
@@ -140,8 +101,7 @@ class TestOWCalibrationPlot(WidgetTest, EvaluateTest):
     @staticmethod
     def _set_combo(combo, val):
         combo.setCurrentIndex(val)
-        combo.activated[int].emit(val)
-        combo.activated[str].emit(combo.currentText())
+        qcombobox_emit_activated(combo, val)
 
     @staticmethod
     def _set_radio_buttons(radios, val):
@@ -381,6 +341,8 @@ class TestOWCalibrationPlot(WidgetTest, EvaluateTest):
     @patch("Orange.widgets.evaluate.owcalibrationplot.CalibratedLearner")
     def test_apply_no_output(self, *_):
         """Test no output warnings"""
+        # Similar to test_owcalibrationplot, but just a little different, hence
+        # pylint: disable=duplicate-code
         widget = self.widget
         model_list = widget.controls.selected_classifiers
 
@@ -394,7 +356,7 @@ class TestOWCalibrationPlot(WidgetTest, EvaluateTest):
             multiple_selected:
                 "select a single model - the widget can output only one",
             non_binary_class:
-                "cannot calibrate non-binary classes"}
+                "cannot calibrate non-binary models"}
 
         def test_shown(shown):
             widget_msg = widget.Information.no_output
@@ -637,3 +599,19 @@ class TestOWCalibrationPlot(WidgetTest, EvaluateTest):
         self.assertTrue(widget.Warning.omitted_nan_prob_points.is_shown())
         self._set_list_selection(widget.controls.selected_classifiers, [0, 2])
         self.assertFalse(widget.Warning.omitted_folds.is_shown())
+
+    @patch("Orange.widgets.evaluate.owcalibrationplot.ThresholdClassifier")
+    @patch("Orange.widgets.evaluate.owcalibrationplot.CalibratedLearner")
+    def test_no_folds(self, *_):
+        """Don't crash on malformed Results with folds=None"""
+        widget = self.widget
+
+        self.results.folds = None
+        self.send_signal(widget.Inputs.evaluation_results, self.results)
+        widget.selected_classifiers = [0]
+        widget.commit.now()
+        self.assertIsNotNone(self.get_output(widget.Outputs.calibrated_model))
+
+
+if __name__ == "__main__":
+    unittest.main()

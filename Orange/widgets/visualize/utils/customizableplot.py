@@ -27,7 +27,7 @@ def available_font_families() -> List:
     """
     if not QApplication.instance():
         _ = QApplication(sys.argv)
-    fonts = QFontDatabase().families()
+    fonts = QFontDatabase.families()
     default = default_font_family()
 
     defaults = [default]
@@ -123,10 +123,12 @@ class Updater:
                                 **settings: _SettingType):
         for item in items:
             font = Updater.change_font(item.label.font(), settings)
+            default_color = pg.mkPen(pg.getConfigOption("foreground"))
             item.label.setFont(font)
             fstyle = ["normal", "italic"][font.italic()]
             style = {"font-size": f"{font.pointSize()}pt",
                      "font-family": f"{font.family()}",
+                     "color": item.labelStyle.get("color", default_color),
                      "font-style": f"{fstyle}"}
             item.setLabel(item.labelText, item.labelUnits,
                           item.labelUnitPrefix, **style)

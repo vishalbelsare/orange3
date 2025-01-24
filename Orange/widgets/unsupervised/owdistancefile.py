@@ -1,36 +1,49 @@
 import os
 
-from AnyQt.QtWidgets import QSizePolicy, QStyle, QMessageBox, QFileDialog
-from AnyQt.QtCore import QTimer
+import numpy as np
 
+from AnyQt.QtWidgets import QSizePolicy, QStyle, QMessageBox, QFileDialog
+from AnyQt.QtCore import QTimer, QUrl
+
+from orangewidget.settings import Setting
+from orangewidget.widget import Msg
 from orangewidget.workflow.drophandler import SingleFileDropHandler
 
 from Orange.misc import DistMatrix
 from Orange.widgets import widget, gui
 from Orange.data import get_sample_datasets_dir
-from Orange.widgets.utils.filedialogs import RecentPathsWComboMixin, RecentPath
+from Orange.widgets.utils.filedialogs import RecentPathsWComboMixin, RecentPath, \
+    stored_recent_paths_prepend, OWUrlDropBase
 from Orange.widgets.utils.widgetpreview import WidgetPreview
 from Orange.widgets.widget import Output
 
 
-class OWDistanceFile(widget.OWWidget, RecentPathsWComboMixin):
+class OWDistanceFile(OWUrlDropBase, RecentPathsWComboMixin):
     name = "Distance File"
     id = "orange.widgets.unsupervised.distancefile"
     description = "Read distances from a file."
     icon = "icons/DistanceFile.svg"
     priority = 10
-    keywords = ["load", "read", "open"]
+    keywords = "distance file, load, read, open"
 
     class Outputs:
         distances = Output("Distances", DistMatrix, dynamic=False)
 
+    class Error(widget.OWWidget.Error):
+        invalid_file = Msg("Data was not loaded:{}")
+        non_square_matrix = Msg(
+            "Matrix is not square. "
+            "Reformat the file and use the File widget to read it.")
+
     want_main_area = False
     resizing_enabled = False
+
+    auto_symmetric = Setting(True)
 
     def __init__(self):
         super().__init__()
         RecentPathsWComboMixin.__init__(self)
-        self.loaded_file = ""
+        self.distances = None
 
         vbox = gui.vBox(self.controlArea, "Distance File")
         box = gui.hBox(vbox)
@@ -48,13 +61,14 @@ class OWDistanceFile(widget.OWWidget, RecentPathsWComboMixin):
         button.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
         button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
-        box = gui.vBox(self.controlArea, "Info")
-        self.infoa = gui.widgetLabel(box, 'No data loaded.')
-        self.warnings = gui.widgetLabel(box, ' ')
-        #Set word wrap, so long warnings won't expand the widget
-        self.warnings.setWordWrap(True)
-        self.warnings.setSizePolicy(
-            QSizePolicy.Ignored, QSizePolicy.MinimumExpanding)
+        vbox = gui.vBox(self.controlArea, "Options")
+        gui.checkBox(
+            vbox, self, "auto_symmetric",
+            "Treat triangular matrices as symmetric",
+            tooltip="If matrix is triangular, this will copy the data to the "
+                    "other triangle",
+            callback=self.commit
+        )
 
         gui.rubber(self.buttonsArea)
         gui.button(
@@ -64,9 +78,6 @@ class OWDistanceFile(widget.OWWidget, RecentPathsWComboMixin):
 
         self.set_file_list()
         QTimer.singleShot(0, self.open_file)
-
-    def set_file_list(self):
-        super().set_file_list()
 
     def reload(self):
         return self.open_file()
@@ -88,61 +99,62 @@ class OWDistanceFile(widget.OWWidget, RecentPathsWComboMixin):
             start_file = self.last_path() or os.path.expanduser("~/")
 
         filename, _ = QFileDialog.getOpenFileName(
-            self, 'Open Distance File', start_file, "(*.dst)")
+            self, 'Open Distance File', start_file,
+            "Excel File (*.xlsx);;Distance File (*.dst)")
         if not filename:
             return
         self.add_path(filename)
         self.open_file()
 
-    # Open a file, create data from it and send it over the data channel
     def open_file(self):
-        self.clear_messages()
+        self.Error.clear()
+        self.distances = None
         fn = self.last_path()
-        if not fn:
-            return
-        if not os.path.exists(fn):
+        if fn and not os.path.exists(fn):
             dir_name, basename = os.path.split(fn)
             if os.path.exists(os.path.join(".", basename)):
                 fn = os.path.join(".", basename)
-                self.information("Loading '{}' from the current directory."
-                                 .format(basename))
-        if fn == "(none)":
-            self.Outputs.distances.send(None)
-            self.infoa.setText("No data loaded")
-            self.infob.setText("")
-            self.warnings.setText("")
-            return
-
-        self.loaded_file = ""
-
-        try:
-            distances = DistMatrix.from_file(fn)
-            self.loaded_file = fn
-        except Exception as exc:
-            err_value = str(exc)
-            self.error("Invalid file format")
-            self.infoa.setText('Data was not loaded due to an error.')
-            self.warnings.setText(err_value)
-            distances = None
-
-        if distances is not None:
-            self.infoa.setText(
-                "{} points(s), ".format(len(distances)) +
-                (["unlabelled", "labelled"][distances.row_items is not None]))
-            self.warnings.setText("")
-            file_name = os.path.split(fn)[1]
-            if "." in file_name:
-                distances.name = file_name[:file_name.rfind('.')]
+        if fn and fn != "(none)":
+            try:
+                distances = DistMatrix.from_file(fn)
+            except Exception as exc:
+                err = str(exc)
+                self.Error.invalid_file(" \n"[len(err) > 40] + err)
             else:
-                distances.name = file_name
+                if distances.shape[0] != distances.shape[1]:
+                    self.Error.non_square_matrix()
+                else:
+                    np.nan_to_num(distances)
+                    self.distances = distances
+                    _, filename = os.path.split(fn)
+                    self.distances.name, _ = os.path.splitext(filename)
+        self.commit()
 
+    def commit(self):
+        distances = self.distances
+        if distances is not None:
+            if self.auto_symmetric:
+                distances = distances.auto_symmetricized()
+            if np.any(np.isnan(distances)):
+                distances = np.nan_to_num(distances)
         self.Outputs.distances.send(distances)
 
     def send_report(self):
-        if not self.loaded_file:
+        if not self.distances:
             self.report_paragraph("No data was loaded.")
         else:
-            self.report_items([("File name", self.loaded_file)])
+            self.report_items([("File name", self.distances.name)])
+
+    def canDropUrl(self, url: QUrl) -> bool:
+        if url.isLocalFile():
+            return OWDistanceFileDropHandler().canDropFile(url.toLocalFile())
+        else:
+            return False
+
+    def handleDroppedUrl(self, url: QUrl) -> None:
+        if url.isLocalFile():
+            self.add_path(url.toLocalFile())
+            self.open_file()
 
 
 class OWDistanceFileDropHandler(SingleFileDropHandler):
@@ -151,10 +163,10 @@ class OWDistanceFileDropHandler(SingleFileDropHandler):
     def parametersFromFile(self, path):
         r = RecentPath(os.path.abspath(path), None, None,
                        os.path.basename(path))
-        return {"recent_paths": [r]}
+        return {"recent_paths": stored_recent_paths_prepend(self.WIDGET, r)}
 
     def canDropFile(self, path: str) -> bool:
-        return os.path.splitext(path)[1].lower() == ".dst"
+        return os.path.splitext(path)[1].lower() in (".dst", ".xlsx")
 
 
 if __name__ == "__main__":  # pragma: no cover

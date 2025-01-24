@@ -24,7 +24,7 @@ import xlrd
 import xlsxwriter
 import openpyxl
 
-from Orange.data import _io, Table, Domain, ContinuousVariable
+from Orange.data import _io, Table, Domain, ContinuousVariable, update_origin
 from Orange.data import Compression, open_compressed, detect_encoding, \
     isnastr, guess_data_type, sanitize_variable
 from Orange.data.io_base import FileFormatBase, Flags, DataTableMixin, PICKLE_PROTOCOL
@@ -164,14 +164,7 @@ class CSVReader(FileFormat, DataTableMixin):
                         skipinitialspace=True,
                     )
                     data = self.data_table(reader)
-
-                    # TODO: Name can be set unconditionally when/if
-                    # self.filename will always be a string with the file name.
-                    # Currently, some tests pass StringIO instead of
-                    # the file name to a reader.
-                    if isinstance(self.filename, str):
-                        data.name = path.splitext(
-                            path.split(self.filename)[-1])[0]
+                    data.name = path.splitext(path.split(self.filename)[-1])[0]
                     if error and isinstance(error, UnicodeDecodeError):
                         pos, endpos = error.args[2], error.args[3]
                         warning = ('Skipped invalid byte(s) in position '
@@ -179,6 +172,7 @@ class CSVReader(FileFormat, DataTableMixin):
                                                   ('-' + str(endpos)) if (endpos - pos) > 1 else '')
                         warnings.warn(warning)
                     self.set_table_metadata(self.filename, data)
+                    update_origin(data, self.filename)
                     return data
                 except Exception as e:
                     error = e
@@ -215,6 +209,7 @@ class PickleReader(FileFormat):
             if not isinstance(table, Table):
                 raise TypeError("file does not contain a data table")
             else:
+                update_origin(table, self.filename)
                 return table
 
     @classmethod
@@ -264,6 +259,7 @@ class _BaseExcelReader(FileFormat, DataTableMixin):
         try:
             cells = self.get_cells()
             table = self.data_table(cells)
+            update_origin(table, self.filename)
             table.name = path.splitext(path.split(self.filename)[-1])[0]
             if self.sheet and len(self.sheets) > 1:
                 table.name = '-'.join((table.name, self.sheet))
@@ -277,6 +273,7 @@ class ExcelReader(_BaseExcelReader):
     EXTENSIONS = ('.xlsx',)
     DESCRIPTION = 'Microsoft Excel spreadsheet'
     ERRORS = ("#VALUE!", "#DIV/0!", "#REF!", "#NUM!", "#NULL!", "#NAME?")
+    OPTIONAL_TYPE_ANNOTATIONS = True
 
     def __init__(self, filename):
         super().__init__(filename)
@@ -319,22 +316,30 @@ class ExcelReader(_BaseExcelReader):
             return self.workbook.active
 
     @classmethod
-    def write_file(cls, filename, data):
+    def write_file(cls, filename, data, with_annotations=False):
         vars = list(chain((ContinuousVariable('_w'),) if data.has_weights() else (),
-                          data.domain.attributes,
                           data.domain.class_vars,
-                          data.domain.metas))
+                          data.domain.metas,
+                          data.domain.attributes))
         formatters = [cls.formatter(v) for v in vars]
         zipped_list_data = zip(data.W if data.W.ndim > 1 else data.W[:, np.newaxis],
-                               data.X,
                                data.Y if data.Y.ndim > 1 else data.Y[:, np.newaxis],
-                               data.metas)
-        headers = cls.header_names(data)
+                               data.metas,
+                               data.X)
+        names = cls.header_names(data)
+        headers = (names,)
+        if with_annotations:
+            types = cls.header_types(data)
+            flags = cls.header_flags(data)
+            headers = (names, types, flags)
+
         workbook = xlsxwriter.Workbook(filename)
         sheet = workbook.add_worksheet()
-        for c, header in enumerate(headers):
-            sheet.write(0, c, header)
-        for i, row in enumerate(zipped_list_data, 1):
+
+        for r, parts in enumerate(headers):
+            for c, part in enumerate(parts):
+                sheet.write(r, c, part)
+        for i, row in enumerate(zipped_list_data, len(headers)):
             for j, (fmt, v) in enumerate(zip(formatters, flatten(row))):
                 sheet.write(i, j, fmt(v))
         workbook.close()
@@ -406,7 +411,13 @@ class UrlReader(FileFormat):
         filename = filename.strip()
         if not urlparse(filename).scheme:
             filename = 'http://' + filename
-        filename = quote(filename, safe="/:")
+
+        # Fully support URL with query or fragment like http://filename.txt?a=1&b=2#c=3
+        def quote_byte(b):
+            return chr(b) if b < 0x80 else '%{:02X}'.format(b)
+
+        filename = ''.join(map(quote_byte, filename.encode("utf-8")))
+
         super().__init__(filename)
 
     @staticmethod
@@ -444,6 +455,7 @@ class UrlReader(FileFormat):
     def _trim(cls, url):
         URL_TRIMMERS = (
             cls._trim_googlesheet,
+            cls._trim_googledrive,
             cls._trim_dropbox,
         )
         for trim in URL_TRIMMERS:
@@ -472,6 +484,18 @@ class UrlReader(FileFormat):
         if sheet:
             url += '&gid=' + sheet
         return url
+
+    @staticmethod
+    def _trim_googledrive(url):
+        parts = urlsplit(url)
+        if not parts.netloc.endswith("drive.google.com"):
+            raise ValueError
+        match = re.match(r'/file/d/(?P<id>[^/]+).*', parts.path)
+        if not match:
+            raise ValueError
+        id_ = match.group("id")
+        parts = parts._replace(path=f"uc?export=download&id={id_}", query=None)
+        return urlunsplit(parts)
 
     @staticmethod
     def _trim_dropbox(url):

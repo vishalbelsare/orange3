@@ -2,6 +2,7 @@
 # pylint: disable=missing-docstring
 from scipy.sparse import csr_matrix
 
+from AnyQt.QtCore import Qt
 from Orange.widgets.model.owsvm import OWSVM
 from Orange.widgets.tests.base import (
     WidgetTest,
@@ -47,7 +48,7 @@ class TestOWSVMClassification(WidgetTest, WidgetLearnerTestMixin):
         """Check learner and model for various values of all parameters
         when Iteration limit is not checked
         """
-        self.widget.max_iter_spin[0].setCheckState(False)
+        self.widget.max_iter_spin[0].setCheckState(Qt.Unchecked)
         self.parameters[-1] = DefaultParameterMapping("max_iter", -1)
         self.test_parameters()
 
@@ -94,10 +95,29 @@ class TestOWSVMClassification(WidgetTest, WidgetLearnerTestMixin):
     def test_sparse_warning(self):
         """Check if the user is warned about sparse input"""
         data = Table("iris")
-        self.send_signal("Data", data)
+        self.send_signal(self.widget.Inputs.data, data)
         self.assertFalse(self.widget.Warning.sparse_data.is_shown())
 
         with data.unlocked():
             data.X = csr_matrix(data.X)
-        self.send_signal("Data", data)
+        self.send_signal(self.widget.Inputs.data, data)
         self.assertTrue(self.widget.Warning.sparse_data.is_shown())
+
+    def test_change_degree(self):
+        data = Table("iris")
+        self.send_signal(self.widget.Inputs.data, data)
+        self.widget.kernel_box.buttons[1].click()
+        degree_spin = self.widget._kernel_params[2]  # pylint: disable=protected-access
+        degree_spin.stepUp()
+        self.assertEqual(self.widget.degree, 4)
+        self.click_apply()
+        self.wait_until_stop_blocking()
+        self.assertFalse(self.widget.Error.fitting_failed.is_shown())
+
+    def test_migrate_degree(self):
+        settings = {}
+        OWSVM.migrate_settings(settings, 1)
+
+        settings = {"degree": 4.0}
+        OWSVM.migrate_settings(settings, 1)
+        self.assertIsInstance(settings["degree"], int)

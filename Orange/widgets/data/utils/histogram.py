@@ -123,7 +123,8 @@ class Histogram(QGraphicsWidget):
     """
 
     def __init__(self, data, variable, parent=None, height=200,
-                 width=300, side_padding=5, top_padding=20, bar_spacing=4,
+                 width=300, side_padding=5, top_padding=20, bottom_padding=0,
+                 bar_spacing=4,
                  border=0, border_color=None, color_attribute=None, n_bins=10):
         super().__init__(parent)
         self.height, self.width = height, width
@@ -133,7 +134,7 @@ class Histogram(QGraphicsWidget):
         self.data = data
         self.attribute = data.domain[variable]
 
-        self.x = data.get_column_view(self.attribute)[0].astype(np.float64)
+        self.x = data.get_column(self.attribute)
         self.x_nans = np.isnan(self.x)
         self.x = self.x[~self.x_nans]
 
@@ -155,7 +156,7 @@ class Histogram(QGraphicsWidget):
         self.color_attribute = color_attribute
         if self.color_attribute is not None:
             self.target_var = data.domain[color_attribute]
-            self.y = data.get_column_view(color_attribute)[0]
+            self.y = data.get_column(color_attribute)
             self.y = self.y[~self.x_nans]
             if not np.issubdtype(self.y.dtype, np.number):
                 self.y = self.y.astype(np.float64)
@@ -191,7 +192,7 @@ class Histogram(QGraphicsWidget):
 
         # _plot_`dim` accounts for all the paddings and spacings
         self._plot_height = self.height
-        self._plot_height -= top_padding
+        self._plot_height -= top_padding + bottom_padding
         self._plot_height -= t / 4 + b / 4
 
         self._plot_width = self.width
@@ -204,7 +205,7 @@ class Histogram(QGraphicsWidget):
             side_padding + r / 2,
             top_padding + t / 2,
             side_padding + l / 2,
-            b / 2
+            bottom_padding + b / 2
         )
         self.__layout.setSpacing(bar_spacing)
 

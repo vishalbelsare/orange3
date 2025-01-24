@@ -11,16 +11,19 @@ Examples
 """
 
 import math
+import warnings
 
 import numpy as np
 import sklearn.metrics as skl_metrics
 from sklearn.metrics import confusion_matrix
 
-from Orange.data import DiscreteVariable, ContinuousVariable
+from Orange.data import DiscreteVariable, ContinuousVariable, Domain
 from Orange.misc.wrapper_meta import WrapperMeta
+from Orange.util import OrangeDeprecationWarning
+
 
 __all__ = ["CA", "Precision", "Recall", "F1", "PrecisionRecallFSupport", "AUC",
-           "MSE", "RMSE", "MAE", "R2", "compute_CD", "graph_ranks", "LogLoss"]
+           "MSE", "RMSE", "MAE", "MAPE", "R2", "LogLoss", "MatthewsCorrCoefficient"]
 
 
 class ScoreMetaType(WrapperMeta):
@@ -37,6 +40,7 @@ class ScoreMetaType(WrapperMeta):
             if not kwargs.get("abstract"):
                 # Don't use inherited names, look into dict_
                 cls.name = dict_.get("name", name)
+                cls.long_name = dict_.get("long_name", cls.name)
                 cls.registry[name] = cls
         else:
             cls.registry = {}
@@ -65,6 +69,9 @@ class Score(metaclass=ScoreMetaType):
     class_types = ()
     name = None
     long_name = None  #: A short user-readable name (e.g. a few words)
+
+    default_visible = True
+    priority = 100
 
     def __new__(cls, results=None, **kwargs):
         self = super().__new__(cls)
@@ -112,19 +119,33 @@ class Score(metaclass=ScoreMetaType):
              for predicted in results.predicted),
             dtype=np.float64, count=len(results.predicted))
 
+    @staticmethod
+    def is_compatible(domain: Domain) -> bool:
+        raise NotImplementedError
+
 
 class ClassificationScore(Score, abstract=True):
     class_types = (DiscreteVariable, )
+
+    @staticmethod
+    def is_compatible(domain: Domain) -> bool:
+        return domain.has_discrete_class
 
 
 class RegressionScore(Score, abstract=True):
     class_types = (ContinuousVariable, )
 
+    @staticmethod
+    def is_compatible(domain: Domain) -> bool:
+        return domain.has_continuous_class
+
 
 # pylint: disable=invalid-name
 class CA(ClassificationScore):
     __wraps__ = skl_metrics.accuracy_score
+    name = "CA"
     long_name = "Classification accuracy"
+    priority = 20
 
 
 class PrecisionRecallFSupport(ClassificationScore):
@@ -173,14 +194,21 @@ class TargetScore(ClassificationScore):
 
 class Precision(TargetScore):
     __wraps__ = skl_metrics.precision_score
+    name = "Prec"
+    long_name = "Precision"
+    priority = 40
 
 
 class Recall(TargetScore):
     __wraps__ = skl_metrics.recall_score
+    name = long_name = "Recall"
+    priority = 50
 
 
 class F1(TargetScore):
     __wraps__ = skl_metrics.f1_score
+    name = long_name = "F1"
+    priority = 30
 
 
 class AUC(ClassificationScore):
@@ -198,7 +226,9 @@ class AUC(ClassificationScore):
     __wraps__ = skl_metrics.roc_auc_score
     separate_folds = True
     is_binary = True
+    name = "AUC"
     long_name = "Area under ROC curve"
+    priority = 10
 
     @staticmethod
     def calculate_weights(results):
@@ -266,17 +296,29 @@ class LogLoss(ClassificationScore):
     Examples
     --------
     >>> Orange.evaluation.LogLoss(results)
-    array([ 0.3...])
+    array([0.1...])
 
     """
     __wraps__ = skl_metrics.log_loss
+    priority = 120
+    name = "LogLoss"
+    long_name = "Logistic loss"
+    default_visible = False
 
-    def compute_score(self, results, eps=1e-15, normalize=True,
+    def compute_score(self, results, eps="auto", normalize=True,
                       sample_weight=None):
+        if eps != "auto":
+            # eps argument will be removed in scikit-learn 1.5
+            warnings.warn(
+                (
+                    "`LogLoss.compute_score`: eps parameter is unused. "
+                    "It will always have value of `np.finfo(y_pred.dtype).eps`."
+                ),
+                OrangeDeprecationWarning,
+            )
         return np.fromiter(
             (skl_metrics.log_loss(results.actual,
                                   probabilities,
-                                  eps=eps,
                                   normalize=normalize,
                                   sample_weight=sample_weight)
              for probabilities in results.probabilities),
@@ -285,6 +327,10 @@ class LogLoss(ClassificationScore):
 
 class Specificity(ClassificationScore):
     is_binary = True
+    priority = 110
+    name = "Spec"
+    long_name = "Specificity"
+    default_visible = False
 
     @staticmethod
     def calculate_weights(results):
@@ -332,323 +378,60 @@ class Specificity(ClassificationScore):
         elif target is not None:
             return self.single_class_specificity(results, target)
 
+
+class MatthewsCorrCoefficient(ClassificationScore):
+    __wraps__ = skl_metrics.matthews_corrcoef
+    name = "MCC"
+    long_name = "Matthews correlation coefficient"
+
+
 # Regression scores
 
 
 class MSE(RegressionScore):
     __wraps__ = skl_metrics.mean_squared_error
+    name = "MSE"
     long_name = "Mean square error"
+    priority = 20
 
 
 class RMSE(RegressionScore):
+    name = "RMSE"
     long_name = "Root mean square error"
 
     def compute_score(self, results):
         return np.sqrt(MSE(results))
+    priority = 30
 
 
 class MAE(RegressionScore):
     __wraps__ = skl_metrics.mean_absolute_error
+    name = "MAE"
     long_name = "Mean absolute error"
+    priority = 40
 
+class MAPE(RegressionScore):
+    __wraps__ = skl_metrics.mean_absolute_percentage_error
+    name = "MAPE"
+    long_name = "Mean absolute percentage error"
+    priority = 45
 
 # pylint: disable=invalid-name
 class R2(RegressionScore):
     __wraps__ = skl_metrics.r2_score
+    name = "R2"
     long_name = "Coefficient of determination"
+    priority = 50
 
 
 class CVRMSE(RegressionScore):
+    name = "CVRMSE"
     long_name = "Coefficient of variation of the RMSE"
+    priority = 110
+    default_visible = False
 
     def compute_score(self, results):
         mean = np.nanmean(results.actual)
         if mean < 1e-10:
             raise ValueError("Mean value is too small")
         return RMSE(results) / mean * 100
-
-
-# CD scores and plot
-
-def compute_CD(avranks, n, alpha="0.05", test="nemenyi"):
-    """
-    Returns critical difference for Nemenyi or Bonferroni-Dunn test
-    according to given alpha (either alpha="0.05" or alpha="0.1") for average
-    ranks and number of tested datasets N. Test can be either "nemenyi" for
-    for Nemenyi two tailed test or "bonferroni-dunn" for Bonferroni-Dunn test.
-    """
-    k = len(avranks)
-    d = {("nemenyi", "0.05"): [0, 0, 1.959964, 2.343701, 2.569032, 2.727774,
-                               2.849705, 2.94832, 3.030879, 3.101730, 3.163684,
-                               3.218654, 3.268004, 3.312739, 3.353618, 3.39123,
-                               3.426041, 3.458425, 3.488685, 3.517073,
-                               3.543799],
-         ("nemenyi", "0.1"): [0, 0, 1.644854, 2.052293, 2.291341, 2.459516,
-                              2.588521, 2.692732, 2.779884, 2.854606, 2.919889,
-                              2.977768, 3.029694, 3.076733, 3.119693, 3.159199,
-                              3.195743, 3.229723, 3.261461, 3.291224, 3.319233],
-         ("bonferroni-dunn", "0.05"): [0, 0, 1.960, 2.241, 2.394, 2.498, 2.576,
-                                       2.638, 2.690, 2.724, 2.773],
-         ("bonferroni-dunn", "0.1"): [0, 0, 1.645, 1.960, 2.128, 2.241, 2.326,
-                                      2.394, 2.450, 2.498, 2.539]}
-    q = d[(test, alpha)]
-    cd = q[k] * (k * (k + 1) / (6.0 * n)) ** 0.5
-    return cd
-
-
-def graph_ranks(avranks, names, cd=None, cdmethod=None, lowv=None, highv=None,
-                width=6, textspace=1, reverse=False, filename=None, **kwargs):
-    """
-    Draws a CD graph, which is used to display  the differences in methods'
-    performance. See Janez Demsar, Statistical Comparisons of Classifiers over
-    Multiple Data Sets, 7(Jan):1--30, 2006.
-
-    Needs matplotlib to work.
-
-    The image is ploted on `plt` imported using
-    `import matplotlib.pyplot as plt`.
-
-    Args:
-        avranks (list of float): average ranks of methods.
-        names (list of str): names of methods.
-        cd (float): Critical difference used for statistically significance of
-            difference between methods.
-        cdmethod (int, optional): the method that is compared with other methods
-            If omitted, show pairwise comparison of methods
-        lowv (int, optional): the lowest shown rank
-        highv (int, optional): the highest shown rank
-        width (int, optional): default width in inches (default: 6)
-        textspace (int, optional): space on figure sides (in inches) for the
-            method names (default: 1)
-        reverse (bool, optional):  if set to `True`, the lowest rank is on the
-            right (default: `False`)
-        filename (str, optional): output file name (with extension). If not
-            given, the function does not write a file.
-    """
-    try:
-        import matplotlib.pyplot as plt
-        from matplotlib.backends.backend_agg import FigureCanvasAgg
-    except ImportError:
-        raise ImportError("Function graph_ranks requires matplotlib.")
-
-    width = float(width)
-    textspace = float(textspace)
-
-    def nth(l, n):
-        """
-        Returns only nth elemnt in a list.
-        """
-        n = lloc(l, n)
-        return [a[n] for a in l]
-
-    def lloc(l, n):
-        """
-        List location in list of list structure.
-        Enable the use of negative locations:
-        -1 is the last element, -2 second last...
-        """
-        if n < 0:
-            return len(l[0]) + n
-        else:
-            return n
-
-    def mxrange(lr):
-        """
-        Multiple xranges. Can be used to traverse matrices.
-        This function is very slow due to unknown number of
-        parameters.
-
-        >>> mxrange([3,5])
-        [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]
-
-        >>> mxrange([[3,5,1],[9,0,-3]])
-        [(3, 9), (3, 6), (3, 3), (4, 9), (4, 6), (4, 3)]
-
-        """
-        if not len(lr):
-            yield ()
-        else:
-            # it can work with single numbers
-            index = lr[0]
-            if isinstance(index, int):
-                index = [index]
-            for a in range(*index):
-                for b in mxrange(lr[1:]):
-                    yield tuple([a] + list(b))
-
-    def print_figure(fig, *args, **kwargs):
-        canvas = FigureCanvasAgg(fig)
-        canvas.print_figure(*args, **kwargs)
-
-    sums = avranks
-
-    tempsort = sorted([(a, i) for i, a in enumerate(sums)], reverse=reverse)
-    ssums = nth(tempsort, 0)
-    sortidx = nth(tempsort, 1)
-    nnames = [names[x] for x in sortidx]
-
-    if lowv is None:
-        lowv = min(1, int(math.floor(min(ssums))))
-    if highv is None:
-        highv = max(len(avranks), int(math.ceil(max(ssums))))
-
-    cline = 0.4
-
-    k = len(sums)
-
-    lines = None
-
-    linesblank = 0
-    scalewidth = width - 2 * textspace
-
-    def rankpos(rank):
-        if not reverse:
-            a = rank - lowv
-        else:
-            a = highv - rank
-        return textspace + scalewidth / (highv - lowv) * a
-
-    distanceh = 0.25
-
-    if cd and cdmethod is None:
-        # get pairs of non significant methods
-
-        def get_lines(sums, hsd):
-            # get all pairs
-            lsums = len(sums)
-            allpairs = [(i, j) for i, j in mxrange([[lsums], [lsums]]) if j > i]
-            # remove not significant
-            notSig = [(i, j) for i, j in allpairs
-                      if abs(sums[i] - sums[j]) <= hsd]
-            # keep only longest
-
-            def no_longer(ij_tuple, notSig):
-                i, j = ij_tuple
-                for i1, j1 in notSig:
-                    if (i1 <= i and j1 > j) or (i1 < i and j1 >= j):
-                        return False
-                return True
-
-            longest = [(i, j) for i, j in notSig if no_longer((i, j), notSig)]
-
-            return longest
-
-        lines = get_lines(ssums, cd)
-        linesblank = 0.2 + 0.2 + (len(lines) - 1) * 0.1
-
-        # add scale
-        distanceh = 0.25
-        cline += distanceh
-
-    # calculate height needed height of an image
-    minnotsignificant = max(2 * 0.2, linesblank)
-    height = cline + ((k + 1) / 2) * 0.2 + minnotsignificant
-
-    fig = plt.figure(figsize=(width, height))
-    fig.set_facecolor('white')
-    ax = fig.add_axes([0, 0, 1, 1])  # reverse y axis
-    ax.set_axis_off()
-
-    hf = 1. / height  # height factor
-    wf = 1. / width
-
-    def hfl(l):
-        return [a * hf for a in l]
-
-    def wfl(l):
-        return [a * wf for a in l]
-
-
-    # Upper left corner is (0,0).
-    ax.plot([0, 1], [0, 1], c="w")
-    ax.set_xlim(0, 1)
-    ax.set_ylim(1, 0)
-
-    def line(l, color='k', **kwargs):
-        """
-        Input is a list of pairs of points.
-        """
-        ax.plot(wfl(nth(l, 0)), hfl(nth(l, 1)), color=color, **kwargs)
-
-    def text(x, y, s, *args, **kwargs):
-        ax.text(wf * x, hf * y, s, *args, **kwargs)
-
-    line([(textspace, cline), (width - textspace, cline)], linewidth=0.7)
-
-    bigtick = 0.1
-    smalltick = 0.05
-
-    tick = None
-    for a in list(np.arange(lowv, highv, 0.5)) + [highv]:
-        tick = smalltick
-        if a == int(a):
-            tick = bigtick
-        line([(rankpos(a), cline - tick / 2),
-              (rankpos(a), cline)],
-             linewidth=0.7)
-
-    for a in range(lowv, highv + 1):
-        text(rankpos(a), cline - tick / 2 - 0.05, str(a),
-             ha="center", va="bottom")
-
-    k = len(ssums)
-
-    for i in range(math.ceil(k / 2)):
-        chei = cline + minnotsignificant + i * 0.2
-        line([(rankpos(ssums[i]), cline),
-              (rankpos(ssums[i]), chei),
-              (textspace - 0.1, chei)],
-             linewidth=0.7)
-        text(textspace - 0.2, chei, nnames[i], ha="right", va="center")
-
-    for i in range(math.ceil(k / 2), k):
-        chei = cline + minnotsignificant + (k - i - 1) * 0.2
-        line([(rankpos(ssums[i]), cline),
-              (rankpos(ssums[i]), chei),
-              (textspace + scalewidth + 0.1, chei)],
-             linewidth=0.7)
-        text(textspace + scalewidth + 0.2, chei, nnames[i],
-             ha="left", va="center")
-
-    if cd and cdmethod is None:
-        # upper scale
-        if not reverse:
-            begin, end = rankpos(lowv), rankpos(lowv + cd)
-        else:
-            begin, end = rankpos(highv), rankpos(highv - cd)
-
-        line([(begin, distanceh), (end, distanceh)], linewidth=0.7)
-        line([(begin, distanceh + bigtick / 2),
-              (begin, distanceh - bigtick / 2)],
-             linewidth=0.7)
-        line([(end, distanceh + bigtick / 2),
-              (end, distanceh - bigtick / 2)],
-             linewidth=0.7)
-        text((begin + end) / 2, distanceh - 0.05, "CD",
-             ha="center", va="bottom")
-
-        # no-significance lines
-        def draw_lines(lines, side=0.05, height=0.1):
-            start = cline + 0.2
-            for l, r in lines:
-                line([(rankpos(ssums[l]) - side, start),
-                      (rankpos(ssums[r]) + side, start)],
-                     linewidth=2.5)
-                start += height
-
-        draw_lines(lines)
-
-    elif cd:
-        begin = rankpos(avranks[cdmethod] - cd)
-        end = rankpos(avranks[cdmethod] + cd)
-        line([(begin, cline), (end, cline)],
-             linewidth=2.5)
-        line([(begin, cline + bigtick / 2),
-              (begin, cline - bigtick / 2)],
-             linewidth=2.5)
-        line([(end, cline + bigtick / 2),
-              (end, cline - bigtick / 2)],
-             linewidth=2.5)
-
-    if filename:
-        print_figure(fig, filename, **kwargs)

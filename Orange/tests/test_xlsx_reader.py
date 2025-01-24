@@ -4,6 +4,7 @@
 import unittest
 import os
 from functools import wraps
+from tempfile import mkstemp
 from typing import Callable
 
 import numpy as np
@@ -45,6 +46,35 @@ class TestExcelReader(unittest.TestCase):
         self.assertIsInstance(domain[0], ContinuousVariable)
         self.assertIsInstance(domain[1], ContinuousVariable)
         self.assertEqual(domain[2].values, ("1", "2"))
+
+    def test_write_file(self):
+        fd, filename = mkstemp(suffix=".xlsx")
+        os.close(fd)
+
+        data = Table("zoo")
+        io.ExcelReader.write_file(filename, data, with_annotations=True)
+
+        reader = io.ExcelReader(filename)
+        read_data = reader.read()
+
+        domain1 = data.domain
+        domain2 = read_data.domain
+        self.assertEqual(len(domain1.attributes), len(domain2.attributes))
+        self.assertEqual(len(domain1.class_vars), len(domain2.class_vars))
+        self.assertEqual(len(domain1.metas), len(domain2.metas))
+        for var1, var2 in zip(domain1.variables + domain1.metas,
+                              domain2.variables + domain2.metas):
+            self.assertEqual(type(var1), type(var2))
+            self.assertEqual(var1.name, var2.name)
+            if var1.is_discrete:
+                self.assertEqual(var1.values, var2.values)
+
+        np.testing.assert_array_equal(data.X, read_data.X)
+        np.testing.assert_array_equal(data.Y, read_data.Y)
+        np.testing.assert_array_equal(data.metas, read_data.metas)
+        np.testing.assert_array_equal(data.W, read_data.W)
+
+        os.unlink(filename)
 
 
 class TestExcelHeader0(unittest.TestCase):
@@ -112,6 +142,25 @@ class TestExcelHeader1(unittest.TestCase):
                                                  [1, 0.1, 0, 123],
                                                  [0, 0, np.nan, 0]]))
         np.testing.assert_equal(table.Y, np.array([]).reshape(3, 0))
+
+    def test_hash(self):
+        table = Table.from_file(get_dataset("header_1_hash.xlsx"))
+        domain = table.domain
+        self.assertEqual(len(domain.metas), 0)
+        self.assertEqual(len(domain.attributes), 3)
+        self.assertEqual(len(domain.class_vars), 1)
+        self.assertIsInstance(domain[0], DiscreteVariable)
+        self.assertIsInstance(domain[1], ContinuousVariable)
+        self.assertIsInstance(domain[2], ContinuousVariable)
+        self.assertIsInstance(domain[3], DiscreteVariable)
+        self.assertEqual([v.name for v in domain.variables],
+                         ["#", "b#", "d", "Feature 1"])
+        self.assertEqual(domain[0].values, ("green", "red"))
+        np.testing.assert_almost_equal(table.X, np.array([[1, 0.5, 21],
+                                                          [1, 0.1, 123],
+                                                          [0, 0, 0]]))
+        np.testing.assert_equal(table.Y, [0, 0, np.nan])
+
 
     @test_xlsx_xls
     def test_flags(self, reader: Callable[[str], io.FileFormat]):
@@ -185,7 +234,7 @@ class TestMissingValues(unittest.TestCase):
     @test_xlsx_xls
     def test_read_errors(self, reader: Callable[[str], io.FileFormat]):
         table = read_file(reader, "missing")
-        values = table.get_column_view("C")[0]
+        values = table.get_column("C")
         self.assertTrue(np.isnan(values).all())
 
 

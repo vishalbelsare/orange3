@@ -28,6 +28,7 @@ from Orange.widgets.utils.widgetpreview import WidgetPreview
 from Orange.widgets.visualize.utils.plotutils import HelpEventDelegate
 from Orange.widgets.widget import Input, Output
 from Orange.widgets.utils.dendrogram import DendrogramWidget
+from Orange.widgets.visualize.utils.plotutils import GraphicsView
 from Orange.widgets.visualize.utils.heatmap import (
     GradientColorMap, GradientLegendWidget,
 )
@@ -264,7 +265,7 @@ class OWDistanceMap(widget.OWWidget):
     description = "Visualize a distance matrix."
     icon = "icons/DistanceMap.svg"
     priority = 1200
-    keywords = []
+    keywords = "distance map"
 
     class Inputs:
         distances = Input("Distances", Orange.misc.DistMatrix)
@@ -273,6 +274,10 @@ class OWDistanceMap(widget.OWWidget):
         selected_data = Output("Selected Data", Orange.data.Table, default=True)
         annotated_data = Output(ANNOTATED_DATA_SIGNAL_NAME, Orange.data.Table)
         features = Output("Features", widget.AttributeList, dynamic=False)
+
+    class Error(widget.OWWidget.Error):
+        empty_matrix = widget.Msg("Empty distance matrix")
+        not_symmetric = widget.Msg("Distance matrix is not symmetric.")
 
     settingsHandler = settings.PerfectDomainContextHandler()
 
@@ -291,7 +296,7 @@ class OWDistanceMap(widget.OWWidget):
 
     autocommit = settings.Setting(True)
 
-    graph_name = "grid_widget"
+    graph_name = "grid_widget" # pg.GraphicsItem (pg.GraphicsWidget)
 
     # Disable clustering for inputs bigger than this
     _MaxClustering = 25000
@@ -344,7 +349,7 @@ class OWDistanceMap(widget.OWWidget):
 
         gui.auto_send(self.buttonsArea, self, "autocommit")
 
-        self.view = GraphicsView(background="w")
+        self.view = GraphicsView(background=None)
         self.mainArea.layout().addWidget(self.view)
 
         self.grid_widget = pg.GraphicsWidget()
@@ -415,11 +420,13 @@ class OWDistanceMap(widget.OWWidget):
     def set_distances(self, matrix):
         self.closeContext()
         self.clear()
-        self.error()
+        self.Error.clear()
         if matrix is not None:
-            N, _ = matrix.shape
-            if N < 2:
-                self.error("Empty distance matrix.")
+            if matrix.shape[1] < 2:
+                self.Error.empty_matrix()
+                matrix = None
+            elif not matrix.is_symmetric():
+                self.Error.not_symmetric()
                 matrix = None
 
         self.matrix = matrix
@@ -599,7 +606,7 @@ class OWDistanceMap(widget.OWWidget):
             labels = [v.name for v in self.items]
         elif isinstance(self.items, Orange.data.Table):
             var = self.annot_combo.model()[self.annotation_idx]
-            column, _ = self.items.get_column_view(var)
+            column = self.items.get_column(var)
             labels = [var.str_val(value) for value in column]
 
         self._set_labels(labels)
@@ -712,16 +719,16 @@ class TextList(TextListWidget):
         fontsize = min(self._point_size(lineheight), maxfontsize)
 
         font_ = QFont()
-        font_.setPointSize(fontsize)
+        font_.setPointSizeF(fontsize)
         self.setFont(font_)
 
     def _point_size(self, height):
         font = self.font()
-        font.setPointSize(height)
+        font.setPointSizeF(height)
         fix = 0
         while QFontMetrics(font).lineSpacing() > height and height - fix > 1:
             fix += 1
-            font.setPointSize(height - fix)
+            font.setPointSizeF(height - fix)
         return height - fix
 
 

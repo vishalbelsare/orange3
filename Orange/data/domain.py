@@ -11,6 +11,7 @@ import numpy as np
 from Orange.data import (
     Unknown, Variable, ContinuousVariable, DiscreteVariable, StringVariable
 )
+from Orange.misc.cache import IDWeakrefCache
 from Orange.util import deprecated, OrangeDeprecationWarning
 
 __all__ = ["DomainConversion", "Domain"]
@@ -69,7 +70,7 @@ class DomainConversion:
                 sourceindex = source.index(sourcevar)
                 if var.is_discrete and var is not sourcevar:
                     mapping = var.get_mapper_from(sourcevar)
-                    return lambda table: mapping(table.get_column_view(sourceindex)[0])
+                    return lambda table: mapping(table.get_column(sourceindex))
                 return source.index(var)
             return var.compute_value  # , which may also be None
 
@@ -164,16 +165,41 @@ class Domain:
         if not all(var.is_primitive() for var in self._variables):
             raise TypeError("variables must be primitive")
 
-        self._indices = dict(chain.from_iterable(
-            ((var, idx), (var.name, idx), (idx, idx))
-            for idx, var in enumerate(self._variables)))
-        self._indices.update(chain.from_iterable(
-            ((var, -1-idx), (var.name, -1-idx), (-1-idx, -1-idx))
-            for idx, var in enumerate(self.metas)))
+        self._indices = None
 
         self.anonymous = False
 
         self._hash = None  # cache for __hash__()
+        self._eq_cache = IDWeakrefCache(_LRS10Dict())  # cache for __eq__()
+
+    def _ensure_indices(self):
+        if self._indices is None:
+            indices = dict(chain.from_iterable(
+                ((var, idx), (var.name, idx), (idx, idx))
+                for idx, var in enumerate(self._variables)))
+            indices.update(chain.from_iterable(
+                ((var, -1-idx), (var.name, -1-idx), (-1-idx, -1-idx))
+                for idx, var in enumerate(self.metas)))
+            self._indices = indices
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._variables = self.attributes + self.class_vars
+        self._indices = None
+        self._hash = None
+        self._eq_cache = {}
+
+    def __getstate__(self):
+        # Do not pickle dictionaries because unpickling dictionaries that
+        # include objects that redefine __hash__ as keys is sometimes problematic
+        # (when said objects do not have __dict__ filled yet in but are used as
+        # keys in a restored dictionary).
+        state = self.__dict__.copy()
+        del state["_variables"]
+        del state["_indices"]
+        del state["_hash"]
+        del state["_eq_cache"]
+        return state
 
     # noinspection PyPep8Naming
     @classmethod
@@ -289,7 +315,7 @@ class Domain:
         """
         if isinstance(idx, slice):
             return self._variables[idx]
-
+        self._ensure_indices()
         index = self._indices.get(idx)
         if index is None:
             var = self._get_equivalent(idx)
@@ -306,6 +332,7 @@ class Domain:
         Return `True` if the item (`str`, `int`, :class:`Variable`) is
         in the domain.
         """
+        self._ensure_indices()
         return item in self._indices or self._get_equivalent(item) is not None
 
     def __iter__(self):
@@ -334,7 +361,7 @@ class Domain:
         Return the index of the given variable or meta attribute, represented
         with an instance of :class:`Variable`, `int` or `str`.
         """
-
+        self._ensure_indices()
         idx = self._indices.get(var)
         if idx is not None:
             return idx
@@ -495,11 +522,26 @@ class Domain:
         if not isinstance(other, Domain):
             return False
 
-        return (self.attributes == other.attributes and
-                self.class_vars == other.class_vars and
-                self.metas == other.metas)
+        try:
+            eq = self._eq_cache[(other,)]
+        except KeyError:
+            eq = (self.attributes == other.attributes and
+                  self.class_vars == other.class_vars and
+                  self.metas == other.metas)
+            self._eq_cache[(other,)] = eq
+
+        return eq
 
     def __hash__(self):
         if self._hash is None:
             self._hash = hash(self.attributes) ^ hash(self.class_vars) ^ hash(self.metas)
         return self._hash
+
+
+class _LRS10Dict(dict):
+    """ A small "least recently stored" (not LRU) dict """
+
+    def __setitem__(self, key, value):
+        if len(self) >= 10:
+            del self[next(iter(self))]
+        super().__setitem__(key, value)

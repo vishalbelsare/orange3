@@ -38,7 +38,7 @@ class TestOWCorrelations(WidgetTest):
         self.wait_until_finished()
         n_attrs = len(self.data_cont.domain.attributes)
         self.process_events()
-        self.assertEqual(self.widget.vizrank.rank_model.columnCount(), 3)
+        self.assertEqual(self.widget.vizrank.rank_model.columnCount(), 4)
         self.assertEqual(self.widget.vizrank.rank_model.rowCount(),
                          n_attrs * (n_attrs - 1) / 2)
         self.send_signal(self.widget.Inputs.data, None)
@@ -60,7 +60,7 @@ class TestOWCorrelations(WidgetTest):
         n_attrs = len([a for a in domain.attributes if a.is_continuous])
         self.wait_until_finished()
         self.process_events()
-        self.assertEqual(self.widget.vizrank.rank_model.columnCount(), 3)
+        self.assertEqual(self.widget.vizrank.rank_model.columnCount(), 4)
         self.assertEqual(self.widget.vizrank.rank_model.rowCount(),
                          n_attrs * (n_attrs - 1) / 2)
 
@@ -158,10 +158,14 @@ class TestOWCorrelations(WidgetTest):
         self.assertIsInstance(correlations, Table)
         self.assertEqual(len(correlations), 6)
         self.assertEqual(len(correlations.domain.metas), 2)
-        self.assertListEqual(["Correlation", "FDR"],
+        self.assertListEqual(["Correlation", "uncorrected p", "FDR"],
                              [m.name for m in correlations.domain.attributes])
-        array = np.array([[0.963, 0], [0.872, 0], [0.818, 0], [-0.421, 0],
-                          [-0.357, 0.000009], [-0.109, 0.1827652]])
+        array = np.array([[0.963, 0, 0],
+                          [0.872, 0, 0],
+                          [0.818, 0, 0],
+                          [-0.421, 0, 0],
+                          [-0.357, 7.52e-6, 0.000009],
+                          [-0.109, 0.1827652, 0.1827652]])
         npt.assert_almost_equal(correlations.X, array)
 
     def test_input_changed(self):
@@ -324,7 +328,7 @@ class TestCorrelationRank(WidgetTest):
         self.assertEqual(row[0].data(Qt.DisplayRole), "+0.200")
         self.assertEqual(row[0].data(CorrelationRank.PValRole), 0.1)
         self.assertEqual(row[1].data(Qt.DisplayRole), self.attrs[0].name)
-        self.assertEqual(row[2].data(Qt.DisplayRole), self.attrs[1].name)
+        self.assertEqual(row[3].data(Qt.DisplayRole), self.attrs[1].name)
 
     def test_iterate_states(self):
         self.assertListEqual(list(self.vizrank.iterate_states(None)),
@@ -358,7 +362,7 @@ class TestKMeansCorrelationHeuristic(unittest.TestCase):
         clusters = self.heuristic.get_clusters_of_attributes()
         # results depend on scikit-learn k-means implementation
         result = sorted([c.instances for c in clusters])
-        self.assertListEqual([[0], [1, 2, 3, 4, 5, 6, 7], [8]],
+        self.assertListEqual([[0, 3, 5], [1, 2, 6, 7], [4, 8]],
                              result)
 
     def test_get_states(self):

@@ -38,21 +38,37 @@ class EmbedderCache:
 
     def _init_cache(self):
         if isfile(self._cache_file_path):
-            try:
-                return self.load_pickle(self._cache_file_path)
-            except EOFError:
-                return {}
+            return self.load_pickle(self._cache_file_path)
         return {}
 
     @staticmethod
     def save_pickle(obj, file_name):
-        with open(file_name, 'wb') as f:
-            pickle.dump(obj, f)
+        try:
+            with open(file_name, 'wb') as f:
+                pickle.dump(obj, f)
+        except PermissionError as ex:
+            # skip saving cache if no right permissions
+            log.warning(
+                "Can't save embedding to %s due to %s.",
+                file_name,
+                type(ex).__name__,
+                exc_info=True,
+            )
 
     @staticmethod
     def load_pickle(file_name):
-        with open(file_name, 'rb') as f:
-            return pickle.load(f)
+        try:
+            with open(file_name, 'rb') as f:
+                return pickle.load(f)
+        except (EOFError, PermissionError) as ex:
+            # load empty cache if no permission or EOF error
+            log.warning(
+                "Can't load embedding from %s due to %s.",
+                file_name,
+                type(ex).__name__,
+                exc_info=True,
+            )
+            return {}
 
     @staticmethod
     def md5_hash(bytes_):
@@ -78,7 +94,7 @@ class EmbedderCache:
 
 def get_proxies() -> Optional[Dict[str, str]]:
     """
-    Return dict with proxy addresses if they exists.
+    Return dict with proxy addresses if they exist.
 
     Returns
     -------
@@ -86,14 +102,18 @@ def get_proxies() -> Optional[Dict[str, str]]:
         Dictionary with format {proxy type: proxy address} or None if
         they not set.
     """
-    def add_protocol(url: Optional[str], prot: str) -> Optional[str]:
-        if url and not url.startswith(prot):
-            return f"{prot}://{url}"
-        return url
-    http_proxy = add_protocol(environ.get("http_proxy"), "http")
-    https_proxy = add_protocol(environ.get("https_proxy"), "https")
-    if http_proxy and https_proxy:  # both proxy addresses defined
-        return {"http://": https_proxy, "https://": https_proxy}
-    elif any([https_proxy, http_proxy]):  # one of the proxies defined
-        return {"all://": http_proxy or https_proxy}
-    return None  # proxies not defined
+    def add_scheme(url: Optional[str]) -> Optional[str]:
+        if url is not None and "://" not in url:
+            # if no scheme default to http - as other libraries do (e.g. requests)
+            return f"http://{url}"
+        else:
+            return url
+
+    http_proxy = add_scheme(environ.get("http_proxy"))
+    https_proxy = add_scheme(environ.get("https_proxy"))
+    proxy_dict = {}
+    if http_proxy:
+        proxy_dict["http://"] = http_proxy
+    if https_proxy:
+        proxy_dict["https://"] = https_proxy
+    return proxy_dict if proxy_dict else None

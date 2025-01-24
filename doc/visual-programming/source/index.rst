@@ -48,7 +48,7 @@ Data
    widgets/data/paintdata
    widgets/data/pivot
    widgets/data/pythonscript
-   widgets/data/featureconstructor
+   widgets/data/formula
    widgets/data/editdomain
    widgets/data/impute
    widgets/data/mergedata
@@ -89,6 +89,7 @@ Visualize
    widgets/visualize/silhouetteplot
    widgets/visualize/treeviewer
    widgets/visualize/nomogram
+   widgets/visualize/scoringsheetviewer
    widgets/visualize/freeviz
    widgets/visualize/radviz
 
@@ -108,8 +109,10 @@ Model
    widgets/model/gradientboosting
    widgets/model/svm
    widgets/model/linearregression
+   widgets/model/pls
    widgets/model/logisticregression
    widgets/model/naivebayes
+   widgets/model/scoringsheet
    widgets/model/adaboost
    widgets/model/curvefit
    widgets/model/neuralnetwork
@@ -127,10 +130,12 @@ Evaluate
 
    widgets/evaluate/calibrationplot
    widgets/evaluate/confusionmatrix
-   widgets/evaluate/liftcurve
+   widgets/evaluate/performancecurve
    widgets/evaluate/predictions
    widgets/evaluate/rocanalysis
    widgets/evaluate/testandscore
+   widgets/evaluate/permutationplot
+   widgets/evaluate/parameterfitter
 
 
 .. toctree::

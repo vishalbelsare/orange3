@@ -1,9 +1,13 @@
+import unittest
 from unittest.mock import patch
+
+import numpy as np
 
 from AnyQt.QtCore import Qt
 
 from Orange.data import ContinuousVariable
 from Orange.widgets import gui
+from Orange.widgets.gui import BarRatioTableModel
 from Orange.widgets.tests.base import GuiTest
 from Orange.widgets.utils.itemmodels import VariableListModel
 from Orange.widgets.widget import OWWidget
@@ -51,6 +55,10 @@ class TestListModel(GuiTest):
         sel_model.clear()
         view.setCurrentIndex(self.attrs.index(1, 0))
         self.assertEqual(widget.foo, [b])
+
+        # unselect all
+        sel_model.clear()
+        self.assertEqual(widget.foo, [])
 
     def test_select_callfront(self):
         widget = self.widget
@@ -107,4 +115,26 @@ class ComboBoxTest(GuiTest):
     def test_warn_value_type(self, gui_combobox):
         with self.assertWarns(DeprecationWarning):
             gui.comboBox(None, None, "foo", valueType=int, editable=True)
-        self.assertEqual(gui_combobox.call_args[1], {"editable": True})
+
+
+class TestRankModel(GuiTest):
+    @staticmethod
+    def test_argsort():
+        func = BarRatioTableModel()._argsortData  # pylint: disable=protected-access
+        assert_equal = np.testing.assert_equal
+
+        test_array = np.array([4.2, 7.2, np.nan, 1.3, np.nan])
+        assert_equal(func(test_array, Qt.AscendingOrder)[:3], [3, 0, 1])
+        assert_equal(func(test_array, Qt.DescendingOrder)[:3], [1, 0, 3])
+
+        test_array = np.array([4, 7, 2])
+        assert_equal(func(test_array, Qt.AscendingOrder), [2, 0, 1])
+        assert_equal(func(test_array, Qt.DescendingOrder), [1, 0, 2])
+
+        test_array = np.array(["Bertha", "daniela", "ann", "Cecilia"])
+        assert_equal(func(test_array, Qt.AscendingOrder), [2, 0, 3, 1])
+        assert_equal(func(test_array, Qt.DescendingOrder), [1, 3, 0, 2])
+
+
+if __name__ == "__main__":
+    unittest.main()

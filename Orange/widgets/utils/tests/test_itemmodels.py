@@ -1,24 +1,29 @@
 # Test methods with long descriptive names can omit docstrings
 # pylint: disable=missing-docstring
-
 import unittest
 from unittest.mock import patch
 
-import numpy as np
+from scipy.sparse import csr_matrix
 
 from AnyQt.QtCore import Qt, QModelIndex
 from AnyQt.QtTest import QSignalSpy
+from AnyQt.QtGui import QBrush, QColor
+
+from orangewidget.tests.base import GuiTest
 
 from Orange.data import \
-    Domain, \
+    Domain, Table, Value, \
     ContinuousVariable, DiscreteVariable, StringVariable, TimeVariable
+from Orange.statistics.basic_stats import BasicStats
 from Orange.widgets.utils import colorpalettes
 from Orange.widgets.utils.itemmodels import \
-    AbstractSortTableModel, PyTableModel,\
-    PyListModel, VariableListModel, DomainModel, ContinuousPalettesModel, \
-    _as_contiguous_range
+    PyTableModel, PyListModel, PyListModelTooltip,\
+    VariableListModel, DomainModel, ContinuousPalettesModel, \
+    TableModel, _as_contiguous_range
 from Orange.widgets.gui import TableVariable
-from orangewidget.tests.base import GuiTest
+from Orange.tests import test_filename
+from Orange.tests.sql.base import DataBaseTest as dbt
+from Orange.data.sql.table import SqlTable
 
 
 class TestUtils(unittest.TestCase):
@@ -64,8 +69,8 @@ class TestPyTableModel(unittest.TestCase):
 
     def test_editable(self):
         editable_model = PyTableModel([[0]], editable=True)
-        self.assertFalse(int(self.model.flags(self.model.index(0, 0)) & Qt.ItemIsEditable))
-        self.assertTrue(int(editable_model.flags(editable_model.index(0, 0)) & Qt.ItemIsEditable))
+        self.assertFalse(bool(self.model.flags(self.model.index(0, 0)) & Qt.ItemIsEditable))
+        self.assertTrue(bool(editable_model.flags(editable_model.index(0, 0)) & Qt.ItemIsEditable))
 
     def test_sort(self):
         self.model.sort(1)
@@ -158,11 +163,11 @@ class TestPyTableModel(unittest.TestCase):
         model.append([2, 3])
         self.assertEqual(list(inserted)[-1][1:], [1, 1])
         del model[:]
-        self.assertEqual(list(removed)[0][1:], [0, 1])
+        self.assertEqual(list(removed)[-1][1:], [0, 1])
         model.extend([[0, 1], [0, 2]])
         self.assertEqual(list(inserted)[-1][1:], [0, 1])
         model.clear()
-        self.assertEqual(list(removed)[0][1:], [0, 1])
+        self.assertEqual(list(removed)[-1][1:], [0, 1])
         model[:] = [[1], [2]]
         self.assertEqual(list(inserted)[-1][1:], [0, 0])
 
@@ -479,6 +484,150 @@ class TestContinuousPalettesModel(GuiTest):
         self.assertEqual(model.indexOf(self.palette2.name), 2)
         self.assertEqual(model.indexOf(self.palette2.friendly_name), 2)
         self.assertIsNone(model.indexOf(42))
+
+
+class TestPyListModelTooltip(GuiTest):
+    def test_tooltips_size(self):
+        def data(i):
+            return model.data(model.index(i, 0))
+
+        def tip(i):
+            return model.data(model.index(i, 0), Qt.ToolTipRole)
+
+        # Not enough tooptips - return None
+        model = PyListModelTooltip(["foo", "bar", "baz"], ["footip", "bartip"])
+        self.assertEqual(data(1), "bar")
+        self.assertEqual(data(2), "baz")
+        self.assertIsNone(data(3))
+        self.assertEqual(tip(1), "bartip")
+        self.assertIsNone(tip(2))
+
+        # No tooltips
+        model = PyListModelTooltip(["foo", "bar", "baz"])
+        self.assertIsNone(tip(1))
+        self.assertIsNone(tip(2))
+
+        # Too many tooltips
+        model = PyListModelTooltip(["foo", "bar"], ["footip", "bartip", "btip"])
+        self.assertEqual(data(0), "foo")
+        self.assertEqual(data(1), "bar")
+        self.assertIsNone(data(2))
+        self.assertEqual(tip(1), "bartip")
+        self.assertEqual(tip(2), "btip")
+
+    def test_tooltip_arg(self):
+        def tip(i):
+            return model.data(model.index(i, 0), Qt.ToolTipRole)
+
+        # Allow generators
+        s = dict(a="ta", b="tb")
+        model = PyListModelTooltip(s, s.values())
+        self.assertEqual(tip(0), "ta")
+        self.assertEqual(tip(1), "tb")
+
+        # Basically backward compatibility; this behaviour diverges from
+        # behaviour of data role
+        s = []
+        model = PyListModelTooltip(["foo"], s)
+        self.assertIsNone(tip(0))
+
+        s += ["footip"]
+        self.assertEqual(tip(1), "footip")
+
+
+class TestTableModel(unittest.TestCase, dbt):
+    def setUpDB(self):
+        # pylint: disable=attribute-defined-outside-init
+        self.conn, self.iris = self.create_iris_sql_table()
+
+    def tearDownDB(self):
+        self.drop_iris_sql_table()
+
+    @dbt.run_on(["postgres", "mssql"])
+    def test_dense_data(self):
+        table = SqlTable(self.conn, self.iris, inspect_values=True)
+        if self.current_db == "mssql":
+            # when loading data from mssql db, Sql widget returns Table (not SqlTable)
+            table = Table(table)
+        new_domain = Domain(table.domain.attributes[:-1], table.domain.attributes[-1])
+        table = table.transform(new_domain)
+        model = TableModel(table)
+
+        self._dense_data(table, model.data, model.index)
+
+    def test_local_dense_data(self):
+        table = Table("iris.tab")
+        model = TableModel(table)
+
+        self._dense_data(table, model.data, model.index)
+
+    def _dense_data(self, table, data, index):
+        # Y: categorical
+        self.assertEqual(table[0, 4], data(index(0, 0), Qt.DisplayRole))
+        self.assertIsInstance(data(index(0, 0), Qt.DisplayRole), str)
+        self.assertEqual(table[0, 4], data(index(0, 0), Qt.EditRole))
+        self.assertIsInstance(data(index(0, 0), Qt.EditRole), Value)
+        self.assertIsInstance(data(index(0, 0), Qt.BackgroundRole), QBrush)
+        self.assertIsInstance(data(index(0, 0), Qt.ForegroundRole), QColor)
+        self.assertEqual(table[0, 4], data(index(0, 0), TableModel.ValueRole))
+        self.assertEqual(table[0, 4], data(index(0, 0), TableModel.ClassValueRole))
+        self.assertEqual(table.domain[4], data(index(0, 0), TableModel.VariableRole))
+        self.assertIsInstance(data(index(0, 0), TableModel.VariableStatsRole), BasicStats)
+
+        # X: continuous
+        self.assertEqual(table[0, 0], data(index(0, 1), Qt.DisplayRole))
+        self.assertIsInstance(data(index(0, 1), Qt.DisplayRole), str)
+        self.assertEqual(table[0, 0], data(index(0, 1), Qt.EditRole))
+        self.assertIsInstance(data(index(0, 1), Qt.EditRole), Value)
+        self.assertIsNone(data(index(0, 1), Qt.BackgroundRole))
+        self.assertIsNone(data(index(0, 1), Qt.ForegroundRole))
+        self.assertEqual(table[0, 0], data(index(0, 1), TableModel.ValueRole))
+        self.assertEqual(table[0, 4], data(index(0, 1), TableModel.ClassValueRole))
+        self.assertEqual(table.domain[0], data(index(0, 1), TableModel.VariableRole))
+        self.assertIsInstance(data(index(0, 1), TableModel.VariableStatsRole), BasicStats)
+
+    def test_sparse_data(self):
+        table = Table(test_filename("datasets/iris_basket.basket"))
+        model = TableModel(table)
+        data, index = model.data, model.index
+
+        # Y: 2d
+        self.assertListEqual([table[0, 4], table[0, 5], table[0, 6]],
+                             [data(index(0, i), Qt.DisplayRole) for i in range(3)])
+        self.assertIsInstance(data(index(0, 0), Qt.DisplayRole), str)
+        self.assertEqual(table[0, 4], data(index(0, 0), Qt.EditRole))
+        self.assertIsInstance(data(index(0, 0), Qt.EditRole), Value)
+        self.assertIsInstance(data(index(0, 0), Qt.BackgroundRole), QBrush)
+        self.assertIsInstance(data(index(0, 0), Qt.ForegroundRole), QColor)
+        self.assertEqual(table[0, 4], data(index(0, 0), TableModel.ValueRole))
+        self.assertIsNone(data(index(0, 0), TableModel.ClassValueRole))
+        self.assertEqual(table.domain[4], data(index(0, 0), TableModel.VariableRole))
+        self.assertIsInstance(data(index(0, 0), TableModel.VariableStatsRole), BasicStats)
+
+        # X: sparse
+        self.assertEqual("sepal_length=1.5, sepal_width=5.3, petal_length=4.1, petal_width=2",
+                         data(index(0, 3), Qt.DisplayRole))
+        self.assertIsNone(data(index(0, 3), Qt.EditRole))
+        self.assertIsNone(data(index(0, 3), Qt.BackgroundRole))
+        self.assertIsNone(data(index(0, 3), Qt.ForegroundRole))
+        self.assertIsNone(data(index(0, 3), TableModel.ValueRole))
+        self.assertIsNone(data(index(0, 3), TableModel.ClassValueRole))
+        self.assertIsNone(data(index(0, 3), TableModel.VariableRole))
+        self.assertIsNone(data(index(0, 3), TableModel.VariableStatsRole))
+
+        # X: sparse_bool
+        table = Table.from_numpy(Domain(table.domain.class_vars, metas=table.domain.attributes),
+                                 csr_matrix(table.Y), metas=table.X)
+        model = TableModel(table)
+        data, index = model.data, model.index
+
+        self.assertEqual("Iris-setosa", data(index(0, 1), Qt.DisplayRole))
+
+        # metas: sparse
+        self.assertEqual("sepal_length=1.5, sepal_width=5.3, petal_length=4.1, petal_width=2",
+                         data(index(0, 0), Qt.DisplayRole))
+        self.assertIsInstance(data(index(0, 0), Qt.BackgroundRole), QBrush)
+        self.assertIsInstance(data(index(0, 0), Qt.ForegroundRole), QColor)
 
 
 if __name__ == "__main__":

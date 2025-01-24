@@ -5,42 +5,53 @@ Edit Domain
 A widget for manual editing of a domain's attributes.
 
 """
+from __future__ import annotations
 import warnings
 from xml.sax.saxutils import escape
-from itertools import zip_longest, repeat, chain
-from contextlib import contextmanager
+from itertools import zip_longest, repeat, chain, groupby
 from collections import namedtuple, Counter
 from functools import singledispatch, partial
+from operator import itemgetter
 from typing import (
     Tuple, List, Any, Optional, Union, Dict, Sequence, Iterable, NamedTuple,
-    FrozenSet, Type, Callable, TypeVar, Mapping, Hashable, cast
+    FrozenSet, Type, Callable, TypeVar, Mapping, Hashable, cast, Set
 )
 
 import numpy as np
 import pandas as pd
+
 from AnyQt.QtWidgets import (
     QWidget, QListView, QTreeView, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLineEdit, QAction, QActionGroup, QGroupBox,
     QStyledItemDelegate, QStyleOptionViewItem, QStyle, QSizePolicy,
     QDialogButtonBox, QPushButton, QCheckBox, QComboBox, QStackedLayout,
-    QDialog, QRadioButton, QGridLayout, QLabel, QSpinBox, QDoubleSpinBox,
+    QDialog, QRadioButton, QLabel, QSpinBox, QDoubleSpinBox,
     QAbstractItemView, QMenu, QToolTip
 )
 from AnyQt.QtGui import (
     QStandardItemModel, QStandardItem, QKeySequence, QIcon, QBrush, QPalette,
-    QHelpEvent
+    QHelpEvent, QColor
 )
 from AnyQt.QtCore import (
     Qt, QSize, QModelIndex, QAbstractItemModel, QPersistentModelIndex, QRect,
-    QPoint,
+    QPoint, QItemSelectionModel
 )
 from AnyQt.QtCore import pyqtSignal as Signal, pyqtSlot as Slot
 
+from orangecanvas.gui.utils import luminance
+from orangecanvas.utils import assocf
+from orangewidget.utils.listview import ListViewSearch
+
 import Orange.data
 
-from Orange.preprocess.transformation import Transformation, Identity, Lookup
-from Orange.widgets import widget, gui, settings
-from Orange.widgets.utils import itemmodels
+from Orange.preprocess.transformation import (
+    Transformation, Identity, Lookup, MappingTransform
+)
+from Orange.misc.collections import DictMissingConst
+from Orange.util import frompyfunc
+from Orange.widgets import widget, gui
+from Orange.widgets.settings import Setting
+from Orange.widgets.utils import itemmodels, ftry, disconnected, unique_everseen as unique
 from Orange.widgets.utils.buttons import FixedSizeButton
 from Orange.widgets.utils.itemmodels import signal_blocking
 from Orange.widgets.utils.widgetpreview import WidgetPreview
@@ -50,18 +61,10 @@ ndarray = np.ndarray  # pylint: disable=invalid-name
 MArray = np.ma.MaskedArray
 DType = Union[np.dtype, type]
 
-A = TypeVar("A")  # pylint: disable=invalid-name
-B = TypeVar("B")  # pylint: disable=invalid-name
 V = TypeVar("V", bound=Orange.data.Variable)  # pylint: disable=invalid-name
 H = TypeVar("H", bound=Hashable)  # pylint: disable=invalid-name
 
-
-def unique(sequence: Iterable[H]) -> Iterable[H]:
-    """
-    Return unique elements in `sequence`, preserving their (first seen) order.
-    """
-    # depending on Python >= 3.6 'ordered' dict implementation detail.
-    return iter(dict.fromkeys(sequence))
+MAX_HINTS = 1000
 
 
 class _DataType:
@@ -77,19 +80,6 @@ class _DataType:
     def __hash__(self):
         return hash((type(self), super().__hash__()))
 
-    def name_type(self):
-        """
-        Returns a tuple with name and type of the variable.
-        It is used since it is forbidden to use names of variables in settings.
-        """
-        type_number = {
-            "Categorical": 0,
-            "Real": 2,
-            "Time": 3,
-            "String": 4
-        }
-        return self.name, type_number[type(self).__name__]
-
 
 #: An ordered sequence of key, value pairs (variable annotations)
 AnnotationsType = Tuple[Tuple[str, str], ...]
@@ -101,8 +91,7 @@ class Categorical(
     _DataType, NamedTuple("Categorical", [
         ("name", str),
         ("categories", Tuple[str, ...]),
-        ("annotations", AnnotationsType),
-        ("linked", bool)
+        ("annotations", AnnotationsType)
     ])): pass
 
 
@@ -111,26 +100,27 @@ class Real(
         ("name", str),
         # a precision (int, and a format specifier('f', 'g', or '')
         ("format", Tuple[int, str]),
-        ("annotations", AnnotationsType),
-        ("linked", bool)
+        ("annotations", AnnotationsType)
     ])): pass
 
 
 class String(
     _DataType, NamedTuple("String", [
         ("name", str),
-        ("annotations", AnnotationsType),
-        ("linked", bool)
+        ("annotations", AnnotationsType)
     ])): pass
 
 
 class Time(
     _DataType, NamedTuple("Time", [
         ("name", str),
-        ("annotations", AnnotationsType),
-        ("linked", bool)
+        ("annotations", AnnotationsType)
     ])): pass
 
+
+class RestoreOriginal:
+    # Indicator type used only for UserRole in ComboBox
+    pass
 
 Variable = Union[Categorical, Real, Time, String]
 VariableTypes = (Categorical, Real, Time, String)
@@ -190,10 +180,12 @@ class Unlink(_DataType, namedtuple("Unlink", [])):
     """Unlink variable from its source, that is, remove compute_value"""
 
 
-Transform = Union[Rename, CategoriesMapping, Annotate, Unlink]
-TransformTypes = (Rename, CategoriesMapping, Annotate, Unlink)
+class StrpTime(_DataType, namedtuple("StrpTime", ["label", "formats", "have_date", "have_time"])):
+    """Use format on variable interpreted as time"""
 
-CategoricalTransformTypes = (CategoriesMapping, Unlink)
+
+Transform = Union[Rename, CategoriesMapping, Annotate, Unlink, StrpTime]
+TransformTypes = (Rename, CategoriesMapping, Annotate, Unlink, StrpTime)
 
 
 # Reinterpret vector transformations.
@@ -236,7 +228,7 @@ class AsString(_DataType, NamedTuple("AsString", [])):
         if isinstance(var, String):
             return vector
         return StringVector(
-            String(var.name, var.annotations, False),
+            String(var.name, var.annotations),
             lambda: as_string(vector.data()),
         )
 
@@ -256,11 +248,11 @@ class AsContinuous(_DataType, NamedTuple("AsContinuous", [])):
                 a = categorical_to_string_vector(d, var.values)
                 return MArray(as_float_or_nan(a, where=a.mask), mask=a.mask)
             return RealVector(
-                Real(var.name, (6, 'g'), var.annotations, var.linked), data
+                Real(var.name, (6, 'g'), var.annotations), data
             )
         elif isinstance(var, Time):
             return RealVector(
-                Real(var.name, (6, 'g'), var.annotations, var.linked),
+                Real(var.name, (6, 'g'), var.annotations),
                 lambda: vector.data().astype(float)
             )
         elif isinstance(var, String):
@@ -268,7 +260,7 @@ class AsContinuous(_DataType, NamedTuple("AsContinuous", [])):
                 s = vector.data()
                 return MArray(as_float_or_nan(s, where=s.mask), mask=s.mask)
             return RealVector(
-                Real(var.name, (6, "g"), var.annotations, var.linked), data
+                Real(var.name, (6, "g"), var.annotations), data
             )
         raise AssertionError
 
@@ -284,7 +276,7 @@ class AsCategorical(_DataType, namedtuple("AsCategorical", [])):
         if isinstance(var, (Real, Time, String)):
             data, values = categorical_from_vector(vector.data())
             return CategoricalVector(
-                Categorical(var.name, values, var.annotations, var.linked),
+                Categorical(var.name, values, var.annotations),
                 lambda: data
             )
         raise AssertionError
@@ -298,7 +290,7 @@ class AsTime(_DataType, namedtuple("AsTime", [])):
             return vector
         elif isinstance(var, Real):
             return TimeVector(
-                Time(var.name, var.annotations, var.linked),
+                Time(var.name, var.annotations),
                 lambda: vector.data().astype("M8[us]")
             )
         elif isinstance(var, Categorical):
@@ -308,7 +300,7 @@ class AsTime(_DataType, namedtuple("AsTime", [])):
                 dt = pd.to_datetime(s, errors="coerce").values.astype("M8[us]")
                 return MArray(dt, mask=d.mask)
             return TimeVector(
-                Time(var.name, var.annotations, var.linked), data
+                Time(var.name, var.annotations), data
             )
         elif isinstance(var, String):
             def data():
@@ -316,13 +308,21 @@ class AsTime(_DataType, namedtuple("AsTime", [])):
                 dt = pd.to_datetime(s, errors="coerce").values.astype("M8[us]")
                 return MArray(dt, mask=s.mask)
             return TimeVector(
-                Time(var.name, var.annotations, var.linked), data
+                Time(var.name, var.annotations), data
             )
         raise AssertionError
 
 
 ReinterpretTransform = Union[AsCategorical, AsContinuous, AsTime, AsString]
 ReinterpretTransformTypes = (AsCategorical, AsContinuous, AsTime, AsString)
+
+TypeTransformers = {
+    Real: AsContinuous,
+    Categorical: AsCategorical,
+    Time: AsTime,
+    String: AsString,
+    RestoreOriginal: RestoreOriginal
+}
 
 
 def deconstruct(obj):
@@ -360,8 +360,8 @@ def reconstruct(tname, args):
     """
     try:
         constructor = globals()[tname]
-    except KeyError:
-        raise NameError(tname)
+    except KeyError as exc:
+        raise NameError(tname) from exc
     return constructor(*args)
 
 
@@ -472,26 +472,33 @@ class DictItemsModel(QStandardItemModel):
         return rval
 
 
-class VariableEditor(QWidget):
+class BaseEditor(QWidget):
+    variable_changed = Signal()
+
+    def __init__(self, parent=None, **kwargs):
+        super().__init__(parent, **kwargs)
+
+        layout = QVBoxLayout()
+        self.setLayout(layout)
+
+        self.form = QFormLayout(
+            fieldGrowthPolicy=QFormLayout.AllNonFixedFieldsGrow,
+            objectName="editor-form-layout"
+        )
+        layout.addLayout(self.form)
+
+
+class VariableEditor(BaseEditor):
     """
     An editor widget for a variable.
 
     Can edit the variable name, and its attributes dictionary.
     """
-    variable_changed = Signal()
-
     def __init__(self, parent=None, **kwargs):
         super().__init__(parent, **kwargs)
         self.var = None  # type: Optional[Variable]
 
-        layout = QVBoxLayout()
-        self.setLayout(layout)
-
-        self.form = form = QFormLayout(
-            fieldGrowthPolicy=QFormLayout.AllNonFixedFieldsGrow,
-            objectName="editor-form-layout"
-        )
-        layout.addLayout(self.form)
+        form = self.form
 
         self.name_edit = QLineEdit(objectName="name-editor")
         self.name_edit.editingFinished.connect(
@@ -510,7 +517,7 @@ class VariableEditor(QWidget):
         self.unlink_var_cb.toggled.connect(self._set_unlink)
         form.addRow("", self.unlink_var_cb)
 
-        vlayout = QVBoxLayout(margin=0, spacing=1)
+        vlayout = QVBoxLayout(spacing=1)
         self.labels_edit = view = QTreeView(
             objectName="annotation-pairs-edit",
             rootIsDecorated=False,
@@ -609,7 +616,7 @@ class VariableEditor(QWidget):
         else:
             self.add_label_action.actionGroup().setEnabled(False)
 
-        self.unlink_var_cb.setDisabled(var is None or not var.linked)
+        self.unlink_var_cb.setDisabled(var is None)
 
     def get_data(self):
         """Retrieve the modified variable.
@@ -623,7 +630,7 @@ class VariableEditor(QWidget):
             tr.append(Rename(name))
         if self.var.annotations != labels:
             tr.append(Annotate(labels))
-        if self.var.linked and self.unlink_var_cb.isChecked():
+        if self.unlink_var_cb.isChecked():
             tr.append(Unlink())
         return self.var, tr
 
@@ -697,7 +704,7 @@ class GroupItemsDialog(QDialog):
         label3 = QLabel("occurrences")
         label4 = QLabel("most frequent values")
 
-        self.frequent_abs_spin = spin2 = QSpinBox()
+        self.frequent_abs_spin = spin2 = QSpinBox(alignment=Qt.AlignRight)
         max_val = len(data)
         spin2.setMinimum(1)
         spin2.setMaximum(max_val)
@@ -707,7 +714,7 @@ class GroupItemsDialog(QDialog):
         )
         spin2.valueChanged.connect(self._frequent_abs_spin_changed)
 
-        self.frequent_rel_spin = spin3 = QDoubleSpinBox()
+        self.frequent_rel_spin = spin3 = QDoubleSpinBox(alignment=Qt.AlignRight)
         spin3.setMinimum(0)
         spin3.setDecimals(1)
         spin3.setSingleStep(0.1)
@@ -717,7 +724,7 @@ class GroupItemsDialog(QDialog):
         spin3.setSuffix(" %")
         spin3.valueChanged.connect(self._frequent_rel_spin_changed)
 
-        self.n_values_spin = spin4 = QSpinBox()
+        self.n_values_spin = spin4 = QSpinBox(alignment=Qt.AlignRight)
         spin4.setMinimum(0)
         spin4.setMaximum(len(variable.categories))
         spin4.setValue(
@@ -730,21 +737,29 @@ class GroupItemsDialog(QDialog):
         )
         spin4.valueChanged.connect(self._n_values_spin_spin_changed)
 
-        grid_layout = QGridLayout()
+        grid_layout = QVBoxLayout()
         # first row
-        grid_layout.addWidget(radio1, 0, 0, 1, 2)
+        row = QHBoxLayout()
+        row.addWidget(radio1)
+        grid_layout.addLayout(row)
         # second row
-        grid_layout.addWidget(radio2, 1, 0, 1, 2)
-        grid_layout.addWidget(spin2, 1, 2)
-        grid_layout.addWidget(label2, 1, 3)
+        row = QHBoxLayout()
+        row.addWidget(radio2)
+        row.addWidget(spin2)
+        row.addWidget(label2)
+        grid_layout.addLayout(row)
         # third row
-        grid_layout.addWidget(radio3, 2, 0, 1, 2)
-        grid_layout.addWidget(spin3, 2, 2)
-        grid_layout.addWidget(label3, 2, 3)
+        row = QHBoxLayout()
+        row.addWidget(radio3)
+        row.addWidget(spin3)
+        row.addWidget(label3)
+        grid_layout.addLayout(row)
         # fourth row
-        grid_layout.addWidget(radio4, 3, 0)
-        grid_layout.addWidget(spin4, 3, 1)
-        grid_layout.addWidget(label4, 3, 2, 1, 2)
+        row = QHBoxLayout()
+        row.addWidget(radio4)
+        row.addWidget(spin4)
+        row.addWidget(label4)
+        grid_layout.addLayout(row)
 
         group_box = QGroupBox()
         group_box.setLayout(grid_layout)
@@ -854,15 +869,6 @@ class GroupItemsDialog(QDialog):
         if checked:
             settings_dict["selected_radio"] = checked[0]
         return settings_dict
-
-
-@contextmanager
-def disconnected(signal, slot, connection_type=Qt.AutoConnection):
-    signal.disconnect(slot)
-    try:
-        yield
-    finally:
-        signal.connect(slot, connection_type)
 
 
 #: In 'reordable' models holds the original position of the item
@@ -1117,7 +1123,7 @@ class DiscreteVariableEditor(VariableEditor):
             flags=Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsEditable
         )
 
-        vlayout = QVBoxLayout(spacing=1, margin=0)
+        vlayout = QVBoxLayout(spacing=1)
         self.values_edit = QListView(
             editTriggers=QListView.DoubleClicked | QListView.EditKeyPressed,
             selectionMode=QListView.ExtendedSelection,
@@ -1133,7 +1139,7 @@ class DiscreteVariableEditor(VariableEditor):
         self.values_model.rowsMoved.connect(self.on_value_selection_changed)
 
         vlayout.addWidget(self.values_edit)
-        hlayout = QHBoxLayout(spacing=1, margin=0)
+        hlayout = QHBoxLayout(spacing=1)
 
         self.categories_action_group = group = QActionGroup(
             self, objectName="action-group-categories", enabled=False
@@ -1303,7 +1309,7 @@ class DiscreteVariableEditor(VariableEditor):
                         SourceNameRole: ci
                     }
                 else:
-                    assert False, "invalid mapping: {!r}".format(tr.mapping)
+                    assert False, f"invalid mapping: {tr.mapping}"
                 items.append(item)
         elif var is not None:
             items = [
@@ -1433,8 +1439,7 @@ class DiscreteVariableEditor(VariableEditor):
                 # new level -> remove it
                 model.removeRow(index.row())
             else:
-                assert False, "invalid state '{}' for {}" \
-                    .format(state, index.row())
+                assert False, f"invalid state '{state}' for {index.row()}"
 
     def _add_category(self):
         """
@@ -1519,8 +1524,37 @@ class ContinuousVariableEditor(VariableEditor):
 
 
 class TimeVariableEditor(VariableEditor):
-    # TODO: enable editing of display format...
-    pass
+    def __init__(self, parent=None, **kwargs):
+        super().__init__(parent, **kwargs)
+        form = self.layout().itemAt(0)
+
+        self.format_cb = QComboBox()
+        for item, data in [("Detect automatically", (None, 1, 1))] + list(
+            Orange.data.TimeVariable.ADDITIONAL_FORMATS.items()
+        ):
+            self.format_cb.addItem(item, StrpTime(item, *data))
+        self.format_cb.currentIndexChanged.connect(self.variable_changed)
+        form.insertRow(2, "Format:", self.format_cb)
+
+    def set_data(self, var, transform=()):
+        super().set_data(var, transform)
+        if self.parent() is not None and isinstance(self.parent().var, (Time, Real)):
+            # when transforming from time to time disable format selection combo
+            self.format_cb.setEnabled(False)
+        else:
+            # select the format from StrpTime transform
+            for tr in transform:
+                if isinstance(tr, StrpTime):
+                    index = self.format_cb.findText(tr.label)
+                    self.format_cb.setCurrentIndex(index)
+            self.format_cb.setEnabled(True)
+
+    def get_data(self):
+        var, tr = super().get_data()
+        if var is not None and (self.parent() is None or not isinstance(self.parent().var, Time)):
+            # do not add StrpTime when transforming from time to time
+            tr.insert(0, self.format_cb.currentData())
+        return var, tr
 
 
 def variable_icon(var):
@@ -1543,6 +1577,12 @@ def variable_icon(var):
 #: ItemDataRole storing the data vector transform
 #: (`List[Union[ReinterpretTransform, Transform]]`)
 TransformRole = Qt.UserRole + 42
+
+#: Any warnings applying to the transform (`list[tuple[Msg, str]]`)
+RestoreWarningRole = TransformRole + 1
+
+#: Hint key that was used to load stored settings.
+RestoreHintKey = RestoreWarningRole + 1
 
 
 class VariableEditDelegate(QStyledItemDelegate):
@@ -1580,8 +1620,7 @@ class VariableEditDelegate(QStyledItemDelegate):
             text = var.name
             for tr in transform:
                 if isinstance(tr, Rename):
-                    text = ("{} \N{RIGHTWARDS ARROW} {}"
-                            .format(var.name, tr.name))
+                    text = f"{var.name} \N{RIGHTWARDS ARROW} {tr.name}"
             for tr in transform:
                 if isinstance(tr, ReinterpretTransformTypes):
                     text += f" (reinterpreted as " \
@@ -1592,9 +1631,24 @@ class VariableEditDelegate(QStyledItemDelegate):
             option.font.setItalic(True)
 
         multiplicity = index.data(MultiplicityRole)
+        warnings_ = index.data(RestoreWarningRole)
+
+        def set_color(palette: QPalette, color):
+            palette.setBrush(QPalette.Text, QBrush(color))
+            palette.setBrush(QPalette.HighlightedText, QBrush(color))
+
         if isinstance(multiplicity, int) and multiplicity > 1:
-            option.palette.setBrush(QPalette.Text, QBrush(Qt.red))
-            option.palette.setBrush(QPalette.HighlightedText, QBrush(Qt.red))
+            set_color(option.palette, Qt.red)
+        elif warnings_:
+            set_color(option.palette, self.warning_text_color(option.palette))
+
+    @staticmethod
+    def warning_text_color(palette: QPalette):
+        background = palette.color(QPalette.ColorRole.Base)
+        if luminance(background) > 0.5:
+            return QColor(255, 148, 11)
+        else:
+            return QColor(Qt.GlobalColor.yellow)
 
     def helpEvent(self, event: QHelpEvent, view: QAbstractItemView,
                   option: QStyleOptionViewItem, index: QModelIndex) -> bool:
@@ -1667,21 +1721,31 @@ class ReinterpretVariableEditor(VariableEditor):
         type(None): -1,
     }
 
+    _editors_by_transform = {
+        AsCategorical: 0,
+        AsContinuous: 1,
+        AsString: 2,
+        AsTime: 3,
+        type(None): 5
+    }
+
     def __init__(self, parent=None, **kwargs):
-        # Explicitly skip VariableEditor's __init__, this is ugly but we have
+        # Explicitly skip BaseEditor's __init__, this is ugly but we have
         # a completely different layout/logic as a compound editor (should
-        # really not subclass VariableEditor).
-        super(VariableEditor, self).__init__(parent, **kwargs)  # pylint: disable=bad-super-call
+        # really not subclass BaseEditor).
+        super(BaseEditor, self).__init__(parent, **kwargs)  # pylint: disable=bad-super-call
+        self.variables = None  # type: Optional[Tuple[Variable]]
         self.var = None  # type: Optional[Variable]
         self.__transform = None  # type: Optional[ReinterpretTransform]
-        self.__data = None  # type: Optional[DataVector]
+        self.__transforms = ()  # type: Sequence[Sequence[Transform]]
+        self.__data = None  # type: Union[None, DataVector, Tuple[DataVector]]
         #: Stored transform state indexed by variable. Used to preserve state
         #: between type switches.
         self.__history = {}  # type: Dict[Variable, List[Transform]]
 
         self.setLayout(QStackedLayout())
 
-        def decorate(editor: VariableEditor) -> VariableEditor:
+        def decorate(editor: BaseEditor) -> VariableEditor:
             """insert an type combo box into a `editor`'s layout."""
             form = editor.layout().itemAt(0)
             assert isinstance(form, QFormLayout)
@@ -1690,7 +1754,12 @@ class ReinterpretVariableEditor(VariableEditor):
             typecb.addItem(variable_icon(Real), "Numeric", Real)
             typecb.addItem(variable_icon(String), "Text", String)
             typecb.addItem(variable_icon(Time), "Time", Time)
-            typecb.activated[int].connect(self.__reinterpret_activated)
+            if type(editor) is BaseEditor:  # pylint: disable=unidiomatic-typecheck
+                typecb.addItem("(Restore original)", RestoreOriginal)
+                typecb.addItem("")
+                typecb.activated[int].connect(self.__reinterpret_activated_multi)
+            else:
+                typecb.activated[int].connect(self.__reinterpret_activated_single)
             form.insertRow(1, "Type:", typecb)
             # Insert the typecb after name edit in the focus chain
             name_edit = editor.findChild(QLineEdit, )
@@ -1704,16 +1773,32 @@ class ReinterpretVariableEditor(VariableEditor):
         cedit = decorate(ContinuousVariableEditor())
         tedit = decorate(TimeVariableEditor())
         sedit = decorate(VariableEditor())
+        medit = decorate(BaseEditor())
 
-        for ed in [dedit, cedit, tedit, sedit]:
+        for ed in [dedit, cedit, tedit, sedit, medit]:
             ed.variable_changed.connect(self.variable_changed)
 
         self.layout().addWidget(dedit)
         self.layout().addWidget(cedit)
         self.layout().addWidget(sedit)
         self.layout().addWidget(tedit)
+        self.layout().addWidget(medit)
 
-    def set_data(self, data, transform=()):  # pylint: disable=arguments-differ
+    # pylint: disable=arguments-differ,arguments-renamed
+    def set_data(self,
+                 data: Sequence[DataVector],
+                 transforms: Sequence[Sequence[Transform]] = None) -> None:
+        if transforms is None:
+            transforms = ([], ) * len(data)
+        else:
+            assert len(data) == len(transforms)
+        if len(data) > 1:
+            self._set_data_multi(data, transforms)
+        else:
+            self._set_data_single(data[0] if data else None,
+                                  transforms[0] if transforms else None)
+
+    def _set_data_single(self, data, transform=()):  # pylint: disable=arguments-differ
         # type: (Optional[DataVector], Sequence[Transform]) -> None
         """
         Set the editor data.
@@ -1736,6 +1821,7 @@ class ReinterpretVariableEditor(VariableEditor):
                            for t in transform)
         self.__transform = type_transform
         self.__data = data
+        self.variables = None
         self.var = data.vtype if data is not None else None
 
         if type_transform is not None and data is not None:
@@ -1757,26 +1843,104 @@ class ReinterpretVariableEditor(VariableEditor):
             cb = w.findChild(QComboBox, "type-combo")
             cb.setCurrentIndex(index)
 
+    def _set_data_multi(self,
+                 data: Sequence[DataVector],
+                 transforms: Sequence[Sequence[Transform]] = ()) -> None:
+        assert len(data) == len(transforms)
+        self.__data = data
+        self.var = None
+        self.variables = tuple(d.vtype for d in self.__data)
+
+        self.__transforms = transforms
+        type_transforms: Set[Type[Optional[ReinterpretTransform]]] = {
+            type(
+                transform[0]
+                if transform and isinstance(transform[0], ReinterpretTransformTypes)
+                else None)
+            for transform in transforms
+        }
+        if len(type_transforms) == 1:
+            self.__transform = type_transforms.pop()()
+        else:
+            self.__transform = None
+
+        self.layout().setCurrentIndex(4)
+        w = self.layout().currentWidget()
+        assert isinstance(w, BaseEditor)
+
+        cb = w.findChild(QComboBox, "type-combo")
+        index = self._editors_by_transform[type(self.__transform)]
+        cb.setCurrentIndex(index)
+
     def get_data(self):
+        if self.variables is None:
+            return self._get_data_single()
+        else:
+            return self._get_data_multi()
+
+    def _get_data_single(self):
         # type: () -> Tuple[Variable, Sequence[Transform]]
         editor = self.layout().currentWidget()  # type: VariableEditor
         var, tr = editor.get_data()
-        if type(var) != type(self.var):  # pylint: disable=unidiomatic-typecheck
+        if type(var) is not type(self.var):
             assert self.__transform is not None
             var = self.var
             tr = [self.__transform, *tr]
-        return var, tr
+        return (var, ), (tr, )
 
-    def __reinterpret_activated(self, index):
+    def _get_data_multi(self):
+        # type: () -> Tuple[Variable, Sequence[Transform]]
+        if self.__transform is None:
+            transforms = self.__transforms
+        else:
+            rev_transforms = {v: k for k, v in TypeTransformers.items()}
+            target = rev_transforms[type(self.__transform)]
+            if target in (RestoreOriginal, None):
+                gen_target_spec = None
+            else:
+                gen_target_spec = self.Specific.get(target, ())
+
+            transforms = []
+            for var, tr in zip(self.variables, self.__transforms):
+                if tr and isinstance(tr[0], ReinterpretTransformTypes):
+                    source_type = rev_transforms[type(tr[0])]
+                else:
+                    source_type = type(var)
+                source_spec = self.Specific.get(source_type)
+                if gen_target_spec is None:
+                    target_spec = self.Specific.get(type(var))
+                else:
+                    target_spec = gen_target_spec
+
+                # Remove type reinterpretation and
+                # transformation specific to source type that aren't
+                # applicable to destination type
+                tr = [
+                    t for t in tr
+                    if not (
+                        isinstance(t, ReinterpretTransformTypes)
+                        or (source_spec and isinstance(t, source_spec)
+                            and not (target_spec and isinstance(t, target_spec))
+                            )
+                    )
+                ]
+                # pylint: disable=unidiomatic-typecheck
+                if target is not RestoreOriginal and type(var) is not target:
+                    tr = [self.__transform, *tr]
+                transforms.append(tr)
+        return self.variables, transforms
+
+    Specific = {
+        Categorical: (CategoriesMapping, )
+    }
+
+    def __reinterpret_activated_single(self, index):
         layout = self.layout()
         assert isinstance(layout, QStackedLayout)
         if index == layout.currentIndex():
             return
         current = layout.currentWidget()
         assert isinstance(current, VariableEditor)
-        Specific = {
-            Categorical: CategoricalTransformTypes
-        }
         _var, _tr = current.get_data()
         if _var is not None:
             self.__history[_var] = _tr
@@ -1784,7 +1948,7 @@ class ReinterpretVariableEditor(VariableEditor):
         var = self.var
         transform = self.__transform
         # take/preserve the general transforms that apply to all types
-        specific = Specific.get(type(var), ())
+        specific = self.Specific.get(type(var), ())
         _tr = [t for t in _tr if not isinstance(t, specific)]
 
         layout.setCurrentIndex(index)
@@ -1795,17 +1959,9 @@ class ReinterpretVariableEditor(VariableEditor):
         target = cb.itemData(index, Qt.UserRole)
         assert issubclass(target, VariableTypes)
         if not isinstance(var, target):
-            if target == Real:
-                transform = AsContinuous()
-            elif target == Categorical:
-                transform = AsCategorical()
-            elif target == Time:
-                transform = AsTime()
-            elif target == String:
-                transform = AsString()
+            transform = TypeTransformers[target]()
         else:
             transform = None
-            var = self.var
 
         self.__transform = transform
         data = None
@@ -1818,7 +1974,7 @@ class ReinterpretVariableEditor(VariableEditor):
         else:
             tr = []
         # type specific transform
-        specific = Specific.get(type(var), ())
+        specific = self.Specific.get(type(var), ())
         # merge tr and _tr
         tr = _tr + [t for t in tr if isinstance(t, specific)]
         with disconnected(
@@ -1832,6 +1988,29 @@ class ReinterpretVariableEditor(VariableEditor):
                 w.set_data(var, transform=tr)
         self.variable_changed.emit()
 
+    def __reinterpret_activated_multi(self, index):
+        layout = self.layout()
+        assert isinstance(layout, QStackedLayout)
+        w = layout.currentWidget()
+        cb = w.findChild(QComboBox, "type-combo")
+        target = cb.itemData(index, Qt.UserRole)
+        if target is None:
+            transform = target
+        else:
+            transform = TypeTransformers[target]()
+        if transform == self.__transform:
+            return
+        self.__transform = transform
+        self.variable_changed.emit()
+
+    def clear(self):
+        self.variables = self.var = None
+        layout = self.layout()
+        assert isinstance(layout, QStackedLayout)
+        w = layout.currentWidget()
+        if isinstance(w, VariableEditor):
+            w.clear()
+
     def set_merge_context(self, merge_context):
         self.disc_edit.merge_dialog_settings = merge_context
 
@@ -1844,7 +2023,7 @@ class OWEditDomain(widget.OWWidget):
     description = "Rename variables, edit categories and variable annotations."
     icon = "icons/EditDomain.svg"
     priority = 3125
-    keywords = ["rename", "drop", "reorder", "order"]
+    keywords = "edit domain, rename, drop, reorder, order"
 
     class Inputs:
         data = Input("Data", Orange.data.Table)
@@ -1855,13 +2034,19 @@ class OWEditDomain(widget.OWWidget):
     class Error(widget.OWWidget.Error):
         duplicate_var_name = widget.Msg("A variable name is duplicated.")
 
-    settingsHandler = settings.DomainContextHandler()
-    settings_version = 2
+    class Warning(widget.OWWidget.Warning):
+        transform_restore_failed = widget.Msg(
+            "Failed to restore transform {} for column {}"
+        )
+        cat_mapping_does_not_apply = widget.Msg(
+            "Categories mapping for {} does not apply to current input"
+        )
 
-    _domain_change_store = settings.ContextSetting({})
-    _selected_item = settings.ContextSetting(None)  # type: Optional[Tuple[str, int]]
-    _merge_dialog_settings = settings.ContextSetting({})
-    output_table_name = settings.ContextSetting("")
+    settings_version = 4
+
+    _domain_change_hints: dict = Setting({}, schema_only=True)
+    _merge_dialog_settings = Setting({}, schema_only=True)
+    output_table_name = Setting("", schema_only=True)
 
     want_main_area = False
 
@@ -1869,7 +2054,7 @@ class OWEditDomain(widget.OWWidget):
         super().__init__()
         self.data = None  # type: Optional[Orange.data.Table]
         #: The current selected variable index
-        self.selected_index = -1
+        self._selected_items = []
         self._invalidated = False
         self.typeindex = 0
 
@@ -1877,8 +2062,8 @@ class OWEditDomain(widget.OWWidget):
         box = gui.vBox(main, "Variables")
 
         self.variables_model = VariableListModel(parent=self)
-        self.variables_view = self.domain_view = QListView(
-            selectionMode=QListView.SingleSelection,
+        self.variables_view = self.domain_view = ListViewSearch(
+            selectionMode=QListView.ExtendedSelection,
             uniformItemSizes=True,
         )
         self.variables_view.setItemDelegate(VariableEditDelegate(self))
@@ -1899,21 +2084,21 @@ class OWEditDomain(widget.OWWidget):
         gui.rubber(self.buttonsArea)
 
         bbox = gui.hBox(self.buttonsArea)
-        breset_all = gui.button(
+        gui.button(
             bbox, self, "Reset All",
             objectName="button-reset-all",
             toolTip="Reset all variables to their input state.",
             autoDefault=False,
             callback=self.reset_all
         )
-        breset = gui.button(
+        gui.button(
             bbox, self, "Reset Selected",
             objectName="button-reset",
             toolTip="Rest selected variable to its input state.",
             autoDefault=False,
             callback=self.reset_selected
         )
-        bapply = gui.button(
+        gui.button(
             bbox, self, "Apply",
             objectName="button-apply",
             toolTip="Apply changes and commit data on output.",
@@ -1927,14 +2112,17 @@ class OWEditDomain(widget.OWWidget):
     @Inputs.data
     def set_data(self, data):
         """Set input dataset."""
-        self.closeContext()
+        if data is not None:
+            self._selected_items = [
+                index.data()
+                for index in self.variables_view.selectedIndexes()]
+
         self.clear()
         self.data = data
 
         if self.data is not None:
             self.setup_model(data)
             self.le_output_name.setPlaceholderText(data.name)
-            self.openContext(self.data)
             self._editor.set_merge_context(self._merge_dialog_settings)
             self._restore()
         else:
@@ -1947,48 +2135,46 @@ class OWEditDomain(widget.OWWidget):
         self.data = None
         self.variables_model.clear()
         self.clear_editor()
-        assert self.selected_index == -1
-        self.selected_index = -1
-
-        self._selected_item = None
-        self._domain_change_store = {}
         self._merge_dialog_settings = {}
+        self.Warning.clear()
 
     def reset_selected(self):
         """Reset the currently selected variable to its original state."""
-        ind = self.selected_var_index()
-        if ind >= 0:
-            model = self.variables_model
+        model = self.variables_model
+        editor = self._editor
+        modified = []
+        for ind in self.selected_var_indices():
             midx = model.index(ind)
+            model.setData(midx, [], TransformRole)
+            model.setData(midx, None, RestoreWarningRole)
+            key = model.data(midx, RestoreHintKey)
             var = midx.data(Qt.EditRole)
-            tr = midx.data(TransformRole)
-            if not tr:
-                return  # nothing to reset
-            editor = self._editor
+            self._domain_change_hints.pop(key, None)
+            modified.append(var)
+        if modified:
             with disconnected(editor.variable_changed,
                               self._on_variable_changed):
-                model.setData(midx, [], TransformRole)
-                editor.set_data(var, transform=[])
+                self._editor.set_data(modified)
             self._invalidate()
+        self._update_restore_warnings()
 
     def reset_all(self):
         """Reset all variables to their original state."""
-        self._domain_change_store = {}
         if self.data is not None:
             model = self.variables_model
             for i in range(model.rowCount()):
                 midx = model.index(i)
                 model.setData(midx, [], TransformRole)
-            index = self.selected_var_index()
-            if index >= 0:
-                self.open_editor(index)
+                model.setData(midx, None, RestoreWarningRole)
+                key = model.data(midx, RestoreHintKey)
+                self._domain_change_hints.pop(key, None)
+            self.open_editor()
             self._invalidate()
+            self._update_restore_warnings()
 
-    def selected_var_index(self):
-        """Return the current selected variable index."""
-        rows = self.variables_view.selectedIndexes()
-        assert len(rows) <= 1
-        return rows[0].row() if rows else -1
+    def selected_var_indices(self):
+        """Return the current selected variable indices."""
+        return [index.row() for index in self.variables_view.selectedIndexes()]
 
     def setup_model(self, data: Orange.data.Table):
         model = self.variables_model
@@ -2011,51 +2197,104 @@ class OWEditDomain(widget.OWWidget):
         for i, d in enumerate(columns):
             model.setData(model.index(i), d, Qt.EditRole)
 
-    def _restore(self, ):
+    def _sanitize_transform(
+            self, var: Variable, trs: Sequence[Transform]
+    ) -> tuple[Sequence[Transform], Sequence[tuple[Msg, str]]]:
+        def does_categories_mapping_apply(
+                var: Categorical, tr: CategoriesMapping) -> bool:
+            return set(var.categories) \
+                == set(ci for ci, _ in tr.mapping if ci is not None)
+        msgs = []
+        if isinstance(var, Categorical):
+            trs_ = []
+            for tr in trs:
+                if isinstance(tr, CategoriesMapping):
+                    if does_categories_mapping_apply(var, tr):
+                        trs_.append(tr)
+                    else:
+
+                        msgs.append((self.Warning.cat_mapping_does_not_apply, var.name))
+                else:
+                    trs_.append(tr)
+            return trs_, msgs
+        else:
+            return trs, msgs
+
+    def _restore(self):
         """
         Restore the edit transform from saved state.
         """
         model = self.variables_model
+        hints = self._domain_change_hints
+        first_key = None
         for i in range(model.rowCount()):
             midx = model.index(i, 0)
             coldesc = model.data(midx, Qt.EditRole)  # type: DataVector
-            tr = self._restore_transform(coldesc.vtype)
-            if tr:
-                model.setData(midx, tr, TransformRole)
+            res = self._find_stored_transform(coldesc.vtype)
+            if res:
+                key, tr = res
+                if tr:
+                    self._store_transform(coldesc.vtype, tr, key)
+                    tr, msgs = self._sanitize_transform(coldesc.vtype, tr)
+                    model.setData(midx, tr, TransformRole)
+                    model.setData(midx, msgs, RestoreWarningRole)
+                    model.setData(midx, key, RestoreHintKey)
+                    if first_key is None:
+                        first_key = key
+        # Reduce the number of hints to MAX_HINTS, but keep all current hints
+        # Current hints start with `first_key`.
+        while len(hints) > MAX_HINTS and \
+                (key := next(iter(hints))) != first_key:
+            del hints[key]  # pylint: disable=unsupported-delete-operation
+
+        self._update_restore_warnings()
 
         # Restore the current variable selection
-        i = -1
-        if self._selected_item is not None:
-            for i, vec in enumerate(model):
-                if vec.vtype.name_type() == self._selected_item:
-                    break
-        if i == -1 and model.rowCount():
-            i = 0
+        selected_rows = [i for i, vec in enumerate(model)
+                         if vec.vtype.name in self._selected_items]
+        if not selected_rows and model.rowCount():
+            selected_rows = [0]
+        itemmodels.select_rows(self.variables_view, selected_rows)
 
-        if i != -1:
-            itemmodels.select_row(self.variables_view, i)
-
-    def _on_selection_changed(self):
-        self.selected_index = self.selected_var_index()
-        if self.selected_index != -1:
-            self._selected_item = self.variables_model[self.selected_index].vtype.name_type()
-        else:
-            self._selected_item = None
-        self.open_editor(self.selected_index)
-
-    def open_editor(self, index):
-        # type: (int) -> None
-        self.clear_editor()
+    def _update_restore_warnings(self):
+        def messages(midx):
+            msgs = model.data(midx, RestoreWarningRole)
+            return msgs or []
         model = self.variables_model
-        if not 0 <= index < model.rowCount():
+        msgs = chain.from_iterable(
+            messages(model.index(i)) for i in range(model.rowCount())
+        )
+        self.Warning.cat_mapping_does_not_apply.clear()
+        # Show warnings for non-applicable transforms
+        for msg, names in groupby(sorted(msgs), key=itemgetter(0)):
+            msg(", ".join(map(itemgetter(1), names)))
+
+    def _on_selection_changed(self, _, deselected):
+        # If the user deselected the last item, select it back with disabled
+        # signals, so nothing happens
+        if not self.selected_var_indices():
+            sel_model = self.variables_view.selectionModel()
+            with disconnected(sel_model.selectionChanged,
+                              self._on_selection_changed):
+                sel_model.select(deselected, QItemSelectionModel.Select)
             return
-        idx = model.index(index, 0)
-        vector = model.data(idx, Qt.EditRole)
-        tr = model.data(idx, TransformRole)
-        if tr is None:
-            tr = []
+
+        self.open_editor()
+
+    def open_editor(self):
+        self.clear_editor()
+
+        indices = self.selected_var_indices()
+        if not indices:
+            return
+
+        model = self.variables_model
+
+        vectors = [model.index(idx, 0).data(Qt.EditRole) for idx in indices]
+        transforms = [model.index(idx, 0).data(TransformRole) or ()
+                      for idx in indices]
         editor = self._editor
-        editor.set_data(vector, transform=tr)
+        editor.set_data(vectors, transforms=transforms)
         editor.variable_changed.connect(
             self._on_variable_changed, Qt.UniqueConnection
         )
@@ -2066,39 +2305,61 @@ class OWEditDomain(widget.OWWidget):
             current.variable_changed.disconnect(self._on_variable_changed)
         except TypeError:
             pass
-        current.set_data(None)
-        current.layout().currentWidget().clear()
+        current.set_data((), ())
+        current.clear()
 
     @Slot()
     def _on_variable_changed(self):
         """User edited the current variable in editor."""
-        assert 0 <= self.selected_index <= len(self.variables_model)
         editor = self._editor
-        var, transform = editor.get_data()
         model = self.variables_model
-        midx = model.index(self.selected_index, 0)
-        model.setData(midx, transform, TransformRole)
-        self._store_transform(var, transform)
+        for idx, var, transform in zip(self.selected_var_indices(),
+                                            *editor.get_data()):
+            midx = model.index(idx, 0)
+            model.setData(midx, transform, TransformRole)
+            model.setData(midx, None, RestoreWarningRole)
+            self._store_transform(var, transform)
         self._invalidate()
+        self._update_restore_warnings()
 
-    def _store_transform(self, var, transform):
-        # type: (Variable, List[Transform]) -> None
-        self._domain_change_store[deconstruct(var)] = [deconstruct(t) for t in transform]
+    def _store_transform(
+            self, var: Variable, transform: Sequence[Transform] | None, deconvar=None
+    ) -> None:
+        deconvar = deconvar or deconstruct(var)
+        # Remove the existing key (if any) to put the new one at the end,
+        # to make sure it comes after the sentinel
+        self._domain_change_hints.pop(deconvar, None)
+        # pylint: disable=unsupported-assignment-operation
+        if transform:
+            self._domain_change_hints[deconvar] = \
+                [deconstruct(t) for t in transform]
 
-    def _restore_transform(self, var):
-        # type: (Variable) -> List[Transform]
-        tr_ = self._domain_change_store.get(deconstruct(var), [])
-        tr = []
+    def _find_stored_transform(
+            self, var: Variable
+    ) -> Tuple[tuple, Sequence[Transform]] | None:
+        """Find stored transform for `var`."""
+        def reconstruct_transform(tr_: list[tuple]) -> list[Transform]:
+            trs = []
+            for t in tr_:
+                try:
+                    trs.append(cast(Transform, reconstruct(*t)))
+                except (AttributeError, TypeError, NameError):
+                    self.Warning.transform_restore_failed(
+                        str(t), var.name, exc_info=True,
+                    )
+            return trs
 
-        for t in tr_:
-            try:
-                tr.append(reconstruct(*t))
-            except (NameError, TypeError) as err:
-                warnings.warn(
-                    "Failed to restore transform: {}, {!r}".format(t, err),
-                    UserWarning, stacklevel=2
-                )
-        return tr
+        hints = self._domain_change_hints
+        key = deconstruct(var)
+        tr = hints.get(key)  # exact match
+        if tr is not None:
+            return key, reconstruct_transform(tr)
+
+        # match by name and type only
+        item = assocf(hints.items(),
+                      lambda k: k[0] == key[0] and k[1][0] == var.name)
+        if item is not None:
+            return item[0], reconstruct_transform(item[1])
 
     def _invalidate(self):
         self._set_modified(True)
@@ -2133,8 +2394,7 @@ class OWEditDomain(widget.OWWidget):
         state = [state(i) for i in range(model.rowCount())]
         input_vars = data.domain.variables + data.domain.metas
         if self.output_table_name in ("", data.name) \
-                and not any(requires_transform(var, trs)
-                            for var, (_, trs) in zip(input_vars, state)):
+                and all(tr is None or not tr for _, tr in state):
             self.Outputs.data.send(data)
             return
 
@@ -2210,7 +2470,7 @@ class OWEditDomain(widget.OWWidget):
                     parts.append(report_transform(vector.vtype, trs))
             if parts:
                 html = ("<ul>" +
-                        "".join(map("<li>{}</li>".format, parts)) +
+                        "".join(f"<li>{part}</li>" for part in parts) +
                         "</ul>")
             else:
                 html = "No changes"
@@ -2220,7 +2480,6 @@ class OWEditDomain(widget.OWWidget):
 
     @classmethod
     def migrate_context(cls, context, version):
-        # pylint: disable=bad-continuation
         if version is None or version <= 1:
             hints_ = context.values.get("domain_change_hints", ({}, -2))[0]
             store = []
@@ -2262,6 +2521,36 @@ class OWEditDomain(widget.OWWidget):
                 store.append((deconstruct(src), [deconstruct(tr) for tr in trs]))
             context.values["_domain_change_store"] = (dict(store), -2)
 
+    @classmethod
+    def migrate_settings(cls, settings, version):
+        if version == 2 and "context_settings" in settings:
+            contexts = settings["context_settings"]
+            valuess = []
+            for context in contexts:
+                cls.migrate_context(context, context.values["__version__"])
+                valuess.append(context.values)
+            # Fix the order of keys
+            hints = dict.fromkeys(
+                chain(*(values["_domain_change_store"][0]
+                        for values in reversed(valuess)))
+            )
+            settings["output_table_name"] = ""
+            for values in valuess:
+                hints.update(values["_domain_change_store"][0])
+                new_name, _ = values.pop("output_table_name", ("", -2))
+                if new_name:
+                    settings["output_table_name"] = new_name
+            while len(hints) > MAX_HINTS:
+                del hints[next(iter(hints))]
+            settings["_domain_change_hints"] = hints
+            del settings["context_settings"]
+
+        if version < 4 and "_domain_change_hints" in settings:
+            settings["_domain_change_hints"] = {
+                (name, desc[:-1]): trs
+                for (name, desc), trs in settings["_domain_change_hints"].items()
+            }
+
 
 def enumerate_columns(
         table: Orange.data.Table
@@ -2283,11 +2572,10 @@ def table_column_data(
         var: Union[Orange.data.Variable, int],
         dtype=None
 ) -> MArray:
-    col, copy = table.get_column_view(var)
+    col = table.get_column(var)
     var = table.domain[var]  # type: Orange.data.Variable
     if var.is_primitive() and not np.issubdtype(col.dtype, np.inexact):
         col = col.astype(float)
-        copy = True
 
     if dtype is None:
         if isinstance(var, Orange.data.TimeVariable):
@@ -2309,9 +2597,8 @@ def table_column_data(
 
     if dtype != col.dtype:
         col = col.astype(dtype)
-        copy = True
 
-    if not copy:
+    if col.base is not None:
         col = col.copy()
     return MArray(col, mask=mask)
 
@@ -2341,13 +2628,13 @@ def report_transform(var, trs):
         return ReinterpretTypeCode.get(type(value), "?")
 
     def strike(text):
-        return "<s>{}</s>".format(escape(text))
+        return f"<s>{escape(text)}</s>"
 
     def i(text):
-        return "<i>{}</i>".format(escape(text))
+        return f"<i>{escape(text)}</i>"
 
     def text(text):
-        return "<span>{}</span>".format(escape(text))
+        return f"<span>{escape(text)}</span>"
     assert trs
     rename = annotate = catmap = unlink = None
     reinterpret = None
@@ -2365,12 +2652,10 @@ def report_transform(var, trs):
             reinterpret = tr
 
     if reinterpret is not None:
-        header = "{} → ({}) {}".format(
-            var.name, type_char(reinterpret),
-            rename.name if rename is not None else var.name
-        )
+        header = f"{var.name} → ({type_char(reinterpret)}) " \
+                 f"{rename.name if rename is not None else var.name}"
     elif rename is not None:
-        header = "{} → {}".format(var.name, rename.name)
+        header = f"{var.name} → {rename.name}"
     else:
         header = var.name
     if unlink is not None:
@@ -2410,9 +2695,9 @@ def report_transform(var, trs):
                     i(name) + " : " + text(old[name]) + " → " + text(new[name])
                 )
 
-    html = ["<div style='font-weight: bold;'>{}</div>".format(header)]
+    html = [f"<div style='font-weight: bold;'>{header}</div>"]
     for title, contents in filter(None, [values_section, annotate_section]):
-        section_header = "<div>{}:</div>".format(title)
+        section_header = f"<div>{title}:</div>"
         section_contents = "<br/>\n".join(contents)
         html.append(section_header)
         html.append(
@@ -2440,15 +2725,14 @@ def abstract(var):
         (key, str(value))
         for key, value in var.attributes.items()
     ))
-    linked = var.compute_value is not None
     if isinstance(var, Orange.data.DiscreteVariable):
-        return Categorical(var.name, tuple(var.values), annotations, linked)
+        return Categorical(var.name, tuple(var.values), annotations)
     elif isinstance(var, Orange.data.TimeVariable):
-        return Time(var.name, annotations, linked)
+        return Time(var.name, annotations)
     elif isinstance(var, Orange.data.ContinuousVariable):
-        return Real(var.name, (var.number_of_decimals, 'f'), annotations, linked)
+        return Real(var.name, (var.number_of_decimals, 'f'), annotations)
     elif isinstance(var, Orange.data.StringVariable):
-        return String(var.name, annotations, linked)
+        return String(var.name, annotations)
     else:
         raise TypeError
 
@@ -2458,7 +2742,7 @@ def _parse_attributes(mapping):
     # Use the same functionality that parses attributes
     # when reading text files
     return Orange.data.Flags([
-        "{}={}".format(*item) for item in mapping
+        f"{item[0]}={item[1]}" for item in mapping
     ]).attributes
 
 
@@ -2478,21 +2762,11 @@ def apply_transform(var, table, trs):
 
 
 def requires_unlink(var: Orange.data.Variable, trs: List[Transform]) -> bool:
-    # Variable is only unlinked if it has compute_value  or if it has other
-    # transformations (that might had added compute_value)
+    # Variable is only unlinked if it has compute_value or if it has other
+    # transformations (that might have added compute_value)
     return trs is not None \
            and any(isinstance(tr, Unlink) for tr in trs) \
            and (var.compute_value is not None or len(trs) > 1)
-
-
-def requires_transform(var: Orange.data.Variable, trs: List[Transform]) -> bool:
-    # Unlink is treated separately: Unlink is required only if the variable
-    # has compute_value. Hence tranform is required if it has any
-    # transformations other than Unlink, or if unlink is indeed required.
-    return trs is not None and (
-        not all(isinstance(tr, Unlink) for tr in trs)
-        or requires_unlink(var, trs)
-    )
 
 
 @singledispatch
@@ -2581,53 +2855,21 @@ def apply_transform_time(var, trs):
 def apply_transform_string(var, trs):
     # type: (Orange.data.StringVariable, List[Transform]) -> Orange.data.Variable
     name, annotations = var.name, var.attributes
+    out_type = Orange.data.StringVariable
+    compute_value = Identity
     for tr in trs:
         if isinstance(tr, Rename):
             name = tr.name
         elif isinstance(tr, Annotate):
             annotations = _parse_attributes(tr.annotations)
-    variable = Orange.data.StringVariable(
-        name=name, compute_value=Identity(var)
-    )
+        elif isinstance(tr, StrpTime):
+            out_type = partial(
+                Orange.data.TimeVariable, have_date=tr.have_date, have_time=tr.have_time
+            )
+            compute_value = partial(ReparseTimeTransform, tr=tr)
+    variable = out_type(name=name, compute_value=compute_value(var))
     variable.attributes.update(annotations)
     return variable
-
-
-def ftry(
-        func: Callable[..., A],
-        error: Union[Type[BaseException], Tuple[Type[BaseException]]],
-        default: B
-) -> Callable[..., Union[A, B]]:
-    """
-    Wrap a `func` such that if `errors` occur `default` is returned instead."""
-    def wrapper(*args, **kwargs):
-        try:
-            return func(*args, **kwargs)
-        except error:
-            return default
-    return wrapper
-
-
-class DictMissingConst(dict):
-    """
-    `dict` with a constant for `__missing__()` value.
-    """
-    __slots__ = ("__missing",)
-
-    def __init__(self, missing, *args, **kwargs):
-        self.__missing = missing
-        super().__init__(*args, **kwargs)
-
-    def __missing__(self, key):
-        return self.__missing
-
-    def __eq__(self, other):
-        return super().__eq__(other) and isinstance(other, DictMissingConst) \
-            and (self.__missing == other[()]  # get `__missing`
-                 or np.isnan(self.__missing) and np.isnan(other[()]))
-
-    def __hash__(self):
-        return hash((self.__missing, frozenset(self.items())))
 
 
 def make_dict_mapper(
@@ -2639,29 +2881,7 @@ def make_dict_mapper(
     `make_dict_mapper` it is used as a the default return dtype,
     otherwise the default dtype is `object`.
     """
-    _vmapper = np.frompyfunc(mapping.__getitem__, 1, 1)
-
-    def mapper(arr, out=None, dtype=dtype, **kwargs):
-        arr = np.asanyarray(arr)
-        if out is None and dtype is not None and arr.shape != ():
-            out = np.empty_like(arr, dtype)
-        return _vmapper(arr, out, dtype=dtype, casting="unsafe", **kwargs)
-    return mapper
-
-
-def time_parse(values: Sequence[str], name="__"):
-    tvar = Orange.data.TimeVariable(name)
-    parse_time = ftry(tvar.parse, ValueError, np.nan)
-    _values = [parse_time(v) for v in values]
-    if np.all(np.isnan(_values)):
-        # try parsing it with pandas (like in transform)
-        dti = pd.to_datetime(values, errors="coerce")
-        _values = datetime_to_epoch(dti)
-        date_only = getattr(dti, "_is_dates_only", False)
-        if np.all(dti != pd.NaT):
-            tvar.have_date = True
-            tvar.have_time = not date_only
-    return tvar, _values
+    return frompyfunc(mapping.__getitem__, 1, 1, dtype)
 
 
 as_string = np.frompyfunc(str, 1, 1)
@@ -2710,23 +2930,15 @@ def apply_reinterpret_d(var, tr, data):
     # type: (Orange.data.DiscreteVariable, ReinterpretTransform, ndarray) -> Orange.data.Variable
     if isinstance(tr, AsCategorical):
         return var
-    elif isinstance(tr, AsString):
+    elif isinstance(tr, (AsString, AsTime)):
+        # TimeVar will be interpreted by StrpTime later
         f = Lookup(var, np.array(var.values, dtype=object), unknown="")
-        rvar = Orange.data.StringVariable(
-            name=var.name, compute_value=f
-        )
+        rvar = Orange.data.StringVariable(name=var.name, compute_value=f)
     elif isinstance(tr, AsContinuous):
         f = Lookup(var, np.array(list(map(parse_float, var.values))),
                    unknown=np.nan)
         rvar = Orange.data.ContinuousVariable(
             name=var.name, compute_value=f, sparse=var.sparse
-        )
-    elif isinstance(tr, AsTime):
-        _tvar, values = time_parse(var.values)
-        f = Lookup(var, np.array(values), unknown=np.nan)
-        rvar = Orange.data.TimeVariable(
-            name=var.name, have_date=_tvar.have_date,
-            have_time=_tvar.have_time, compute_value=f,
         )
     else:
         assert False
@@ -2736,15 +2948,13 @@ def apply_reinterpret_d(var, tr, data):
 @apply_reinterpret.register(Orange.data.ContinuousVariable)
 def apply_reinterpret_c(var, tr, data: MArray):
     if isinstance(tr, AsCategorical):
-        # This is ill defined and should not result in a 'compute_value'
+        # This is ill-defined and should not result in a 'compute_value'
         # (post-hoc expunge from the domain once translated?)
         values, index = categorize_unique(data)
         coldata = index.astype(float)
         coldata[index.mask] = np.nan
         tr = LookupMappingTransform(
-            var, DictMissingConst(
-                np.nan, {v: i for i, v in enumerate(values)}
-            )
+            var, {v: i for i, v in enumerate(values)}, dtype=np.float64, unknown=np.nan
         )
         values = tuple(as_string(values))
         rvar = Orange.data.DiscreteVariable(
@@ -2754,12 +2964,11 @@ def apply_reinterpret_c(var, tr, data: MArray):
         return var
     elif isinstance(tr, AsString):
         tstr = ToStringTransform(var)
-        rvar = Orange.data.StringVariable(
-            name=var.name, compute_value=tstr
-        )
+        rvar = Orange.data.StringVariable(name=var.name, compute_value=tstr)
     elif isinstance(tr, AsTime):
+        # continuous variable is always transformed to time as UNIX epoch
         rvar = Orange.data.TimeVariable(
-            name=var.name, compute_value=Identity(var)
+            name=var.name, compute_value=Identity(var), have_time=1, have_date=1
         )
     else:
         assert False
@@ -2769,12 +2978,10 @@ def apply_reinterpret_c(var, tr, data: MArray):
 @apply_reinterpret.register(Orange.data.StringVariable)
 def apply_reinterpret_s(var: Orange.data.StringVariable, tr, data: MArray):
     if isinstance(tr, AsCategorical):
-        # This is ill defined and should not result in a 'compute_value'
+        # This is ill-defined and should not result in a 'compute_value'
         # (post-hoc expunge from the domain once translated?)
         _, values = categorical_from_vector(data)
-        mapping = DictMissingConst(
-            np.nan, {v: float(i) for i, v in enumerate(values)}
-        )
+        mapping = {v: float(i) for i, v in enumerate(values)}
         tr = LookupMappingTransform(var, mapping)
         rvar = Orange.data.DiscreteVariable(
             name=var.name, values=values, compute_value=tr
@@ -2783,14 +2990,9 @@ def apply_reinterpret_s(var: Orange.data.StringVariable, tr, data: MArray):
         rvar = Orange.data.ContinuousVariable(
             var.name, compute_value=ToContinuousTransform(var)
         )
-    elif isinstance(tr, AsString):
+    elif isinstance(tr, (AsString, AsTime)):
+        # TimeVar will be interpreted by StrpTime later
         return var
-    elif isinstance(tr, AsTime):
-        tvar, _ = time_parse(np.unique(data.data[~data.mask]))
-        rvar = Orange.data.TimeVariable(
-            name=var.name, have_date=tvar.have_date, have_time=tvar.have_time,
-            compute_value=ReparseTimeTransform(var)
-        )
     else:
         assert False
     return copy_attributes(rvar, var)
@@ -2801,9 +3003,7 @@ def apply_reinterpret_t(var: Orange.data.TimeVariable, tr, data):
     if isinstance(tr, AsCategorical):
         values, _ = categorize_unique(data)
         or_values = values.astype(float) / 1e6
-        mapping = DictMissingConst(
-            np.nan, {v: i for i, v in enumerate(or_values)}
-        )
+        mapping = {v: i for i, v in enumerate(or_values)}
         tr = LookupMappingTransform(var, mapping)
         values = tuple(as_string(values))
         rvar = Orange.data.DiscreteVariable(
@@ -2867,53 +3067,35 @@ class ToContinuousTransform(Transformation):
             raise TypeError
 
 
-def datetime_to_epoch(dti: pd.DatetimeIndex) -> np.ndarray:
+def datetime_to_epoch(dti: pd.DatetimeIndex, only_time) -> np.ndarray:
     """Convert datetime to epoch"""
-    data = dti.values.astype("M8[us]")
-    mask = np.isnat(data)
-    data = data.astype(float) / 1e6
-    data[mask] = np.nan
-    return data
+    # when dti has timezone info also the subtracted timestamp must have it
+    # otherwise subtracting fails
+    initial_ts = pd.Timestamp("1970-01-01", tz=None if dti.tz is None else "UTC")
+    delta = dti - (dti.normalize() if only_time else initial_ts)
+    return (delta / pd.Timedelta("1s")).values
 
 
 class ReparseTimeTransform(Transformation):
     """
     Re-parse the column's string repr as datetime.
     """
-    def transform(self, c):
-        c = column_str_repr(self.variable, c)
-        c = pd.to_datetime(c, errors="coerce")
-        return datetime_to_epoch(c)
-
-
-class LookupMappingTransform(Transformation):
-    """
-    Map values via a dictionary lookup.
-    """
-    def __init__(
-            self,
-            variable: Orange.data.Variable,
-            mapping: Mapping,
-            dtype: Optional[np.dtype] = None
-    ) -> None:
+    def __init__(self, variable, tr):
         super().__init__(variable)
-        self.mapping = mapping
-        self.dtype = dtype
-        self._mapper = make_dict_mapper(mapping, dtype)
+        self.tr = tr
 
     def transform(self, c):
-        return self._mapper(c)
+        # if self.formats is none guess format option is selected
+        formats = list(self.tr.formats) if self.tr.formats is not None else []
+        for f in formats + [None]:
+            d = pd.to_datetime(c, errors="coerce", format=f)
+            if pd.notnull(d).any():
+                return datetime_to_epoch(d, only_time=not self.tr.have_date)
+        return np.nan
 
-    def __reduce_ex__(self, protocol):
-        return type(self), (self.variable, self.mapping, self.dtype)
 
-    def __eq__(self, other):
-        return self.variable == other.variable \
-               and self.mapping == other.mapping \
-               and self.dtype == other.dtype
-
-    def __hash__(self):
-        return hash((type(self), self.variable, self.mapping, self.dtype))
+# Alias for back compatibility (unpickling transforms)
+LookupMappingTransform = MappingTransform
 
 
 @singledispatch

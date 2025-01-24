@@ -1,27 +1,32 @@
 # pylint: disable=unsubscriptable-object
 import unittest
 from unittest import TestCase
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
-from AnyQt.QtCore import QMimeData, QPoint, Qt
-from AnyQt.QtGui import QDragEnterEvent
+from AnyQt.QtCore import QMimeData, QPoint, QPointF, Qt
+from AnyQt.QtGui import QDragEnterEvent, QDropEvent, QDrag
+from AnyQt.QtWidgets import QApplication
 
+from orangewidget.tests.base import GuiTest
 
-from Orange.data import Table, ContinuousVariable, DiscreteVariable, Domain
+from Orange.data import Table, Domain, \
+    ContinuousVariable, DiscreteVariable, StringVariable
 from Orange.widgets.settings import ContextSetting
 from Orange.widgets.utils import vartype
 from Orange.widgets.tests.base import WidgetTest
 from Orange.widgets.data.owselectcolumns \
     import OWSelectAttributes, VariablesListItemModel, \
-    SelectAttributesDomainContextHandler
+    SelectAttributesDomainContextHandler, SelectedVarsView, PrimitivesView
 from Orange.widgets.data.owrank import OWRank
+from Orange.widgets.utils.itemmodels import select_rows
 from Orange.widgets.widget import AttributeList
 
 Continuous = vartype(ContinuousVariable("c"))
 Discrete = vartype(DiscreteVariable("d"))
 
 
+# It is, what it is (and should be), pylint: disable=invalid-name
 class TestSelectAttributesDomainContextHandler(TestCase):
     def setUp(self):
         self.domain = Domain(
@@ -41,6 +46,7 @@ class TestSelectAttributesDomainContextHandler(TestCase):
         self.handler.read_defaults = lambda: None
 
     def test_open_context(self):
+        # Why not? pylint: disable=use-dict-literal
         self.handler.bind(SimpleWidget)
         context = Mock(
             attributes=self.args[1], metas=self.args[2], values=dict(
@@ -68,6 +74,7 @@ class TestSelectAttributesDomainContextHandler(TestCase):
                           domain['c2']: ('class', 0)})
 
     def test_open_context_with_imperfect_match(self):
+        # Why not? pylint: disable=use-dict-literal
         self.handler.bind(SimpleWidget)
         context1 = Mock(values=dict(
             domain_role_hints=({('d1', Discrete): ('attribute', 0),
@@ -97,15 +104,72 @@ class TestSelectAttributesDomainContextHandler(TestCase):
 
 
 class TestModel(TestCase):
+    def setUp(self):
+        self.variables = \
+            [ContinuousVariable(c) for c in "xyz"] + \
+            [StringVariable(s) for s in "spqr"] + \
+            [DiscreteVariable(d, values=tuple("def")) for d in "abc"]
+
+    @staticmethod
+    def _vars(s):
+        return "".join(var.name for var in s)
+
     def test_drop_mime(self):
-        iris = Table("iris")
-        m = VariablesListItemModel(iris.domain.variables)
+        m = VariablesListItemModel(self.variables)
         mime = m.mimeData([m.index(1, 0)])
         self.assertTrue(mime.hasFormat(VariablesListItemModel.MIME_TYPE))
         assert m.dropMimeData(mime, Qt.MoveAction, 5, 0, m.index(-1, -1))
         self.assertIs(m[5], m[1])
         assert m.dropMimeData(mime, Qt.MoveAction, -1, -1, m.index(-1, -1))
-        self.assertIs(m[6], m[1])
+        self.assertIs(m[11], m[1])
+
+    def test_drop_mime_primitive(self):
+        mime = QMimeData()
+        # the encoded 'data' is empty, variables are passed by properties
+        mime.setData(VariablesListItemModel.MIME_TYPE, b'')
+        mime.setProperty("_items", self.variables[2:])
+
+        m = VariablesListItemModel(self.variables[:2], primitive=False)
+        assert m.dropMimeData(mime, Qt.MoveAction, 1, 0, m.index(-1, -1))
+        self.assertEqual(self._vars(m), "xzspqrabcy")
+        self.assertTrue(mime.property("_moved"))
+
+        m = VariablesListItemModel(self.variables[:2], primitive=True)
+        assert m.dropMimeData(mime, Qt.MoveAction, 1, 0, m.index(-1, -1))
+        self.assertEqual(self._vars(m), "xzabcy")
+        self.assertEqual(self._vars(mime.property("_moved")), "zabc")
+
+    def test_drop_mime_noop(self):
+        m = VariablesListItemModel(self.variables[:2], primitive=False)
+
+        mime = QMimeData()
+        # the encoded 'data' is empty, variables are passed by properties
+        mime.setData(VariablesListItemModel.MIME_TYPE, b'')
+
+        mime.setProperty("_items", self.variables[:2])
+        self.assertTrue(m.dropMimeData(mime, Qt.IgnoreAction, 1, 0, m.index(-1, -1)))
+        self.assertEqual(self._vars(m), "xy")
+        self.assertIsNone(mime.property("_moved"))
+
+        mime.setProperty("_items", None)
+        self.assertFalse(m.dropMimeData(mime, Qt.MoveAction, 1, 0, m.index(-1, -1)))
+        self.assertEqual(self._vars(m), "xy")
+        self.assertIsNone(mime.property("_moved"))
+
+        mime = QMimeData()
+        mime.setData("application/x-that-other-format", b'')
+        mime.setProperty("_items", self.variables[:2])
+
+        self.assertFalse(m.dropMimeData(mime, Qt.MoveAction, 1, 0, m.index(-1, -1)))
+        self.assertEqual(self._vars(m), "xy")
+        self.assertIsNone(mime.property("_moved"))
+
+    def test_mimedata(self):
+        m = VariablesListItemModel(self.variables)
+        mime = m.mimeData([m.index(i, 0) for i in (1, 2, 5, 7, 9)])
+        # 0123456789
+        # xyzspqrabc
+        self.assertEqual(self._vars(mime.property("_items")), "yzqac")
 
     def test_flags(self):
         m = VariablesListItemModel([ContinuousVariable("X")])
@@ -115,6 +179,96 @@ class TestModel(TestCase):
         # 'invalid' index is drop enabled -> indicates insertion capability
         flags = m.flags(m.index(-1, -1))
         self.assertTrue(flags & Qt.ItemIsDropEnabled)
+
+
+class TestViews(GuiTest):
+    def setUp(self):
+        self.variables = \
+            [ContinuousVariable(c) for c in "xyz"] + \
+            [StringVariable(s) for s in "spqr"] + \
+            [DiscreteVariable(d, values=tuple("def")) for d in "abc"]
+        self.model = VariablesListItemModel(self.variables)
+        self.view = SelectedVarsView()
+        self.view.setModel(self.model)
+
+    @staticmethod
+    def _vars(s):
+        return "".join(var.name for var in s)
+
+    @patch("AnyQt.QtGui.QDrag.exec")
+    def test_noop(self, drag_exec):
+        with patch.object(self.view, "selectedIndexes", return_value=[]):
+            assert self.view.startDrag(Qt.MoveAction) is None
+            drag_exec.assert_not_called()
+
+        with patch.object(self.view, "selectedIndexes",
+                          return_value=[self.model.index(1, 0)]), \
+                patch.object(self.model, "mimeData", return_value=None):
+            assert self.view.startDrag(Qt.MoveAction) is None
+            drag_exec.assert_not_called()
+
+    def test_move(self):
+
+        def drag_exec(self, *_):
+            self.mimeData().setProperty("_moved", moved)
+            return Qt.MoveAction
+
+        # 0123456789
+        # xyzspqrabc
+        #  yz p rab
+        indexes = [self.model.index(i, 0) for i in (1, 2, 4, 6, 7, 8)]
+        selmodel = self.view.selectionModel()
+        for index in indexes:
+            selmodel.select(index, selmodel.Select)
+        with patch("AnyQt.QtGui.QDrag.exec", drag_exec):
+
+            moved = None
+            self.view.startDrag(Qt.MoveAction)
+            self.assertEqual(self.model.rowCount(), 10)
+
+            moved = True
+            self.view.startDrag(Qt.MoveAction)
+            self.assertEqual(self._vars(self.model), "xsqc")
+
+            self.model[:] = self.variables
+            indexes = [self.model.index(i, 0) for i in (1, 2, 4, 6, 7, 8)]
+            for index in indexes:
+                selmodel.select(index, selmodel.Select)
+            moved = [self.model[i] for i in (4, 6)]
+            self.view.startDrag(Qt.MoveAction)
+            self.assertEqual(self._vars(self.model), "xyzsqabc")
+
+    @patch("AnyQt.QtGui.QDropEvent.source")
+    def test_primitives_accepts_drop(self, src):
+        view = PrimitivesView()
+        mime = QMimeData()
+        mime.setData(VariablesListItemModel.MIME_TYPE, b'')
+        event = QDropEvent(QPointF(20, 20), Qt.MoveAction, mime,
+                          Qt.NoButton, Qt.NoModifier)
+
+        with patch.object(event, "mimeData"):
+            self.assertFalse(view.acceptsDropEvent(event))
+            event.mimeData.assert_not_called()
+            self.assertFalse(event.isAccepted())
+
+        src.return_value.window.return_value = view.window()
+
+        mime.setProperty("_items", self.variables)
+        self.assertTrue(view.acceptsDropEvent(event))
+        self.assertTrue(event.isAccepted())
+        event.setAccepted(False)
+
+        mime.setProperty("_items", None)
+        self.assertFalse(view.acceptsDropEvent(event))
+        self.assertFalse(event.isAccepted())
+
+        mime.setProperty("_items", [])
+        self.assertFalse(view.acceptsDropEvent(event))
+        self.assertFalse(event.isAccepted())
+
+        mime.setProperty("_items", self.variables[3:7])  # string variables
+        self.assertFalse(view.acceptsDropEvent(event))
+        self.assertFalse(event.isAccepted())
 
 
 class SimpleWidget:
@@ -133,10 +287,14 @@ class TestOWSelectAttributes(WidgetTest):
         self.widget = self.create_widget(OWSelectAttributes)
 
     def assertVariableCountsEqual(self, available, used, classattrs, metas=0):
-        self.assertEqual(len(self.widget.available_attrs), available)
-        self.assertEqual(len(self.widget.used_attrs), used)
-        self.assertEqual(len(self.widget.class_attrs), classattrs)
-        self.assertEqual(len(self.widget.meta_attrs), metas)
+        self.widget.update_interface_state()
+        for (name, box, view), nattrs in zip(self.widget.view_boxes,
+                                              (available, used, classattrs, metas)):
+            self.assertEqual(view.model().rowCount(), nattrs)
+            if nattrs:
+                self.assertEqual(box.title(), f"{name} ({nattrs})")
+            else:
+                self.assertEqual(box.title(), name)
 
     def assertControlsEnabled(self, _list, button, box, widget=None):
         if widget is None:
@@ -171,6 +329,87 @@ class TestOWSelectAttributes(WidgetTest):
         self.widget.available_attrs_view.selectAll()
         self.widget.move_selected(self.widget.class_attrs_view)
         self.assertVariableCountsEqual(0, 0, 5)
+
+    def test_move_to_primitive(self):
+        app = QApplication.instance()
+        widget = self.widget
+
+        data = Table("zoo")
+        self.send_signal(widget.Inputs.data, data)
+
+        # Selecting meta attribute must enable the corresponding button
+        widget.meta_attrs_view.selectAll()
+        app.processEvents()
+        self.assertFalse(widget.move_attr_button.isEnabled())
+        self.assertFalse(widget.move_class_button.isEnabled())
+        self.assertTrue(widget.move_meta_button.isEnabled())
+
+        # Moving to available
+        widget.move_meta_button.click()
+        self.assertVariableCountsEqual(available=1, used=16, classattrs=1, metas=0)
+
+        # Selecting available attributes must enable only meta button
+        # because all selected attrs are non-primitive and can't be used for
+        # features or classes
+        widget.available_attrs_view.selectAll()
+        app.processEvents()
+        self.assertFalse(widget.move_attr_button.isEnabled())
+        self.assertFalse(widget.move_class_button.isEnabled())
+        self.assertTrue(widget.move_meta_button.isEnabled())
+
+        # Selecting class attributes must enable the corresponding button
+        widget.class_attrs_view.selectAll()
+        app.processEvents()
+        self.assertFalse(widget.move_attr_button.isEnabled())
+        self.assertTrue(widget.move_class_button.isEnabled())
+        self.assertFalse(widget.move_meta_button.isEnabled())
+
+        # Move it to available
+        widget.move_class_button.click()
+        self.assertVariableCountsEqual(available=2, used=16, classattrs=0, metas=0)
+
+        # Selecting meta attributes: nothing there, so disable all buttons
+        widget.meta_attrs_view.selectAll()
+        app.processEvents()
+        self.assertFalse(widget.move_attr_button.isEnabled())
+        self.assertFalse(widget.move_class_button.isEnabled())
+        self.assertFalse(widget.move_meta_button.isEnabled())
+
+        # Selecting available attributes must now enable all buttons because
+        # there some of selected attributes are not primitive
+        widget.available_attrs_view.selectAll()
+        app.processEvents()
+        self.assertTrue(widget.move_attr_button.isEnabled())
+        self.assertTrue(widget.move_class_button.isEnabled())
+        self.assertTrue(widget.move_meta_button.isEnabled())
+
+        # Move to metas should move both attributes
+        widget.move_meta_button.click()
+        self.assertVariableCountsEqual(available=0, used=16, classattrs=0, metas=2)
+
+        # Move them back to available
+        widget.meta_attrs_view.selectAll()
+        app.processEvents()
+        widget.move_meta_button.click()
+        self.assertVariableCountsEqual(available=2, used=16, classattrs=0, metas=0)
+
+        # Now move them to class: only one should be moved
+        widget.available_attrs_view.selectAll()
+        app.processEvents()
+        widget.move_class_button.click()
+        self.assertVariableCountsEqual(available=1, used=16, classattrs=1, metas=0)
+
+        # Move them back to available
+        widget.class_attrs_view.selectAll()
+        app.processEvents()
+        widget.move_class_button.click()
+        self.assertVariableCountsEqual(available=2, used=16, classattrs=0, metas=0)
+
+        # Now move them to attributes: only one should be moved
+        widget.available_attrs_view.selectAll()
+        app.processEvents()
+        widget.move_attr_button.click()
+        self.assertVariableCountsEqual(available=1, used=17, classattrs=0, metas=0)
 
     def test_input_features(self):
         data = Table("zoo")
@@ -376,6 +615,33 @@ class TestOWSelectAttributes(WidgetTest):
             d1.domain.attributes,
             data.domain.attributes
         )
+
+    def test_drag_drop_move_rows(self):
+        data = Table("iris")[:5]
+        w = self.widget
+        self.send_signal(w.Inputs.data, data)
+        used = w.used_attrs_view
+        unused = w.available_attrs_view
+        model = used.model()
+        select_rows(used, [0, 1])
+
+        def drag_exec(self, supported, default):
+            mime = self.mimeData()
+            drop = QDropEvent(QPointF(20, 20), supported, mime,
+                              Qt.NoButton, Qt.NoModifier)
+            drop.setDropAction(default)
+            drop.setAccepted(False)
+            unused.dropEvent(drop)
+            assert drop.isAccepted()
+            return drop.dropAction()
+
+        with patch.object(QDrag, "exec", drag_exec):
+            used.startDrag(Qt.MoveAction)
+
+        self.assertEqual(model.rowCount(), 2)
+        self.assertEqual(unused.model().rowCount(), 2)
+        out = self.get_output(w.Outputs.data, w)
+        self.assertEqual(out.domain.attributes, data.domain.attributes[2:])
 
     def test_domain_new_feature(self):
         """ Test scenario when new attribute is added at position 0 """

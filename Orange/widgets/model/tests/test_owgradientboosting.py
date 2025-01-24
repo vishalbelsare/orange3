@@ -1,6 +1,8 @@
+import json
 import unittest
-from unittest.mock import patch, Mock
 import sys
+from typing import Type
+from unittest.mock import patch, Mock
 
 from Orange.classification import GBClassifier
 
@@ -27,11 +29,19 @@ except ImportError:
     CatGBRegressor = None
 from Orange.widgets.model.owgradientboosting import OWGradientBoosting, \
     LearnerItemModel, GBLearnerEditor, XGBLearnerEditor, XGBRFLearnerEditor, \
-    CatGBLearnerEditor
+    CatGBLearnerEditor, BaseEditor
 from Orange.widgets.settings import SettingProvider
 from Orange.widgets.tests.base import WidgetTest, ParameterMapping, \
     WidgetLearnerTestMixin, datasets, simulate, GuiTest
 from Orange.widgets.widget import OWWidget
+
+
+def get_tree_train_params(model):
+    ln = json.loads(model.skl_model.get_booster().save_config())["learner"]
+    try:
+        return ln["gradient_booster"]["tree_train_param"]
+    except KeyError:
+        return ln["gradient_booster"]["updater"]["grow_colmaker"]["train_param"]
 
 
 def create_parent(editor_class):
@@ -66,11 +76,22 @@ class TestLearnerItemModel(GuiTest):
         self.assertFalse(model.item(1).isEnabled())
 
 
-class TestGBLearnerEditor(GuiTest):
+class BaseEditorTest(GuiTest):
+    EditorClass: Type[BaseEditor] = None
+
     def setUp(self):
-        editor_class = GBLearnerEditor
+        super().setUp()
+        editor_class = self.EditorClass
         self.widget = create_parent(editor_class)
-        self.editor = editor_class(self.widget)
+        self.editor = editor_class(self.widget)  # pylint: disable=not-callable
+
+    def tearDown(self) -> None:
+        self.widget.deleteLater()
+        super().tearDown()
+
+
+class TestGBLearnerEditor(BaseEditorTest):
+    EditorClass = GBLearnerEditor
 
     def test_arguments(self):
         args = {"n_estimators": 100, "learning_rate": 0.1, "max_depth": 3,
@@ -116,11 +137,8 @@ class TestGBLearnerEditor(GuiTest):
         self.assertIsNone(params["random_state"])
 
 
-class TestXGBLearnerEditor(GuiTest):
-    def setUp(self):
-        editor_class = XGBLearnerEditor
-        self.widget = create_parent(editor_class)
-        self.editor = editor_class(self.widget)
+class TestXGBLearnerEditor(BaseEditorTest):
+    EditorClass = XGBLearnerEditor
 
     def test_arguments(self):
         args = {"n_estimators": 100, "learning_rate": 0.3, "max_depth": 6,
@@ -148,18 +166,17 @@ class TestXGBLearnerEditor(GuiTest):
         booster = XGBClassifier()
         model = booster(data)
         params = model.skl_model.get_params()
+        tp = get_tree_train_params(model)
         self.assertEqual(params["n_estimators"], self.editor.n_estimators)
-        self.assertEqual(round(params["learning_rate"], 1),
-                         self.editor.learning_rate)
-        self.assertEqual(params["max_depth"], self.editor.max_depth)
-        self.assertEqual(params["reg_lambda"], self.editor.lambda_)
-        self.assertEqual(params["subsample"], self.editor.subsample)
-        self.assertEqual(params["colsample_bytree"],
-                         self.editor.colsample_bytree)
-        self.assertEqual(params["colsample_bylevel"],
-                         self.editor.colsample_bylevel)
-        self.assertEqual(params["colsample_bynode"],
-                         self.editor.colsample_bynode)
+        self.assertEqual(
+            round(float(tp["learning_rate"]), 1), self.editor.learning_rate
+        )
+        self.assertEqual(int(tp["max_depth"]), self.editor.max_depth)
+        self.assertEqual(float(tp["reg_lambda"]), self.editor.lambda_)
+        self.assertEqual(int(tp["subsample"]), self.editor.subsample)
+        self.assertEqual(int(tp["colsample_bytree"]), self.editor.colsample_bytree)
+        self.assertEqual(int(tp["colsample_bylevel"]), self.editor.colsample_bylevel)
+        self.assertEqual(int(tp["colsample_bynode"]), self.editor.colsample_bynode)
 
     @unittest.skipIf(XGBRegressor is None, "Missing 'xgboost' package")
     def test_default_parameters_reg(self):
@@ -167,25 +184,21 @@ class TestXGBLearnerEditor(GuiTest):
         booster = XGBRegressor()
         model = booster(data)
         params = model.skl_model.get_params()
+        tp = get_tree_train_params(model)
         self.assertEqual(params["n_estimators"], self.editor.n_estimators)
-        self.assertEqual(round(params["learning_rate"], 1),
-                         self.editor.learning_rate)
-        self.assertEqual(params["max_depth"], self.editor.max_depth)
-        self.assertEqual(params["reg_lambda"], self.editor.lambda_)
-        self.assertEqual(params["subsample"], self.editor.subsample)
-        self.assertEqual(params["colsample_bytree"],
-                         self.editor.colsample_bytree)
-        self.assertEqual(params["colsample_bylevel"],
-                         self.editor.colsample_bylevel)
-        self.assertEqual(params["colsample_bynode"],
-                         self.editor.colsample_bynode)
+        self.assertEqual(
+            round(float(tp["learning_rate"]), 1), self.editor.learning_rate
+        )
+        self.assertEqual(int(tp["max_depth"]), self.editor.max_depth)
+        self.assertEqual(float(tp["reg_lambda"]), self.editor.lambda_)
+        self.assertEqual(int(tp["subsample"]), self.editor.subsample)
+        self.assertEqual(int(tp["colsample_bytree"]), self.editor.colsample_bytree)
+        self.assertEqual(int(tp["colsample_bylevel"]), self.editor.colsample_bylevel)
+        self.assertEqual(int(tp["colsample_bynode"]), self.editor.colsample_bynode)
 
 
-class TestXGBRFLearnerEditor(GuiTest):
-    def setUp(self):
-        editor_class = XGBRFLearnerEditor
-        self.widget = create_parent(editor_class)
-        self.editor = editor_class(self.widget)
+class TestXGBRFLearnerEditor(BaseEditorTest):
+    EditorClass = XGBRFLearnerEditor
 
     def test_arguments(self):
         args = {"n_estimators": 100, "learning_rate": 0.3, "max_depth": 6,
@@ -214,18 +227,17 @@ class TestXGBRFLearnerEditor(GuiTest):
         booster = XGBRFClassifier()
         model = booster(data)
         params = model.skl_model.get_params()
+        tp = get_tree_train_params(model)
         self.assertEqual(params["n_estimators"], self.editor.n_estimators)
-        self.assertEqual(round(params["learning_rate"], 1),
-                         self.editor.learning_rate)
-        self.assertEqual(params["max_depth"], self.editor.max_depth)
-        self.assertEqual(params["reg_lambda"], self.editor.lambda_)
-        self.assertEqual(params["subsample"], self.editor.subsample)
-        self.assertEqual(params["colsample_bytree"],
-                         self.editor.colsample_bytree)
-        self.assertEqual(params["colsample_bylevel"],
-                         self.editor.colsample_bylevel)
-        self.assertEqual(params["colsample_bynode"],
-                         self.editor.colsample_bynode)
+        self.assertEqual(
+            round(float(tp["learning_rate"]), 1), self.editor.learning_rate
+        )
+        self.assertEqual(int(tp["max_depth"]), self.editor.max_depth)
+        self.assertEqual(float(tp["reg_lambda"]), self.editor.lambda_)
+        self.assertEqual(int(tp["subsample"]), self.editor.subsample)
+        self.assertEqual(int(tp["colsample_bytree"]), self.editor.colsample_bytree)
+        self.assertEqual(int(tp["colsample_bylevel"]), self.editor.colsample_bylevel)
+        self.assertEqual(int(tp["colsample_bynode"]), self.editor.colsample_bynode)
 
     @unittest.skipIf(XGBRFRegressor is None, "Missing 'xgboost' package")
     def test_default_parameters_reg(self):
@@ -233,25 +245,21 @@ class TestXGBRFLearnerEditor(GuiTest):
         booster = XGBRFRegressor()
         model = booster(data)
         params = model.skl_model.get_params()
+        tp = get_tree_train_params(model)
         self.assertEqual(params["n_estimators"], self.editor.n_estimators)
-        self.assertEqual(round(params["learning_rate"], 1),
-                         self.editor.learning_rate)
-        self.assertEqual(params["max_depth"], self.editor.max_depth)
-        self.assertEqual(params["reg_lambda"], self.editor.lambda_)
-        self.assertEqual(params["subsample"], self.editor.subsample)
-        self.assertEqual(params["colsample_bytree"],
-                         self.editor.colsample_bytree)
-        self.assertEqual(params["colsample_bylevel"],
-                         self.editor.colsample_bylevel)
-        self.assertEqual(params["colsample_bynode"],
-                         self.editor.colsample_bynode)
+        self.assertEqual(
+            round(float(tp["learning_rate"]), 1), self.editor.learning_rate
+        )
+        self.assertEqual(int(tp["max_depth"]), self.editor.max_depth)
+        self.assertEqual(float(tp["reg_lambda"]), self.editor.lambda_)
+        self.assertEqual(int(tp["subsample"]), self.editor.subsample)
+        self.assertEqual(int(tp["colsample_bytree"]), self.editor.colsample_bytree)
+        self.assertEqual(int(tp["colsample_bylevel"]), self.editor.colsample_bylevel)
+        self.assertEqual(int(tp["colsample_bynode"]), self.editor.colsample_bynode)
 
 
-class TestCatGBLearnerEditor(GuiTest):
-    def setUp(self):
-        editor_class = CatGBLearnerEditor
-        self.widget = create_parent(editor_class)
-        self.editor = editor_class(self.widget)
+class TestCatGBLearnerEditor(BaseEditorTest):
+    EditorClass = CatGBLearnerEditor
 
     def test_arguments(self):
         args = {"n_estimators": 100, "learning_rate": 0.3, "max_depth": 6,
@@ -346,7 +354,7 @@ class TestOWGradientBoosting(WidgetTest, WidgetLearnerTestMixin):
             if cls is None:
                 continue
             simulate.combobox_activate_index(method_cb, i)
-            self.widget.apply_button.button.click()
+            self.click_apply()
             self.assertIsInstance(self.widget.learner, cls)
 
     def test_missing_lib(self):

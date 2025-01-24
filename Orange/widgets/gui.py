@@ -1,16 +1,17 @@
 """
 Wrappers for controls used in widgets
 """
-import math
-
 import logging
 import sys
 import warnings
 import weakref
 from collections.abc import Sequence
 
+import math
+import numpy as np
+
 from AnyQt import QtWidgets, QtCore, QtGui
-from AnyQt.QtCore import Qt, QSize, QItemSelection
+from AnyQt.QtCore import Qt, QSize, QItemSelection, QSortFilterProxyModel
 from AnyQt.QtGui import QColor, QWheelEvent
 from AnyQt.QtWidgets import QWidget, QListView, QComboBox
 
@@ -40,7 +41,8 @@ from orangewidget.gui import (
     ControlledCallback, ControlledCallFront, ValueCallback, connectControl,
     is_macstyle
 )
-
+from orangewidget.utils.itemmodels import PyTableModel
+from orangewidget.utils.listview import ListViewFilter
 
 try:
     # Some Orange widgets might expect this here
@@ -50,11 +52,10 @@ except ImportError:
     pass  # Neither WebKit nor WebEngine are available
 
 import Orange.data
-from Orange.widgets.utils import getdeepattr
+from Orange.widgets.utils import getdeepattr, vartype
 from Orange.data import \
     ContinuousVariable, StringVariable, TimeVariable, DiscreteVariable, \
     Variable, Value
-from Orange.widgets.utils import vartype
 
 __all__ = [
     # Re-exported
@@ -78,7 +79,7 @@ __all__ = [
     "createAttributePixmap", "attributeIconDict", "attributeItem",
     "listView", "ListViewWithSizeHint", "listBox", "OrangeListBox",
     "TableValueRole", "TableClassValueRole", "TableDistribution",
-    "TableVariable", "TableBarItem", "palette_combo_box"
+    "TableVariable", "TableBarItem", "palette_combo_box", "BarRatioTableModel"
 ]
 
 
@@ -192,10 +193,15 @@ def listView(widget, master, value=None, model=None, box=None, callback=None,
     else:
         bg = widget
     view = viewType(preferred_size=sizeHint)
-    view.setModel(model)
+    if isinstance(view, ListViewFilter):
+        view.model().setSourceModel(model)
+        signal = view.sigSelectionChanged
+    else:
+        view.setModel(model)
+        signal = view.selectionModel().selectionChanged
     if value is not None:
         connectControl(master, value, callback,
-                       view.selectionModel().selectionChanged,
+                       signal,
                        CallFrontListView(view),
                        CallBackListView(model, view, master, value))
     misc.setdefault('uniformItemSizes', True)
@@ -467,12 +473,22 @@ class ControlledList(list):
         super().remove(item)
 
 
-def comboBox(*args, **kwargs):
-    if "valueType" in kwargs:
-        del kwargs["valueType"]
+def comboBox(widget, master, value, box=None, label=None, labelWidth=None,
+             orientation=Qt.Vertical, items=(), callback=None,
+             sendSelectedValue=None, emptyString=None, editable=False,
+             contentsLength=None, searchable=False, *, model=None,
+             tooltips=None, **misc):
+    if "valueType" in misc:
+        del misc["valueType"]
         warnings.warn("Argument 'valueType' is deprecated and ignored",
                       DeprecationWarning)
-    return gui_comboBox(*args, **kwargs)
+    return gui_comboBox(
+        widget, master, value, box, label, labelWidth, orientation, items,
+        callback, sendSelectedValue, emptyString, editable,
+        contentsLength, searchable, model=model, tooltips=tooltips, **misc)
+
+
+comboBox.__doc__ = gui_comboBox.__doc__
 
 
 class CallBackListView(ControlledCallback):
@@ -485,16 +501,19 @@ class CallBackListView(ControlledCallback):
     def __call__(self, *_):
         # This must be imported locally to avoid circular imports
         from Orange.widgets.utils.itemmodels import PyListModel
-        values = [i.row()
-                  for i in self.view.selectionModel().selection().indexes()]
-        if values:
-            # FIXME: irrespective of PyListModel check, this might/should always
-            # callback with values!
-            if isinstance(self.model, PyListModel):
-                values = [self.model[i] for i in values]
-            if self.view.selectionMode() == self.view.SingleSelection:
-                values = values[0]
-            self.acyclic_setattr(values)
+
+        selection = self.view.selectionModel().selection()
+        if isinstance(self.view, ListViewFilter):
+            selection = self.view.selection
+        values = [i.row() for i in selection.indexes()]
+
+        # set attribute's values
+        if isinstance(self.model, PyListModel):
+            values = [self.model[i] for i in values]
+        if self.view.selectionMode() == self.view.SingleSelection:
+            assert len(values) <= 1
+            values = values[0] if values else None
+        self.acyclic_setattr(values)
 
 
 class CallBackListBox:
@@ -525,6 +544,8 @@ class CallFrontListView(ControlledCallFront):
     def action(self, values):
         view = self.control
         model = view.model()
+        if isinstance(view.model(), QSortFilterProxyModel):
+            model = model.sourceModel()
         sel_model = view.selectionModel()
 
         if not isinstance(values, Sequence):
@@ -534,7 +555,7 @@ class CallFrontListView(ControlledCallFront):
         for value in values:
             index = None
             if not isinstance(value, int):
-                if isinstance(value, Variable):
+                if value is None or isinstance(value, Variable):
                     search_role = TableVariable
                 else:
                     search_role = Qt.DisplayRole
@@ -547,6 +568,8 @@ class CallFrontListView(ControlledCallFront):
                 index = value
             if index is not None:
                 selection.select(model.index(index), model.index(index))
+        if isinstance(view.model(), QSortFilterProxyModel):
+            selection = view.model().mapSelectionFromSource(selection)
         sel_model.select(selection, sel_model.ClearAndSelect)
 
 
@@ -650,7 +673,8 @@ class HScrollStepMixin:
         self.horizontalScrollBar().setSingleStep(20)
 
     def wheelEvent(self, event: QWheelEvent):
-        if event.source() == Qt.MouseEventNotSynthesized and \
+        if hasattr(event, "source") and \
+                event.source() == Qt.MouseEventNotSynthesized and \
                 (event.modifiers() & Qt.ShiftModifier and sys.platform == 'darwin' or
                  event.modifiers() & Qt.AltModifier and sys.platform != 'darwin'):
             new_event = QWheelEvent(
@@ -662,3 +686,73 @@ class HScrollStepMixin:
             super().wheelEvent(new_event)
         else:
             super().wheelEvent(event)
+
+
+class BarRatioTableModel(PyTableModel):
+    """A model for displaying python tables.
+    Adds a BarRatioRole that returns Data, normalized between the extremes.
+    NaNs are listed last when sorting."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._extremes = {}
+
+    def data(self, index, role=Qt.DisplayRole):
+        if role == BarRatioRole and index.isValid():
+            value = super().data(index, Qt.EditRole)
+            if not isinstance(value, float):
+                return None
+            vmin, vmax = self._extremes.get(index.column(), (-np.inf, np.inf))
+            value = (value - vmin) / ((vmax - vmin) or 1)
+            return value
+
+        if role == Qt.DisplayRole and index.column() != 0:
+            role = Qt.EditRole
+
+        value = super().data(index, role)
+
+        # Display nothing for non-existent attr value counts in column 1
+        if role == Qt.EditRole \
+                and index.column() == 1 and np.isnan(value):
+            return ''
+
+        return value
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.InitialSortOrderRole:
+            return Qt.DescendingOrder if section > 0 else Qt.AscendingOrder
+        return super().headerData(section, orientation, role)
+
+    def setExtremesFrom(self, column, values):
+        """Set extremes for column's ratio bars from values"""
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore", ".*All-NaN slice encountered.*", RuntimeWarning)
+                vmin = np.nanmin(values)
+            if np.isnan(vmin):
+                raise TypeError
+        except TypeError:
+            vmin, vmax = -np.inf, np.inf
+        else:
+            vmax = np.nanmax(values)
+        self._extremes[column] = (vmin, vmax)
+
+    def resetSorting(self, yes_reset=False):
+        # pylint: disable=arguments-differ
+        """We don't want to invalidate our sort proxy model everytime we
+        wrap a new list. Our proxymodel only invalidates explicitly
+        (i.e. when new data is set)"""
+        if yes_reset:
+            super().resetSorting()
+
+    def _argsortData(self, data, order):
+        if data.dtype not in (float, int):
+            data = np.char.lower(data)
+        indices = np.argsort(data, kind='mergesort')
+        if order == Qt.DescendingOrder:
+            indices = indices[::-1]
+            if data.dtype == float:
+                # Always sort NaNs last
+                return np.roll(indices, -np.isnan(data).sum())
+        return indices

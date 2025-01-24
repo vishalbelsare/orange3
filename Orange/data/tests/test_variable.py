@@ -1,6 +1,7 @@
 # Test methods with long descriptive names can omit docstrings
 # pylint: disable=missing-docstring
 # pylint: disable=protected-access
+import csv
 import os
 import sys
 import math
@@ -10,9 +11,10 @@ import pkgutil
 import warnings
 from datetime import datetime, timezone
 
-from io import StringIO
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 
 import numpy as np
+import pandas as pd
 import scipy.sparse as sp
 
 from Orange.data import Variable, ContinuousVariable, DiscreteVariable, \
@@ -234,6 +236,61 @@ class TestVariable(unittest.TestCase):
         self.assertEqual(hash(a), hash(a1))
         self.assertEqual(hash(c1), hash(c2))
 
+    def test_compute_value_eq_warning(self):
+        with warnings.catch_warnings(record=True) as warns:
+            ContinuousVariable("x")
+            self.assertEqual(warns, [])
+            ContinuousVariable("x", compute_value=lambda *_: 42)
+            self.assertEqual(warns, [])
+
+            class Valid:
+                def __eq__(self, other):
+                    return self is other
+
+                def __hash__(self):
+                    return super().__hash__(self)
+
+            ContinuousVariable("x", compute_value=Valid())
+            self.assertEqual(warns, [])
+
+            class AlsoValid:
+                InheritEq = True
+
+            ContinuousVariable("x", compute_value=AlsoValid())
+            self.assertEqual(warns, [])
+
+            class Invalid:
+                pass
+
+            ContinuousVariable("x", compute_value=Invalid())
+            self.assertNotEqual(warns, [])
+
+        with warnings.catch_warnings(record=True) as warns:
+
+            class InheritEqInherited(AlsoValid):
+                pass
+
+            ContinuousVariable("x", compute_value=InheritEqInherited())
+            self.assertNotEqual(warns, [])
+
+        with warnings.catch_warnings(record=True) as warns:
+
+            class MissingHash:
+                def __eq__(self, other):
+                    return self is other
+
+            ContinuousVariable("x", compute_value=MissingHash())
+            self.assertNotEqual(warns, [])
+
+        with warnings.catch_warnings(record=True) as warns:
+
+            class MissingEq:
+                def __hash__(self):
+                    return super().__hash__(self)
+
+            ContinuousVariable("x", compute_value=MissingEq())
+            self.assertNotEqual(warns, [])
+
 
 def variabletest(varcls):
     def decorate(cls):
@@ -302,6 +359,10 @@ class TestDiscreteVariable(VariableTest):
         a.add_value("b")
         self.assertEqual(list(a.values), ["a", "b", "c"])
         self.assertEqual(list(a._value_index), ["a", "b", "c"])
+
+    def test_no_duplicates_in_constructor(self):
+        self.assertRaises(ValueError, DiscreteVariable,
+                          "foo", values=("a", "b", "a"))
 
     def test_unpickle(self):
         d1 = DiscreteVariable("A", values=("two", "one"))
@@ -577,6 +638,8 @@ class TestStringVariable(VariableTest):
         self.assertEqual(a.str_val(""), "?")
         self.assertEqual(a.str_val(Value(a, "")), "?")
         self.assertEqual(a.repr_val(Value(a, "foo")), '"foo"')
+        self.assertEqual(a.str_val(np.nan), "?")
+        self.assertEqual(a.str_val(None), "?")
 
 
 @variabletest(TimeVariable)
@@ -658,27 +721,35 @@ class TestTimeVariable(VariableTest):
         self.assertEqual(TimeVariable('relative time').repr_val(1.6), '1.6')
 
     def test_readwrite_timevariable(self):
-        output_csv = StringIO()
-        input_csv = StringIO("""\
-Date,Feature
-time,continuous
-,
-1920-12-12,1.0
-1920-12-13,3.0
-1920-12-14,5.5
-""")
-        for stream in (output_csv, input_csv):
-            stream.close = lambda: None  # HACK: Prevent closing of streams
+        content = [
+            ("Date", "Feature"),
+            ("time", "continuous"),
+            ("", ""),
+            ("1920-12-12", 1.0),
+            ("1920-12-13", 3.0),
+            ("1920-12-14", 5.5),
+        ]
+        with NamedTemporaryFile(
+            mode="w", delete=False, newline="", encoding="utf-8"
+        ) as input_csv:
+            csv.writer(input_csv, delimiter=",").writerows(content)
 
-        table = CSVReader(input_csv).read()
-        self.assertIsInstance(table.domain['Date'], TimeVariable)
-        self.assertEqual(table[0, 'Date'], '1920-12-12')
+        table = CSVReader(input_csv.name).read()
+        self.assertIsInstance(table.domain["Date"], TimeVariable)
+        self.assertEqual(table[0, "Date"], "1920-12-12")
         # Dates before 1970 are negative
-        self.assertTrue(all(inst['Date'] < 0 for inst in table))
+        self.assertTrue(all(inst["Date"] < 0 for inst in table))
 
-        CSVReader.write_file(output_csv, table)
-        self.assertEqual(input_csv.getvalue().splitlines(),
-                         output_csv.getvalue().splitlines())
+        with NamedTemporaryFile(mode="w", delete=False) as output_csv:
+            pass
+        CSVReader.write_file(output_csv.name, table)
+
+        with open(input_csv.name, encoding="utf-8") as in_f:
+            with open(output_csv.name, encoding="utf-8") as out_f:
+                self.assertEqual(in_f.read(), out_f.read())
+
+        os.unlink(input_csv.name)
+        os.unlink(output_csv.name)
 
     def test_repr_value(self):
         # https://github.com/biolab/orange3/pull/1760
@@ -697,6 +768,117 @@ time,continuous
         var.have_date = 1
         var.have_time = 1
         return var
+
+    def test_additional_formats(self):
+        expected_date = datetime(2022, 2, 7)
+        dates = {
+            "2021-11-25": ("2022-02-07",),
+            "25.11.2021": ("07.02.2022", "07. 02. 2022", "7.2.2022", "7. 2. 2022"),
+            "25.11.21": ("07.02.22", "07. 02. 22", "7.2.22", "7. 2. 22"),
+            "11/25/2021": ("02/07/2022", "2/7/2022"),
+            "11/25/21": ("02/07/22", "2/7/22"),
+            "20211125": ("20220207",),
+        }
+        expected_date_time = datetime(2022, 2, 7, 10, 11, 12)
+        date_times = {
+            "2021-11-25 00:00:00": (
+                "2022-02-07 10:11:12",
+                "2022-02-07 10:11:12.00",
+            ),
+            "25.11.2021 00:00:00": (
+                "07.02.2022 10:11:12",
+                "07. 02. 2022 10:11:12",
+                "7.2.2022 10:11:12",
+                "7. 2. 2022 10:11:12",
+                "07.02.2022 10:11:12.00",
+                "07. 02. 2022 10:11:12.00",
+                "7.2.2022 10:11:12.00",
+                "7. 2. 2022 10:11:12.00",
+            ),
+            "25.11.21 00:00:00": (
+                "07.02.22 10:11:12",
+                "07. 02. 22 10:11:12",
+                "7.2.22 10:11:12",
+                "7. 2. 22 10:11:12",
+                "07.02.22 10:11:12.00",
+                "07. 02. 22 10:11:12.00",
+                "7.2.22 10:11:12.00",
+                "7. 2. 22 10:11:12.00",
+            ),
+            "11/25/2021 00:00:00": (
+                "02/07/2022 10:11:12",
+                "2/7/2022 10:11:12",
+                "02/07/2022 10:11:12.00",
+                "2/7/2022 10:11:12.00",
+            ),
+            "11/25/21 00:00:00": (
+                "02/07/22 10:11:12",
+                "2/7/22 10:11:12",
+                "02/07/22 10:11:12.00",
+                "2/7/22 10:11:12.00",
+            ),
+            "20211125000000": ("20220207101112", "20220207101112.00"),
+        }
+        # times without seconds
+        expected_date_time2 = datetime(2022, 2, 7, 10, 11, 0)
+        date_times2 = {
+            "2021-11-25 00:00:00": ("2022-02-07 10:11",),
+            "25.11.2021 00:00:00": (
+                "07.02.2022 10:11",
+                "07. 02. 2022 10:11",
+                "7.2.2022 10:11",
+                "7. 2. 2022 10:11",
+            ),
+            "25.11.21 00:00:00": (
+                "07.02.22 10:11",
+                "07. 02. 22 10:11",
+                "7.2.22 10:11",
+                "7. 2. 22 10:11",
+            ),
+            "11/25/2021 00:00:00": ("02/07/2022 10:11", "2/7/2022 10:11"),
+            "11/25/21 00:00:00": ("02/07/22 10:11", "2/7/22 10:11"),
+            "20211125000000": ("202202071011",),
+        }
+        # datetime defaults to 1900, 01, 01
+        expected_time = datetime(1900, 1, 1, 10, 11, 12)
+        times = {
+            "00:00:00": ("10:11:12", "10:11:12.00"),
+            "000000": ("101112", "101112.00"),
+        }
+        expected_time2 = datetime(1900, 1, 1, 10, 11, 0)
+        times2 = {
+            "00:00:00": ("10:11",),
+        }
+        expected_year = datetime(2022, 1, 1)
+        years = {
+            "2021": (2022,),
+        }
+        expected_day = datetime(1900, 2, 7)
+        days = {
+            "11-25": ("02-07",),
+            "25.11.": ("07.02.", "07. 02.", "7.2.", "7. 2."),
+            "11/25": ("02/07", "2/7"),
+        }
+        data = (
+            (expected_date, dates),
+            (expected_date_time, date_times),
+            (expected_date_time2, date_times2),
+            (expected_time, times),
+            (expected_time2, times2),
+            (expected_year, years),
+            (expected_day, days),
+        )
+        for expected, dts in data:
+            for k, dt in dts.items():
+                for t in dt:
+                    parsed = [
+                        pd.to_datetime(t, format=f, errors="coerce")
+                        for f in TimeVariable.ADDITIONAL_FORMATS[k][0]
+                    ]
+                    # test any equal to expected
+                    self.assertTrue(any(d == expected for d in parsed))
+                    # test that no other equal to any other date - only nan or expected
+                    self.assertTrue(any(d == expected or pd.isnull(d) for d in parsed))
 
 
 PickleContinuousVariable = create_pickling_tests(

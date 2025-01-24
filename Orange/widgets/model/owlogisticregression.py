@@ -2,6 +2,8 @@ from itertools import chain
 import numpy as np
 from AnyQt.QtCore import Qt
 
+from orangewidget.report import bool_str
+
 from Orange.data import Table, Domain, ContinuousVariable, StringVariable
 from Orange.classification.logistic_regression import LogisticRegressionLearner
 from Orange.widgets import settings, gui
@@ -9,7 +11,6 @@ from Orange.widgets.utils.owlearnerwidget import OWBaseLearner
 from Orange.widgets.utils.signals import Output
 from Orange.widgets.utils.widgetpreview import WidgetPreview
 from Orange.widgets.widget import Msg
-
 
 
 class OWLogisticRegression(OWBaseLearner):
@@ -21,13 +22,14 @@ class OWLogisticRegression(OWBaseLearner):
         "Orange.widgets.classify.owlogisticregression.OWLogisticRegression",
     ]
     priority = 60
-    keywords = []
+    keywords = "logistic regression"
 
     LEARNER = LogisticRegressionLearner
 
     class Outputs(OWBaseLearner.Outputs):
         coefficients = Output("Coefficients", Table, explicit=True)
 
+    settings_version = 2
     penalty_type = settings.Setting(1)
     C_index = settings.Setting(61)
     class_weight = settings.Setting(False)
@@ -39,14 +41,15 @@ class OWLogisticRegression(OWBaseLearner):
                      [x / 10 for x in range(9, 2, -1)],
                      [x / 100 for x in range(20, 2, -1)],
                      [x / 1000 for x in range(20, 0, -1)]))
+    strength_C = C_s[61]
     dual = False
     tol = 0.0001
     fit_intercept = True
     intercept_scaling = 1.0
     max_iter = 10000
 
-    penalty_types = ("Lasso (L1)", "Ridge (L2)")
-    penalty_types_short = ["l1", "l2"]
+    penalty_types = ("Lasso (L1)", "Ridge (L2)", "None")
+    penalty_types_short = ["l1", "l2", None]
 
     class Warning(OWBaseLearner.Warning):
         class_weights_used = Msg("Weighting by class may decrease performance.")
@@ -57,7 +60,8 @@ class OWLogisticRegression(OWBaseLearner):
         self.penalty_combo = gui.comboBox(
             box, self, "penalty_type", label="Regularization type: ",
             items=self.penalty_types, orientation=Qt.Horizontal,
-            callback=self.settings_changed)
+            callback=self._penalty_type_changed)
+        self.c_box = box = gui.widgetBox(box)
         gui.widgetLabel(box, "Strength:")
         box2 = gui.hBox(gui.indentedBox(box))
         gui.widgetLabel(box2, "Weak").setStyleSheet("margin-top:6px")
@@ -80,10 +84,23 @@ class OWLogisticRegression(OWBaseLearner):
         )
 
     def set_c(self):
-        # called from init, pylint: disable=attribute-defined-outside-init
         self.strength_C = self.C_s[self.C_index]
-        fmt = "C={}" if self.strength_C >= 1 else "C={:.3f}"
-        self.c_label.setText(fmt.format(self.strength_C))
+        penalty = self.penalty_types_short[self.penalty_type]
+        enable_c = penalty is not None
+        self.c_box.setEnabled(enable_c)
+        if enable_c:
+            fmt = "C={}" if self.strength_C >= 1 else "C={:.3f}"
+            self.c_label.setText(fmt.format(self.strength_C))
+        else:
+            self.c_label.setText("N/A")
+
+    def set_penalty(self, penalty):
+        self.penalty_type = self.penalty_types_short.index(penalty)
+        self._penalty_type_changed()
+
+    def _penalty_type_changed(self):
+        self.set_c()
+        self.settings_changed()
 
     def create_learner(self):
         self.Warning.class_weights_used.clear()
@@ -93,11 +110,15 @@ class OWLogisticRegression(OWBaseLearner):
             self.Warning.class_weights_used()
         else:
             class_weight = None
+        if penalty is None:
+            C = 1.0
+        else:
+            C = self.strength_C
         return self.LEARNER(
             penalty=penalty,
             dual=self.dual,
             tol=self.tol,
-            C=self.strength_C,
+            C=C,
             class_weight=class_weight,
             fit_intercept=self.fit_intercept,
             intercept_scaling=self.intercept_scaling,
@@ -114,9 +135,9 @@ class OWLogisticRegression(OWBaseLearner):
         self.Outputs.coefficients.send(coef_table)
 
     def get_learner_parameters(self):
-        return (("Regularization", "{}, C={}, class weights={}".format(
+        return (("Regularization", "{}, C={}, class weights: {}".format(
             self.penalty_types[self.penalty_type], self.C_s[self.C_index],
-            self.class_weight)),)
+            bool_str(self.class_weight))),)
 
 
 def create_coef_table(classifier):
