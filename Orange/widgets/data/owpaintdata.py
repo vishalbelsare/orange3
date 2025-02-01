@@ -30,6 +30,7 @@ from Orange.widgets.utils import itemmodels, colorpalettes
 
 from Orange.util import scale, namegen
 from Orange.widgets.utils.widgetpreview import WidgetPreview
+from Orange.widgets.visualize.utils.plotutils import PlotWidget
 from Orange.widgets.widget import OWWidget, Msg, Input, Output
 
 
@@ -512,7 +513,8 @@ class SelectTool(DataTool):
 
     def activate(self):
         if self._item is None:
-            self._item = _RectROI((0, 0), (0, 0), pen=(25, 25, 25))
+            pen = self._plot.palette().color(QPalette.Text)
+            self._item = _RectROI((0, 0), (0, 0), pen=pen)
             self._item.setAcceptedMouseButtons(Qt.LeftButton)
             self._item.setVisible(False)
             self._item.setCursor(Qt.OpenHandCursor)
@@ -740,7 +742,7 @@ class OWPaintData(OWWidget):
     description = "Create data by painting data points on a plane."
     icon = "icons/PaintData.svg"
     priority = 60
-    keywords = ["create", "draw"]
+    keywords = "paint data, create, draw"
 
     class Inputs:
         data = Input("Data", Table)
@@ -763,7 +765,7 @@ class OWPaintData(OWWidget):
     labels = Setting(["C1", "C2"], schema_only=True)
 
     buttons_area_orientation = Qt.Vertical
-    graph_name = "plot"
+    graph_name = "plot"  # pg.GraphicsItem (pg.PlotItem)
 
     class Warning(OWWidget.Warning):
         no_input_variables = Msg("Input data has no variables")
@@ -938,8 +940,7 @@ class OWPaintData(OWWidget):
 
         # main area GUI
         viewbox = PaintViewBox(enableMouse=False)
-        self.plotview = pg.PlotWidget(background="w", viewBox=viewbox)
-        self.plotview.sizeHint = lambda: QSize(200, 100)  # Minimum size for 1-d painting
+        self.plotview = PlotWidget(viewBox=viewbox)
         self.plot = self.plotview.getPlotItem()
 
         axis_color = self.palette().color(QPalette.Text)
@@ -979,7 +980,7 @@ class OWPaintData(OWWidget):
         if self.hasAttr2:
             self.plot.setYRange(0, 1, padding=0.01)
             self.plot.showAxis('left')
-            self.plotview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+            self.plotview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         else:
             self.plot.setYRange(-.5, .5, padding=0.01)
             self.plot.hideAxis('left')

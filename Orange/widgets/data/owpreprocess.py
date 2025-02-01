@@ -1,5 +1,5 @@
 from collections import OrderedDict
-import pkg_resources
+import importlib.resources
 
 import numpy
 
@@ -27,6 +27,7 @@ from Orange import preprocess
 from Orange.preprocess import Continuize, ProjectPCA, RemoveNaNRows, \
     ProjectCUR, Scale as _Scale, Randomize as _Randomize, RemoveSparse
 from Orange.widgets import widget, gui
+from Orange.widgets.utils.localization import pl
 from Orange.widgets.settings import Setting
 from Orange.widgets.utils.overlay import OverlayWidget
 from Orange.widgets.utils.sql import check_sql_input
@@ -253,9 +254,9 @@ class ContinuizeEditor(BaseEditor):
     def __repr__(self):
         return self.Continuizers[self.__treatment]
 
-class RemoveSparseEditor(BaseEditor):
 
-    options = ["missing", "zeros"]
+class RemoveSparseEditor(BaseEditor):
+    options = ["missing values", "zeros"]
 
     def __init__(self, parent=None, **kwargs):
         super().__init__(parent, **kwargs)
@@ -266,12 +267,10 @@ class RemoveSparseEditor(BaseEditor):
         self.setLayout(QVBoxLayout())
 
         self.layout().addWidget(QLabel("Remove features with too many"))
-        options = ["missing values",
-                   "zeros"]
         self.filter_buttons = QButtonGroup(exclusive=True)
         self.filter_buttons.buttonClicked.connect(self.filterByClicked)
-        for idx, option, in enumerate(options):
-            btn = QRadioButton(self, text=option, checked=idx == 0)
+        for idx, option, in enumerate(self.options):
+            btn = QRadioButton(self, text=option, checked=idx == 1)
             self.filter_buttons.addButton(btn, id=idx)
             self.layout().addWidget(btn)
 
@@ -312,6 +311,7 @@ class RemoveSparseEditor(BaseEditor):
     def setFilter0(self, id_):
         if self.filter0 != id_:
             self.filter0 = id_
+            self.filter_buttons.button(id_).setChecked(True)
             self.edited.emit()
 
     def setFixedThresh(self, thresh):
@@ -347,12 +347,21 @@ class RemoveSparseEditor(BaseEditor):
     def createinstance(params):
         params = dict(params)
         filter0 = params.pop('filter0', True)
-        useFixedThreshold = params.pop('useFixedThreshold', True)
+        useFixedThreshold = params.pop('useFixedThreshold', False)
         if useFixedThreshold:
             threshold = params.pop('fixedThresh', 50)
         else:
             threshold = params.pop('percThresh', 5) / 100
         return RemoveSparse(threshold, filter0)
+
+    def __repr__(self):
+        desc = f"remove features with too many {self.options[self.filter0]}, threshold: "
+        if self.useFixedThreshold:
+            desc += f"{self.fixedThresh} {pl(self.fixedThresh, 'instance')}"
+        else:
+            desc += f"{self.percThresh} %"
+        return desc
+
 
 class ImputeEditor(BaseEditor):
     (NoImputation, Constant, Average,
@@ -727,6 +736,15 @@ class RandomFeatureSelectEditor(BaseEditor):
             # further implementations
             raise NotImplementedError
 
+    def __repr__(self):
+        if self.__strategy == self.Fixed:
+            # private attributes may not appear translated strings
+            num = self.__k
+            return f"select {num} {pl(num,'feature')}"
+        else:
+            perc = self.__p
+            return f"select {perc} % features"
+
 
 def index_to_enum(enum, i):
     """Enums, by default, are not int-comparable, so use an ad-hoc mapping of
@@ -978,7 +996,8 @@ class PreprocessAction:
 
 
 def icon_path(basename):
-    return pkg_resources.resource_filename(__name__, "icons/" + basename)
+    path = importlib.resources.files(__package__).joinpath("icons/" + basename)
+    return str(path)
 
 
 PREPROCESS_ACTIONS = [
@@ -1070,8 +1089,8 @@ class OWPreprocess(widget.OWWidget, openclass=True):
     description = "Construct a data preprocessing pipeline."
     category = "Transform"
     icon = "icons/Preprocess.svg"
-    priority = 2105
-    keywords = ["process"]
+    priority = 2100
+    keywords = "preprocess, process"
 
     settings_version = 2
 
@@ -1163,6 +1182,10 @@ class OWPreprocess(widget.OWWidget, openclass=True):
 
         gui.auto_apply(self.buttonsArea, self, "autocommit")
 
+        self.__update_size_constraint_timer = QTimer(
+            self, singleShot=True, interval=0,
+        )
+        self.__update_size_constraint_timer.timeout.connect(self.__update_size_constraint)
         self._initialize()
 
     def _initialize(self):
@@ -1352,8 +1375,7 @@ class OWPreprocess(widget.OWWidget, openclass=True):
 
     def eventFilter(self, receiver, event):
         if receiver is self.flow_view and event.type() == QEvent.LayoutRequest:
-            QTimer.singleShot(0, self.__update_size_constraint)
-
+            self.__update_size_constraint_timer.start()
         return super().eventFilter(receiver, event)
 
     def storeSpecificSettings(self):

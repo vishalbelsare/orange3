@@ -244,7 +244,6 @@ class TreeGraphicsView(QGraphicsView):
         self.setFocusPolicy(Qt.WheelFocus)
         self.setRenderHint(QPainter.Antialiasing)
         self.setRenderHint(QPainter.TextAntialiasing)
-        self.setRenderHint(QPainter.HighQualityAntialiasing)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -370,7 +369,7 @@ class OWTreeViewer2D(OWWidget, openclass=True):
     _DEF_NODE_WIDTH = 24
     _DEF_NODE_HEIGHT = 20
 
-    graph_name = "scene"
+    graph_name = "scene"  # QGraphicsScene (TreeGraphicsScene)
 
     def __init__(self):
         super().__init__()
@@ -404,7 +403,7 @@ class OWTreeViewer2D(OWWidget, openclass=True):
             "Depth: ",
             gui.comboBox(box, self, 'max_tree_depth',
                          items=["Unlimited"] + [
-                             "{} levels".format(x) for x in range(2, 10)],
+                             f"{x} levels" for x in range(2, 10)],
                          addToLayout=False, sendSelectedValue=False,
                          callback=self.toggle_tree_depth, sizePolicy=policy))
         layout.addRow(
@@ -418,6 +417,10 @@ class OWTreeViewer2D(OWWidget, openclass=True):
 
         self.scene = TreeGraphicsScene(self)
         self.scene_view = TreeGraphicsView(self.scene)
+        self.scene_view.setStyleSheet("""QToolTip { padding: 3px;
+                                                    border: 1px solid #C0C0C0;
+                                      }""")
+
         self.scene_view.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
         self.mainArea.layout().addWidget(self.scene_view)
         self.toggle_zoom_slider()

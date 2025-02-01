@@ -2,13 +2,13 @@
 # pylint: disable=all
 import pickle
 import unittest
-from itertools import product
+from functools import partial
+from itertools import product, chain
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
 import numpy as np
 from numpy.testing import assert_array_equal
-import pandas as pd
 
 from AnyQt.QtCore import QItemSelectionModel, Qt, QItemSelection, QPoint
 from AnyQt.QtGui import QPalette, QColor, QHelpEvent
@@ -16,6 +16,7 @@ from AnyQt.QtWidgets import QAction, QComboBox, QLineEdit, \
     QStyleOptionViewItem, QDialog, QMenu, QToolTip, QListView
 from AnyQt.QtTest import QTest, QSignalSpy
 
+from orangewidget.settings import Context
 from orangewidget.tests.utils import simulate
 
 from Orange.data import (
@@ -32,13 +33,15 @@ from Orange.widgets.data.oweditdomain import (
     AsString, AsCategorical, AsContinuous, AsTime,
     table_column_data, ReinterpretVariableEditor, CategoricalVector,
     VariableEditDelegate, TransformRole,
-    RealVector, TimeVector, StringVector, make_dict_mapper, DictMissingConst,
-    LookupMappingTransform, as_float_or_nan, column_str_repr, time_parse,
-    GroupItemsDialog, VariableListModel
+    RealVector, TimeVector, StringVector, make_dict_mapper,
+    LookupMappingTransform, as_float_or_nan, column_str_repr,
+    GroupItemsDialog, VariableListModel, StrpTime, RestoreOriginal, BaseEditor,
+    RestoreWarningRole
 )
 from Orange.widgets.data.owcolor import OWColor, ColorRole
 from Orange.widgets.tests.base import WidgetTest, GuiTest
 from Orange.widgets.tests.utils import contextMenu
+from Orange.widgets.utils.itemmodels import select_row
 from Orange.widgets.utils import colorpalettes
 from Orange.tests import test_filename, assert_array_nanequal
 
@@ -47,26 +50,26 @@ MArray = np.ma.MaskedArray
 
 class TestReport(TestCase):
     def test_rename(self):
-        var = Real("X", (-1, ""), (), False)
+        var = Real("X", (-1, ""), ())
         tr = Rename("Y")
         val = report_transform(var, [tr])
         self.assertIn("X", val)
         self.assertIn("Y", val)
 
     def test_annotate(self):
-        var = Real("X", (-1, ""), (("a", "1"), ("b", "z")), False)
+        var = Real("X", (-1, ""), (("a", "1"), ("b", "z")))
         tr = Annotate((("a", "2"), ("j", "z")))
         r = report_transform(var, [tr])
         self.assertIn("a", r)
         self.assertIn("b", r)
 
     def test_unlinke(self):
-        var = Real("X", (-1, ""), (("a", "1"), ("b", "z")), True)
+        var = Real("X", (-1, ""), (("a", "1"), ("b", "z")))
         r = report_transform(var, [Unlink()])
         self.assertIn("unlinked", r)
 
     def test_categories_mapping(self):
-        var = Categorical("C", ("a", "b", "c"), (), False)
+        var = Categorical("C", ("a", "b", "c"), ())
         tr = CategoriesMapping(
             (("a", "aa"),
              ("b", None),
@@ -80,7 +83,7 @@ class TestReport(TestCase):
         self.assertIn("<s>", r)
 
     def test_categorical_merge_mapping(self):
-        var = Categorical("C", ("a", "b1", "b2"), (), False)
+        var = Categorical("C", ("a", "b1", "b2"), ())
         tr = CategoriesMapping(
             (("a", "a"),
              ("b1", "b"),
@@ -91,7 +94,7 @@ class TestReport(TestCase):
         self.assertIn('b', r)
 
     def test_reinterpret(self):
-        var = String("T", (), False)
+        var = String("T", ())
         for tr in (AsContinuous(), AsCategorical(), AsTime()):
             t = report_transform(var, [tr])
             self.assertIn("→ (", t)
@@ -179,14 +182,14 @@ class TestOWEditDomain(WidgetTest):
     def test_input_from_owcolor(self):
         """Check widget's data sent from OWColor widget"""
         owcolor = self.create_widget(OWColor)
-        self.send_signal("Data", self.iris, widget=owcolor)
+        self.send_signal(owcolor.Inputs.data, self.iris)
         disc_model = owcolor.disc_model
         disc_model.setData(disc_model.index(0, 1), (1, 2, 3), ColorRole)
         cont_model = owcolor.cont_model
         palette = list(colorpalettes.ContinuousPalettes.values())[-1]
         cont_model.setData(cont_model.index(1, 1), palette, ColorRole)
-        owcolor_output = self.get_output("Data", owcolor)
-        self.send_signal("Data", owcolor_output)
+        owcolor_output = self.get_output(owcolor.Outputs.data)
+        self.send_signal(owcolor_output)
         self.assertEqual(self.widget.data, owcolor_output)
         np.testing.assert_equal(self.widget.data.domain.class_var.colors[0],
                                 (1, 2, 3))
@@ -273,7 +276,7 @@ class TestOWEditDomain(WidgetTest):
         output = self.get_output(self.widget.Outputs.data)
         self.assertIsInstance(output, Table)
 
-    def test_unlink(self):
+    def test_unlink_inherited(self):
         var0, var1, var2 = [ContinuousVariable("x", compute_value=Mock()),
                             ContinuousVariable("y", compute_value=Mock()),
                             ContinuousVariable("z")]
@@ -285,7 +288,6 @@ class TestOWEditDomain(WidgetTest):
         for i in range(3):
             self.widget.domain_view.setCurrentIndex(index(i))
             editor = self.widget.findChild(ContinuousVariableEditor)
-            self.assertIs(editor.unlink_var_cb.isEnabled(), i < 2)
             editor._set_unlink(i == 1)
 
         self.widget.commit()
@@ -298,6 +300,31 @@ class TestOWEditDomain(WidgetTest):
         self.assertIsNotNone(out0.compute_value)
         self.assertIsNone(out1.compute_value)
         self.assertIsNone(out2.compute_value)
+
+    def test_unlink_forward(self):
+        var0, var1, var2, var3 = [ContinuousVariable("x", compute_value=Mock()),
+                                  ContinuousVariable("y", compute_value=Mock()),
+                                  ContinuousVariable("z"),
+                                  ContinuousVariable("w")]
+        domain = Domain([var0, var1, var2, var3], None)
+        table = Table.from_numpy(domain, np.zeros((5, 4)), np.zeros((5, 0)))
+        self.send_signal(self.widget.Inputs.data, table)
+
+        index = self.widget.domain_view.model().index
+        for i in [0, 2, 3]:
+            self.widget.domain_view.setCurrentIndex(index(i))
+            editor = self.widget.findChild(ContinuousVariableEditor)
+            editor.name_edit.setText(f"v{i}")
+            editor.on_name_changed()
+            editor._set_unlink(i != 3)
+
+        self.widget.commit()
+        out = self.get_output(self.widget.Outputs.data)
+        out0, out1, out2, out3 = out.domain.variables
+        self.assertIsNone(out0.compute_value)
+        self.assertIsNotNone(out1.compute_value)
+        self.assertIsNone(out2.compute_value)
+        self.assertIsNotNone(out3.compute_value)
 
     def test_time_variable_preservation(self):
         """Test if time variables preserve format specific attributes"""
@@ -319,13 +346,12 @@ class TestOWEditDomain(WidgetTest):
         iris = self.iris
         viris = (
             "Categorical",
-            ("iris", ("Iris-setosa", "Iris-versicolor", "Iris-virginica"), (),
-             False)
+            ("iris", ("Iris-setosa", "Iris-versicolor", "Iris-virginica"), ())
         )
         w = self.widget
 
         def restore(state):
-            w._domain_change_store = state
+            w._domain_change_hints = state
             w._restore()
 
         model = w.variables_model
@@ -338,13 +364,326 @@ class TestOWEditDomain(WidgetTest):
         tr = model.data(model.index(4), TransformRole)
         self.assertEqual(tr, [AsString(), Rename("Z")])
 
+        restore({viris: [("CategoriesMapping", ([("Iris-setosa", "setosa"),
+                                                 ("Iris-versicolor", "versicolor"),
+                                                 ("Iris-virginica", "virginica")],)),
+                         ("Rename", ("Species",))]})
+        tr = model.data(model.index(4), TransformRole)
+        self.assertEqual(tr, [CategoriesMapping([("Iris-setosa", "setosa"),
+                                                 ("Iris-versicolor", "versicolor"),
+                                                 ("Iris-virginica", "virginica")]),
+                              Rename("Species")])
+
+        viris_1 = ("Categorical", ("iris", ("A", "B"), ()))
+        restore({viris_1: [("Rename", ("K",),),
+                           ("CategoriesMapping", ([("A", "AA"), ("B", "BB")],))]})
+        self.assertTrue(w.Warning.cat_mapping_does_not_apply.is_shown())
+        w.commit()
+        output = self.get_output(w.Outputs.data)
+        self.assertEqual(output.domain.class_var.name, "K")
+        self.assertEqual(output.domain.class_var.values,
+                         ("Iris-setosa", "Iris-versicolor", "Iris-virginica"))
+
+        restore({viris_1: [("Rename", ("K",),),
+                           ("CategoriesMapping", ([("A", "AA")],))]})
+        self.assertTrue(w.Warning.cat_mapping_does_not_apply.is_shown())
+        w.reset_all()
+        self.assertFalse(w.Warning.cat_mapping_does_not_apply.is_shown())
+
+        select_row(w.variables_view, 4)
+        w.reset_selected()
+        self.assertFalse(w.Warning.cat_mapping_does_not_apply.is_shown())
+
+        restore({viris: [("Rename", ("A")), ("NonexistantTransform", ("AA",))]})
+        tr = model.data(model.index(4), TransformRole)
+        self.assertEqual(tr, [Rename("A")])
+        self.assertTrue(w.Warning.transform_restore_failed.is_shown())
+
+    def test_reset_selected(self):
+        w = self.widget
+        model = w.domain_view.model()
+        sel_model = w.domain_view.selectionModel()
+
+        self.send_signal(self.iris)
+        model.setData(model.index(1, 0), [Rename("foo")], TransformRole)
+        model.setData(model.index(2, 0), [AsCategorical()], TransformRole)
+        model.setData(model.index(3, 0), [Rename("bar")], TransformRole)
+        w.commit()
+        out = self.get_output()
+        self.assertEqual([var.name for var in out.domain.attributes],
+                         ["sepal length", "foo", "petal length", "bar"])
+        self.assertIsInstance(out.domain[2], DiscreteVariable)
+
+        sel_model.select(model.index(0, 0), QItemSelectionModel.Select)
+        sel_model.select(model.index(2, 0), QItemSelectionModel.Select)
+        sel_model.select(model.index(3, 0), QItemSelectionModel.Select)
+        w.reset_selected()
+        w.commit()
+        out = self.get_output()
+        self.assertEqual([var.name for var in out.domain.attributes],
+                         ["sepal length", "foo", "petal length", "petal width"])
+        self.assertIsInstance(out.domain[2], ContinuousVariable)
+
+    @patch("Orange.widgets.data.oweditdomain.ReinterpretVariableEditor.set_data")
+    def test_selection_sets_data(self, set_data):
+        w = self.widget
+        model = w.domain_view.model()
+        sel_model = w.domain_view.selectionModel()
+        tr = (Rename("x"), )
+
+        iris = self.iris
+
+        self.send_signal(iris)
+        model.setData(model.index(1, 0), tr, TransformRole)
+
+        sel_model.select(model.index(1, 0), QItemSelectionModel.ClearAndSelect)
+        args, kwargs = set_data.call_args
+        self.assertEqual(len(args), 1)
+        self.assertEqual(len(args[0]), 1)
+        self.assertEqual(args[0][0].vtype.name, iris.domain[1].name)
+        self.assertEqual(kwargs["transforms"], [tr])
+
+        sel_model.select(model.index(2, 0), QItemSelectionModel.Select)
+        args, kwargs = set_data.call_args
+        self.assertEqual(len(args), 1)
+        self.assertEqual(len(args[0]), 2)
+        self.assertEqual(args[0][0].vtype.name, iris.domain[1].name)
+        self.assertEqual(args[0][1].vtype.name, iris.domain[2].name)
+        self.assertEqual(kwargs["transforms"], [tr, ()])
+
+    def test_selection_after_new_data(self):
+        w = self.widget
+        model = w.domain_view.model()
+        sel_model = w.domain_view.selectionModel()
+        iris = self.iris
+        attrs = iris.domain.attributes
+
+        self.send_signal(iris.transform(Domain(attrs[:3])))
+        sel_model.select(model.index(1, 0), QItemSelectionModel.ClearAndSelect)
+        sel_model.select(model.index(2, 0), QItemSelectionModel.Select)
+        # Select #1 and #2, out of attributes 0, 1, 2
+        self.assertEqual(w.selected_var_indices(), [1, 2])
+
+        # Send attributes 1, 2, 3; #0 and #1 must be selected
+        self.send_signal(iris.transform(Domain(attrs[1:])))
+        self.assertEqual(w.selected_var_indices(), [0, 1])
+
+        # Now send 0 and 2; only #1 (2) must be selected
+        self.send_signal(iris.transform(Domain([attrs[0], attrs[2]])))
+        self.assertEqual(w.selected_var_indices(), [1])
+
+        # Send 0 and 3, first must be selected by default
+        self.send_signal(iris.transform(Domain([attrs[0], attrs[3]])))
+        self.assertEqual(w.selected_var_indices(), [0])
+
+        # Send 1 and 2; first is selected by default
+        self.send_signal(iris.transform(Domain([attrs[1], attrs[2]])))
+        self.assertEqual(w.selected_var_indices(), [0])
+
+    def test_hint_keeping(self):
+        editor: ContinuousVariableEditor = self.widget.findChild(ContinuousVariableEditor)
+        name_edit = editor.name_edit
+        model = self.widget.domain_view.model()
+
+        def rename(fr, to):
+            for idx in range(fr, to):
+                self.widget.domain_view.setCurrentIndex(model.index(idx))
+                cur_text = name_edit.text()
+                if cur_text[0] != "x":
+                    name_edit.setText("x" + cur_text)
+                editor.on_name_changed()
+
+        def data(fr, to):
+            return Table.from_numpy(Domain(vars[fr:to]),
+                                    np.zeros((1, to - fr)))
+
+
+        vars = [ContinuousVariable(f"v{i}") for i in range(1020)]
+        self.send_signal(data(0, 5))
+        rename(2, 4)
+
+        self.send_signal(None)
+        self.assertIsNone(self.get_output())
+
+        self.send_signal(data(3, 7))
+        outp = self.get_output()
+        self.assertEqual([var.name for var in outp.domain.attributes],
+                         ["xv3", "v4", "v5", "v6"])
+
+        self.send_signal(data(0, 5))
+        outp = self.get_output()
+        self.assertEqual([var.name for var in outp.domain.attributes],
+                         ["v0", "v1", "xv2", "xv3", "v4"])
+
+        self.send_signal(data(3, 7))
+        outp = self.get_output()
+        self.assertEqual([var.name for var in outp.domain.attributes],
+                         ["xv3", "v4", "v5", "v6"])
+
+        # This is too large: widget should retain just hints related to
+        # the current data
+        self.send_signal(data(3, 1020))
+        outp = self.get_output()
+        self.assertEqual([var.name for var in outp.domain.attributes[:4]],
+                         ["xv3", "v4", "v5", "v6"])
+        rename(5, 1017)
+        self.widget.commit()
+        outp = self.get_output()
+        self.assertEqual([var.name for var in outp.domain.attributes[-3:]],
+                         ["xv1017", "xv1018", "xv1019"])
+
+        self.send_signal(None)
+        self.assertIsNone(self.get_output())
+
+        # Tests that hints for the current data are kept
+        # - including the earliest (v3) and latest (v1019)
+        self.send_signal(data(3, 1020))
+        outp = self.get_output()
+        self.assertEqual([var.name for var in outp.domain.attributes[:4]],
+                         ["xv3", "v4", "v5", "v6"])
+        self.assertEqual([var.name for var in outp.domain.attributes[-3:]],
+                         ["xv1017", "xv1018", "xv1019"])
+
+        # Tests that older hints are dropped: v2 should be lost
+        self.send_signal(data(0, 5))
+        outp = self.get_output()
+        self.assertEqual([var.name for var in outp.domain.attributes],
+                         ["v0", "v1", "v2", "xv3", "v4"])
+
+    def test_migrate_settings_hints_2_to_4(self):
+        settings = {
+            '__version__': 2,
+            'context_settings':
+                [Context(values={
+                    '_domain_change_store': (
+                        {('Categorical', ('a', ('mir1', 'mir4', 'mir2'), (), False)):
+                            [('Rename', ('disease mir',))],
+                         ('Categorical', ('b', ('mir4', 'mir1', 'mir2'), (), False)):
+                             [('Rename', ('disease mirs',))]
+                         },
+                        -2),
+                    '_merge_dialog_settings': ({}, -4),
+                    '_selected_item': (('1', 0), -2),
+                    'output_table_name': ('boo', -2),
+                    '__version__': 2}),
+                 Context(values={
+                     '_domain_change_store': (
+                         {('Categorical', ('b', ('mir4', 'mir1', 'mir2'), (), False)):
+                             [('Rename', ('disease bmir',))],
+                          ('Categorical', ('c', ('mir4', 'mir1', 'mir2'), (), False)):
+                              [('Rename', ('disease mirs',))]
+                         },
+                         -2),
+                      '_merge_dialog_settings': ({}, -4),
+                      '_selected_item': (('1', 0), -2),
+                      'output_table_name': ('far', -2),
+                      '__version__': 2}),
+                ]}
+        migrated_hints = {
+            ('Categorical', ('b', ('mir4', 'mir1', 'mir2'), ())):
+                [('Rename', ('disease bmir',))],
+            ('Categorical', ('c', ('mir4', 'mir1', 'mir2'), ())):
+                [('Rename', ('disease mirs',))],
+            ('Categorical', ('a', ('mir1', 'mir4', 'mir2'), ())):
+                 [('Rename', ('disease mir',))],
+        }
+        widget = self.create_widget(OWEditDomain, stored_settings=settings)
+        self.assertEqual(widget._domain_change_hints, migrated_hints)
+        # order matters
+        self.assertEqual(list(widget._domain_change_hints), list(migrated_hints))
+        self.assertEqual(widget.output_table_name, "far")
+
+    def test_migrate_settings_2_to_4_realworld(self):
+        settings = {
+            'controlAreaVisible': True,
+            '__version__': 2,
+            'context_settings': [Context(
+                values={
+                    '_domain_change_store':
+                        ({('Real', ('sepal length', (1, 'f'), (), False)):
+                              [('AsString', ())],
+                          ('Real', ('sepal width', (1, 'f'), (), False)):
+                              [('AsTime', ()), ('StrpTime', ('Detect automatically', None, 1, 1))],
+                          ('Real', ('petal width', (1, 'f'), (), False)):
+                              [('Annotate', ((('a', 'b'),),))]}, -2),
+                    '_merge_dialog_settings': ({}, -4),
+                    '_selected_item': (('petal width', 2), -2),
+                    'output_table_name': ('', -2),
+                    '__version__': 2},
+                attributes={'sepal length': 2, 'sepal width': 2,
+                            'petal length': 2, 'petal width': 2, 'iris': 1},
+                metas={}
+            )]
+        }
+        widget = self.create_widget(OWEditDomain, stored_settings=settings)
+        self.assertEqual(
+            widget._domain_change_hints,
+            {('Real', ('sepal length', (1, 'f'), ())):
+                 [('AsString', ())],
+             ('Real', ('sepal width', (1, 'f'), ())):
+                 [('AsTime', ()),
+                  ('StrpTime', ('Detect automatically', None, 1, 1))],
+             ('Real', ('petal width', (1, 'f'), ())):
+                 [('Annotate', ((('a', 'b'),),))]}
+        )
+
+    def test_migrate_settings_name_2_to_3(self):
+        settings = {
+            '__version__': 2,
+            'context_settings':
+                [Context(values={
+                    '_domain_change_store': ({}, -2),
+                     'output_table_name': ('boo', -2),
+                     '__version__': 2}),
+                 Context(values={
+                     '_domain_change_store': ({}, -2),
+                     'output_table_name': ('far', -2),
+                     '__version__': 2}),
+                 Context(values={
+                     '_domain_change_store': ({}, -2),
+                     'output_table_name': ('', -2),
+                     '__version__': 2}),
+                 Context(values={
+                     '_domain_change_store': ({}, -2),
+                     '__version__': 2})
+                ]
+        }
+        widget = self.create_widget(OWEditDomain, stored_settings=settings)
+        self.assertEqual(widget.output_table_name, "far")
+
+    def test_migrate_settings_3_to_4(self):
+        settings = {
+            '_domain_change_hints': {
+                ('Real', ('age', (0, 'f'), (), False)):
+                    [('Unlink', ())],
+                ('Categorical', ('gender', ('female', 'male'), (), False)):
+                    [('CategoriesMapping', ([('female', 'woman'), ('male', 'man')],))],
+                ('Categorical', ('chest pain', ('asymptomatic', 'atypical ang',
+                                                'non-anginal', 'typical ang'), (), False)):
+                    [('AsString', ())]},
+            '_merge_dialog_settings': {},
+            'controlAreaVisible': True}
+
+        widget = self.create_widget(OWEditDomain, stored_settings=settings)
+        self.assertEqual(
+            widget._domain_change_hints,
+            {('Real', ('age', (0, 'f'), ())):
+                    [('Unlink', ())],
+             ('Categorical', ('gender', ('female', 'male'), ())):
+                    [('CategoriesMapping',
+                      ([('female', 'woman'), ('male', 'man')],))],
+             ('Categorical', ('chest pain', ('asymptomatic', 'atypical ang',
+                                             'non-anginal', 'typical ang'), ())):
+                    [('AsString', ())]}
+        )
+
 
 class TestEditors(GuiTest):
     def test_variable_editor(self):
         w = VariableEditor()
         self.assertEqual(w.get_data(), (None, []))
 
-        v = String("S", (("A", "1"), ("B", "b")), False)
+        v = String("S", (("A", "1"), ("B", "b")))
         w.set_data(v, [])
 
         self.assertEqual(w.name_edit.text(), v.name)
@@ -369,7 +708,7 @@ class TestEditors(GuiTest):
         w = ContinuousVariableEditor()
         self.assertEqual(w.get_data(), (None, []))
 
-        v = Real("X", (-1, ""), (("A", "1"), ("B", "b")), False)
+        v = Real("X", (-1, ""), (("A", "1"), ("B", "b")))
         w.set_data(v, [])
 
         self.assertEqual(w.name_edit.text(), v.name)
@@ -384,7 +723,7 @@ class TestEditors(GuiTest):
         w = DiscreteVariableEditor()
         self.assertEqual(w.get_data(), (None, []))
 
-        v = Categorical("C", ("a", "b", "c"), (("A", "1"), ("B", "b")), False)
+        v = Categorical("C", ("a", "b", "c"), (("A", "1"), ("B", "b")))
         values = [0, 0, 0, 1, 1, 2]
         w.set_data_categorical(v, values)
 
@@ -436,7 +775,7 @@ class TestEditors(GuiTest):
     def test_discrete_editor_add_remove_action(self):
         w = DiscreteVariableEditor()
         v = Categorical("C", ("a", "b", "c"),
-                        (("A", "1"), ("B", "b")), False)
+                        (("A", "1"), ("B", "b")))
         values = [0, 0, 0, 1, 1, 2]
         w.set_data_categorical(v, values)
         action_add = w.add_new_item
@@ -484,7 +823,7 @@ class TestEditors(GuiTest):
         """
         w = DiscreteVariableEditor()
         v = Categorical("C", ("a", "b", "c"),
-                        (("A", "1"), ("B", "b")), False)
+                        (("A", "1"), ("B", "b")))
 
         w.set_data_categorical(
             v, [0, 0, 0, 1, 1, 2],
@@ -514,7 +853,7 @@ class TestEditors(GuiTest):
     def test_discrete_editor_rename_selected_items_action(self):
         w = DiscreteVariableEditor()
         v = Categorical("C", ("a", "b", "c"),
-                        (("A", "1"), ("B", "b")), False)
+                        (("A", "1"), ("B", "b")))
         w.set_data_categorical(v, [])
         action = w.rename_selected_items
         view = w.values_edit
@@ -541,7 +880,7 @@ class TestEditors(GuiTest):
     def test_discrete_editor_context_menu(self):
         w = DiscreteVariableEditor()
         v = Categorical("C", ("a", "b", "c"),
-                        (("A", "1"), ("B", "b")), False)
+                        (("A", "1"), ("B", "b")))
         w.set_data_categorical(v, [])
         view = w.values_edit
         model = view.model()
@@ -559,7 +898,7 @@ class TestEditors(GuiTest):
         w = TimeVariableEditor()
         self.assertEqual(w.get_data(), (None, []))
 
-        v = Time("T", (("A", "1"), ("B", "b")), False)
+        v = Time("T", (("A", "1"), ("B", "b")))
         w.set_data(v,)
 
         self.assertEqual(w.name_edit.text(), v.name)
@@ -572,78 +911,240 @@ class TestEditors(GuiTest):
 
     DataVectors = [
         CategoricalVector(
-            Categorical("A", ("a", "aa"), (), False), lambda:
+            Categorical("A", ("a", "aa"), ()), lambda:
                 MArray([0, 1, 2], mask=[False, False, True])
         ),
         RealVector(
-            Real("B", (6, "f"), (), False), lambda:
+            Real("B", (6, "f"), ()), lambda:
                 MArray([0.1, 0.2, 0.3], mask=[True, False, True])
         ),
         TimeVector(
-            Time("T", (), False), lambda:
+            Time("T", ()), lambda:
                 MArray([0, 100, 200], dtype="M8[us]", mask=[True, False, True])
         ),
         StringVector(
-            String("S", (), False), lambda:
+            String("S", ()), lambda:
                 MArray(["0", "1", "2"], dtype=object, mask=[True, False, True])
         ),
     ]
     ReinterpretTransforms = {
-        Categorical: AsCategorical, Real: AsContinuous, Time: AsTime,
-        String: AsString
+        Categorical: [AsCategorical], Real: [AsContinuous],
+        Time: [AsTime, partial(StrpTime, 'Detect automatically', None, 1, 1)],
+        String: [AsString]
     }
 
     def test_reinterpret_editor(self):
         w = ReinterpretVariableEditor()
-        self.assertEqual(w.get_data(), (None, []))
+        self.assertEqual(w.get_data(), ((None, ), ([], )))
         data = self.DataVectors[0]
-        w.set_data(data, )
-        self.assertEqual(w.get_data(), (data.vtype, []))
-        w.set_data(data, [Rename("Z")])
-        self.assertEqual(w.get_data(), (data.vtype, [Rename("Z")]))
+        w.set_data((data, ))
+        self.assertEqual(w.get_data(), ((data.vtype, ), ([], )))
+        w.set_data((data, ), ([Rename("Z")], ))
+        self.assertEqual(w.get_data(), ((data.vtype, ), ([Rename("Z")], )))
 
         for vec, tr in product(self.DataVectors, self.ReinterpretTransforms.values()):
-            w.set_data(vec, [tr()])
+            w.set_data((vec, ), ([t() for t in tr], ))
             v, tr_ = w.get_data()
-            self.assertEqual(v, vec.vtype)
-            if not tr_:
-                self.assertEqual(tr, self.ReinterpretTransforms[type(v)])
+            self.assertEqual(*v, vec.vtype)
+            if not tr_[0]:
+                self.assertEqual(tr, self.ReinterpretTransforms[type(*v)])
             else:
-                self.assertEqual(tr_, [tr()])
+                self.assertListEqual(*tr_, [t() for t in tr])
 
     def test_reinterpret_editor_simulate(self):
         w = ReinterpretVariableEditor()
-        tc = w.findChild(QComboBox, name="type-combo")
 
         def cb():
             var, tr = w.get_data()
+            var, tr = var[0], tr[0]
             type_ = tc.currentData()
             if type_ is not type(var):
-                self.assertEqual(tr, [self.ReinterpretTransforms[type_](), Rename("Z")])
+                self.assertEqual(
+                    tr, [t() for t in self.ReinterpretTransforms[type_]] + [Rename("Z")]
+                )
             else:
                 self.assertEqual(tr, [Rename("Z")])
 
         for vec in self.DataVectors:
-            w.set_data(vec, [Rename("Z")])
+            w.set_data((vec, ), ([Rename("Z")], ))
+            tc = w.layout().currentWidget().findChild(QComboBox,
+                                                      name="type-combo")
             simulate.combobox_run_through_all(tc, callback=cb)
+
+    def test_multiple_editor_init(self):
+        w = ReinterpretVariableEditor()
+        w.set_data(self.DataVectors, [()] * 4)
+        cw = w.layout().currentWidget()
+        tc = cw.findChild(QComboBox, name="type-combo")
+        self.assertIs(type(cw), BaseEditor)
+        self.assertEqual(tc.count(), 6)
+
+        w.set_data(self.DataVectors[:1], [()])
+        cw = w.layout().currentWidget()
+        tc = cw.findChild(QComboBox, name="type-combo")
+        self.assertIsNot(type(cw), BaseEditor)
+        self.assertEqual(tc.count(), 4)
+
+    def test_reinterpret_set_data_multiple_transforms(self):
+        w = ReinterpretVariableEditor()
+
+        w.set_data((Mock(), ) * 4,
+                   [[AsContinuous()] for _ in range(4)])
+        cw = w.layout().currentWidget()
+        self.assertIs(type(cw), BaseEditor)
+        tc = cw.findChild(QComboBox, name="type-combo")
+
+        self.assertIsInstance(
+            w.__dict__["_ReinterpretVariableEditor__transform"],
+            AsContinuous)
+        self.assertEqual(tc.currentData(), Real)
+
+        w.set_data((Mock(), ) * 3,
+                   [[AsContinuous(), Rename("x")],
+                    [AsContinuous(), Rename("y")],
+                    [AsContinuous()]
+                    ]
+                   )
+        self.assertIsInstance(
+            w.__dict__["_ReinterpretVariableEditor__transform"],
+            AsContinuous)
+        self.assertEqual(tc.currentData(), Real)
+
+        w.set_data((Mock(), ) * 3,
+                   [[AsContinuous(), Rename("x")],
+                    [Rename("y")],
+                    [AsContinuous()]
+                    ]
+                   )
+        self.assertIsNone(w.__dict__["_ReinterpretVariableEditor__transform"])
+        self.assertIsNone(tc.currentData())
+
+        w.set_data((Mock(), ) * 3,
+                   [[AsContinuous(), Rename("x")],
+                    [],
+                    [AsContinuous()]
+                    ]
+                   )
+        self.assertIsNone(w.__dict__["_ReinterpretVariableEditor__transform"])
+        self.assertIsNone(tc.currentData())
+
+        w.set_data((Mock(),) * 3,
+                   [[AsContinuous(), Rename("x")],
+                    [AsTime()],
+                    [AsContinuous()]
+                    ]
+                   )
+        self.assertIsNone(w.__dict__["_ReinterpretVariableEditor__transform"])
+        self.assertIsNone(tc.currentData())
+
+    def test_reinterpret_multiple(self):
+        def cb():
+            for var, tr, v in zip(*w.get_data(), "SPQR"):
+                type_ = tc.currentData()
+                if type_ is not type(var) \
+                        and type_ not in (RestoreOriginal, None):
+                    self.assertSequenceEqual(
+                        tr, [t() for t in self.ReinterpretTransforms[type_][:1]]
+                            + [Rename(v)],
+                        f"type: {type_}"
+                    )
+                else:
+                    self.assertSequenceEqual(tr, (Rename(v), ), f"type: {type_}")
+
+        w = ReinterpretVariableEditor()
+        w.set_data(self.DataVectors, tuple([Rename(c)] for c in "SPQR"))
+        tc = w.layout().currentWidget().findChild(QComboBox, name="type-combo")
+        simulate.combobox_run_through_all(tc, callback=cb)
+
+    def test_reinterpret_remove_specific(self):
+        def cb():
+            for var, tr, v in zip(*w.get_data(), "SPQR"):
+                type_ = tc.currentData()
+                if type_ is not type(var) \
+                        and type_ not in (RestoreOriginal, None):
+                    self.assertSequenceEqual(
+                        tr, [t() for t in self.ReinterpretTransforms[type_][:1]]
+                            + [Rename(v)],
+                        f"type: {type_}"
+                    )
+                else:
+                    self.assertSequenceEqual(tr, (Rename(v), ), f"type: {type_}")
+
+        w = ReinterpretVariableEditor()
+        transforms = (
+            [CategoriesMapping([("a", "b")])],
+            [AsCategorical(), Rename("xx")],
+            [AsCategorical(), CategoriesMapping([("c", "d")])])
+        w.set_data(self.DataVectors[:3], transforms)
+        tc = w.layout().currentWidget().findChild(QComboBox, name="type-combo")
+
+        tc.setCurrentIndex(0)  # Categorical
+        tc.activated[int].emit(0)
+        self.assertSequenceEqual(w.get_data()[1], transforms)
+
+        tc.setCurrentIndex(1)  # Numeric
+        tc.activated[int].emit(1)
+        self.assertEqual(w.get_data()[1],
+                         [[AsContinuous()],
+                          [Rename("xx")],
+                          [AsContinuous()]])
+
+        tc.setCurrentIndex(4)  # Restore original
+        tc.activated[int].emit(4)
+        self.assertEqual(w.get_data()[1],
+                         [[CategoriesMapping([("a", "b")])],
+                          [Rename("xx")],
+                          []])
+
+        tc.setCurrentIndex(5)  # None
+        tc.activated[int].emit(5)
+        self.assertSequenceEqual(w.get_data()[1], transforms)
+
+        # We don't have this situation, but simulate a situation in which the
+        # target type has the same (specific) transformation
+        with patch.dict(w.Specific, {Real: (CategoriesMapping, )}):
+            tc.setCurrentIndex(1)  # Numeric
+            tc.activated[int].emit(1)
+            self.assertSequenceEqual(
+                w.get_data()[1],
+                ([AsContinuous(), CategoriesMapping([("a", "b")])],
+                 [Rename("xx")],
+                 [AsContinuous(), CategoriesMapping([("c", "d")])]
+                 )
+            )
+
+    def test_reinterpret_multiple_keep_and_restore(self):
+        w = ReinterpretVariableEditor()
+        transforms = tuple([AsString(), Rename(c)] for c in "SPQR")
+        w.set_data(self.DataVectors, tuple([AsString(), Rename(c)] for c in "SPQR"))
+        tc = w.layout().currentWidget().findChild(QComboBox, name="type-combo")
+
+        tc.setCurrentIndex(4)  # Restore original
+        tc.activated[int].emit(4)
+        self.assertSequenceEqual(
+            [list(tr) for tr in w.get_data()[1]],
+            [[Rename(c)] for c in "SPQR"])
+
+        tc.setCurrentIndex(5)  # Keep
+        tc.activated[int].emit(5)
+        self.assertSequenceEqual(
+            [list(tr) for tr in w.get_data()[1]],
+            transforms)
 
     def test_unlink(self):
         w = ContinuousVariableEditor()
         cbox = w.unlink_var_cb
         self.assertEqual(w.get_data(), (None, []))
 
-        v = Real("X", (-1, ""), (("A", "1"), ("B", "b")), False)
+        v = Real("X", (-1, ""), (("A", "1"), ("B", "b")))
         w.set_data(v, [])
-        self.assertFalse(cbox.isEnabled())
 
-        v = Real("X", (-1, ""), (("A", "1"), ("B", "b")), True)
+        v = Real("X", (-1, ""), (("A", "1"), ("B", "b")))
         w.set_data(v, [Unlink()])
-        self.assertTrue(cbox.isEnabled())
         self.assertTrue(cbox.isChecked())
 
-        v = Real("X", (-1, ""), (("A", "1"), ("B", "b")), True)
+        v = Real("X", (-1, ""), (("A", "1"), ("B", "b")))
         w.set_data(v, [])
-        self.assertTrue(cbox.isEnabled())
         self.assertFalse(cbox.isChecked())
 
         cbox.setChecked(True)
@@ -678,8 +1179,8 @@ class TestModels(GuiTest):
             model.setData(model.index(row), data, role)
 
         model[:] = [
-            RealVector(Real("A", (3, "g"), (), False), lambda: MArray([])),
-            RealVector(Real("B", (3, "g"), (), False), lambda: MArray([])),
+            RealVector(Real("A", (3, "g"), ()), lambda: MArray([])),
+            RealVector(Real("B", (3, "g"), ()), lambda: MArray([])),
         ]
         self.assertEqual(data(0, Qt.DisplayRole), "A")
         self.assertEqual(data(1, Qt.DisplayRole), "B")
@@ -705,7 +1206,7 @@ class TestDelegates(GuiTest):
             delegate.initStyleOption(opt, model.index(row))
             return opt
 
-        set_item(0, {Qt.EditRole: Categorical("a", (), (), False)})
+        set_item(0, {Qt.EditRole: Categorical("a", (), ())})
         delegate = VariableEditDelegate()
         opt = get_style_option(0)
         self.assertEqual(opt.text, "a")
@@ -720,7 +1221,7 @@ class TestDelegates(GuiTest):
         self.assertIn("reinterpreted", opt.text)
         self.assertTrue(opt.font.italic())
         set_item(1, {
-            Qt.EditRole: String("b", (), False),
+            Qt.EditRole: String("b", ()),
             TransformRole: [Rename("a")]
         })
         opt = get_style_option(1)
@@ -732,6 +1233,16 @@ class TestDelegates(GuiTest):
                 view, opt, model.index(1),
             )
             p.assert_called_once()
+
+        set_item(1, {
+            TransformRole: Rename("bb"),
+            RestoreWarningRole: ("bb", "aa"),
+        })
+        opt = get_style_option(1)
+        self.assertIn(
+            opt.palette.color(QPalette.Text),
+            (QColor(Qt.yellow), QColor(255, 148, 11))
+        )
 
 
 class TestTransforms(TestCase):
@@ -912,24 +1423,46 @@ class TestReinterpretTransforms(TestCase):
         )
 
     def test_as_time(self):
-        table = self.data
-        domain = table.domain
+        # this test only test type of format that can be string, continuous and discrete
+        # correctness of time formats is already tested in TimeVariable module
+        d = TimeVariable("_").parse_exact_iso
+        times = (
+            ["07.02.2022", "18.04.2021"],  # date only
+            ["07.02.2022 01:02:03", "18.04.2021 01:02:03"],  # datetime
+            # datetime with timezone
+            ["2021-02-08 01:02:03+01:00", "2021-02-07 01:02:03+01:00"],
+            ["010203", "010204"],  # time
+            ["02-07", "04-18"],
+        )
+        formats = [
+            "25.11.2021", "25.11.2021 00:00:00", "2021-11-25 00:00:00", "000000", "11-25"
+        ]
+        expected = [
+            [d("2022-02-07"), d("2021-04-18")],
+            [d("2022-02-07 01:02:03"), d("2021-04-18 01:02:03")],
+            [d("2021-02-08 01:02:03+0100"), d("2021-02-07 01:02:03+0100")],
+            [d("01:02:03"), d("01:02:04")],
+            [d("1900-02-07"), d("1900-04-18")],
+        ]
+        variables = [StringVariable(f"s{i}") for i in range(len(times))]
+        variables += [DiscreteVariable(f"d{i}", values=t) for i, t in enumerate(times)]
+        domain = Domain([], metas=variables)
+        metas = [t for t in times] + [list(range(len(x))) for x in times]
+        table = Table(domain, np.empty((len(times[0]), 0)), metas=np.array(metas).transpose())
 
         tr = AsTime()
         dtr = []
-        for v in domain.variables:
-            vtr = apply_reinterpret(v, tr, table_column_data(table, v))
+        for v, f in zip(domain.metas, chain(formats, formats)):
+            strp = StrpTime(f, *TimeVariable.ADDITIONAL_FORMATS[f])
+            vtr = apply_transform_var(
+                apply_reinterpret(v, tr, table_column_data(table, v)), [strp]
+            )
             dtr.append(vtr)
 
-        ttable = table.transform(Domain(dtr))
+        ttable = table.transform(Domain([], metas=dtr))
         assert_array_equal(
-            ttable.X,
-            np.array([
-                [np.nan, np.nan, 0.25, 180],
-                [np.nan, np.nan, 1.25, 360],
-                [np.nan, np.nan, 0.20, 720],
-                [np.nan, np.nan, 0.00, 000],
-            ], dtype=float)
+            ttable.metas,
+            np.array(list(chain(expected, expected)), dtype=float).transpose()
         )
 
     def test_reinterpret_string(self):
@@ -937,9 +1470,16 @@ class TestReinterpretTransforms(TestCase):
         domain = table.domain
         tvars = []
         for v in domain.metas:
-            for i, tr in enumerate([AsContinuous(), AsCategorical(), AsTime(), AsString()]):
-                tr = apply_reinterpret(v, tr, table_column_data(table, v)).renamed(f'{v.name}_{i}')
-                tvars.append(tr)
+            for i, tr in enumerate(
+                [AsContinuous(), AsCategorical(), AsTime(), AsString()]
+            ):
+                vtr = apply_reinterpret(v, tr, table_column_data(table, v)).renamed(
+                    f"{v.name}_{i}"
+                )
+                if isinstance(tr, AsTime):
+                    strp = StrpTime("Detect automatically", None, 1, 1)
+                    vtr = apply_transform_var(vtr, [strp])
+                tvars.append(vtr)
         tdomain = Domain([], metas=tvars)
         ttable = table.transform(tdomain)
         assert_array_nanequal(
@@ -983,6 +1523,20 @@ class TestReinterpretTransforms(TestCase):
         v = apply_transform(domain.metas[0],table, [])
         self.assertIs(v, domain.metas[0])
 
+    def test_to_time_variable(self):
+        table = self.data
+        tr = AsTime()
+        dtr = []
+        for v in table.domain:
+            strp = StrpTime("Detect automatically", None, 1, 1)
+            vtr = apply_transform_var(
+                apply_reinterpret(v, tr, table_column_data(table, v)), [strp]
+            )
+            dtr.append(vtr)
+        ttable = table.transform(Domain([], metas=dtr))
+        for var in ttable.domain:
+            self.assertTrue(var.have_date or var.have_time)
+
 
 class TestUtils(TestCase):
     def test_mapper(self):
@@ -1004,13 +1558,6 @@ class TestUtils(TestCase):
         r_ = mapper(["a", "a", "b"], out=r)
         self.assertIs(r, r_)
         assert_array_equal(r, [1, 1, 2])
-
-    def test_dict_missing(self):
-        d = DictMissingConst("<->", {1: 1, 2: 2})
-        self.assertEqual(d[1], 1)
-        self.assertEqual(d[-1], "<->")
-        # must be sufficiently different from defaultdict to warrant existence
-        self.assertEqual(d, DictMissingConst("<->", {1: 1, 2: 2}))
 
     def test_as_float_or_nan(self):
         a = np.array(["a", "1.1", ".2", "NaN"], object)
@@ -1039,25 +1586,12 @@ class TestUtils(TestCase):
         d = column_str_repr(v, np.array([0., np.nan, 1.0]))
         assert_array_equal(d, ["00:00:00", "?", "00:00:01"])
 
-    def test_time_parse(self):
-        """parsing additional datetimes by pandas"""
-        date = ["1/22/20", "1/23/20", "1/24/20"]
-        # we use privet method, check if still exists
-        assert hasattr(pd.DatetimeIndex, '_is_dates_only')
-
-        tval, values = time_parse(date)
-
-        self.assertTrue(tval.have_date)
-        self.assertFalse(tval.have_time)
-        self.assertListEqual(list(values),
-                             [1579651200.0, 1579737600.0, 1579824000.0])
-
 
 class TestLookupMappingTransform(TestCase):
     def setUp(self) -> None:
         self.lookup = LookupMappingTransform(
             StringVariable("S"),
-            DictMissingConst(np.nan, {"": np.nan, "a": 0, "b": 1}),
+            {"": np.nan, "a": 0, "b": 1},
             dtype=float,
         )
 
@@ -1079,9 +1613,9 @@ class TestLookupMappingTransform(TestCase):
         v2 = DiscreteVariable("v1", values=tuple("abc"))
         v3 = DiscreteVariable("v3", values=tuple("abc"))
 
-        map1 = DictMissingConst(np.nan, {"a": 2, "b": 0, "c": 1})
-        map2 = DictMissingConst(np.nan, {"a": 2, "b": 0, "c": 1})
-        map3 = DictMissingConst(np.nan, {"a": 2, "b": 0, "c": 1})
+        map1 = {"a": 2, "b": 0, "c": 1}
+        map2 = {"a": 2, "b": 0, "c": 1}
+        map3 = {"a": 2, "b": 0, "c": 1}
 
         t1 = LookupMappingTransform(v1, map1, float)
         t1a = LookupMappingTransform(v2, map2, float)
@@ -1093,15 +1627,15 @@ class TestLookupMappingTransform(TestCase):
         self.assertEqual(hash(t1), hash(t1a))
         self.assertNotEqual(hash(t1), hash(t2))
 
-        map1a = DictMissingConst(np.nan, {"a": 2, "b": 1, "c": 0})
+        map1a = {"a": 2, "b": 1, "c": 0}
         t1 = LookupMappingTransform(v1, map1, float)
         t1a = LookupMappingTransform(v1, map1a, float)
         self.assertNotEqual(t1, t1a)
         self.assertNotEqual(hash(t1), hash(t1a))
 
-        map1a = DictMissingConst(2, {"a": 2, "b": 0, "c": 1})
+        map1a = {"a": 2, "b": 0, "c": 1}
         t1 = LookupMappingTransform(v1, map1, float)
-        t1a = LookupMappingTransform(v1, map1a, float)
+        t1a = LookupMappingTransform(v1, map1a, float, unknown=2)
         self.assertNotEqual(t1, t1a)
         self.assertNotEqual(hash(t1), hash(t1a))
 
@@ -1114,7 +1648,7 @@ class TestLookupMappingTransform(TestCase):
 class TestGroupLessFrequentItemsDialog(GuiTest):
     def setUp(self) -> None:
         self.v = Categorical("C", ("a", "b", "c"),
-                        (("A", "1"), ("B", "b")), False)
+                        (("A", "1"), ("B", "b")))
         self.data = [0, 0, 0, 1, 1, 2]
 
     def test_dialog_open(self):
@@ -1220,4 +1754,3 @@ class TestGroupLessFrequentItemsDialog(GuiTest):
 
 if __name__ == '__main__':
     unittest.main()
-

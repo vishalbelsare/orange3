@@ -2,16 +2,19 @@
 # pylint: disable=missing-docstring
 
 import unittest
+
 import numpy as np
 
 from Orange.data import DiscreteVariable, ContinuousVariable, Domain
 from Orange.data import Table
-from Orange.classification import LogisticRegressionLearner, SklTreeLearner, NaiveBayesLearner,\
-                                  MajorityLearner
+from Orange.classification import LogisticRegressionLearner, SklTreeLearner, \
+    NaiveBayesLearner, MajorityLearner, RandomForestLearner
 from Orange.evaluation import AUC, CA, Results, Recall, \
-    Precision, TestOnTrainingData, scoring, LogLoss, F1, CrossValidation
+    Precision, TestOnTrainingData, scoring, LogLoss, F1, CrossValidation, \
+    MatthewsCorrCoefficient, TestOnTestData
 from Orange.evaluation.scoring import Specificity
 from Orange.preprocess import discretize, Discretize
+from Orange.regression import MeanLearner
 from Orange.tests import test_filename
 
 
@@ -317,20 +320,6 @@ class TestAUC(unittest.TestCase):
         return AUC(results)[0]
 
 
-class TestComputeCD(unittest.TestCase):
-    def test_compute_CD(self):
-        avranks = [1.9, 3.2, 2.8, 3.3]
-        cd = scoring.compute_CD(avranks, 30)
-        np.testing.assert_almost_equal(cd, 0.856344)
-
-        cd = scoring.compute_CD(avranks, 30, test="bonferroni-dunn")
-        np.testing.assert_almost_equal(cd, 0.798)
-
-        # Do what you will, just don't crash
-        scoring.graph_ranks(avranks, "abcd", cd)
-        scoring.graph_ranks(avranks, "abcd", cd, cdmethod=0)
-
-
 class TestLogLoss(unittest.TestCase):
     def test_log_loss(self):
         data = Table('iris')
@@ -357,6 +346,48 @@ class TestLogLoss(unittest.TestCase):
         ll_calc = self._log_loss(actual, probab)
         ll_orange = LogLoss(results)
         self.assertAlmostEqual(ll_calc, ll_orange[0])
+
+
+class TestMatthewsCorrCoefficient(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.heart = Table("heart_disease")
+        cls.iris = Table("iris")
+        cls.housing = Table("housing")
+        cls.scorer = MatthewsCorrCoefficient()
+
+    def test_mcc_binary(self):
+        rf = RandomForestLearner(random_state=0)
+        results = TestOnTrainingData()(self.heart, [rf])
+        mcc = self.scorer(results)
+        self.assertGreater(mcc, 0.95)
+
+    def test_mcc_multiclass(self):
+        rf = RandomForestLearner(random_state=0)
+        results = TestOnTrainingData()(self.iris, [rf])
+        mcc = self.scorer(results)
+        self.assertGreater(mcc, 0.95)
+
+    def test_mcc_random(self):
+        majority = MajorityLearner()
+        results = TestOnTrainingData()(self.iris, [majority])
+        mcc = self.scorer(results)
+        self.assertEqual(mcc, 0)
+
+    def test_mcc_neg(self):
+        rf = RandomForestLearner(random_state=0)
+        test_data = self.heart.copy()
+        mask = test_data.Y == 0
+        test_data.Y[mask] = 1
+        test_data.Y[~mask] = 0
+        results = TestOnTestData()(self.heart, test_data, [rf])
+        mcc = self.scorer(results)
+        self.assertLess(mcc, -0.95)
+
+    def test_mcc_continuous(self):
+        majority = MeanLearner()
+        results = TestOnTrainingData()(self.housing, [majority])
+        self.assertRaises(ValueError, self.scorer, results)
 
 
 class TestSpecificity(unittest.TestCase):

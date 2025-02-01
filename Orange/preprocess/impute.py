@@ -2,6 +2,7 @@ import numpy as np
 import scipy.sparse as sp
 
 import Orange.data
+from Orange.data.table import DomainTransformationError
 from Orange.statistics import distribution, basic_stats
 from Orange.util import Reprable
 from .transformation import Transformation, Lookup
@@ -88,7 +89,7 @@ class DropInstances(BaseImputeMethod):
     description = ""
 
     def __call__(self, data, variable):
-        col, _ = data.get_column_view(variable)
+        col = data.get_column(variable)
         return np.isnan(col)
 
 
@@ -172,7 +173,7 @@ class FixedValueByType(BaseImputeMethod):
         return FixedValueByType(*self.defaults.values())
 
 
-class ReplaceUnknownsModel(Reprable):
+class ReplaceUnknownsModel(Transformation):
     """
     Replace unknown values with predicted values using a `Orange.base.Model`
 
@@ -185,15 +186,14 @@ class ReplaceUnknownsModel(Reprable):
     """
     def __init__(self, variable, model):
         assert model.domain.class_var == variable
-        self.variable = variable
+        super().__init__(variable)
         self.model = model
 
     def __call__(self, data):
         if isinstance(data, Orange.data.Instance):
             data = Orange.data.Table.from_list(data.domain, [data])
         domain = data.domain
-        column = np.array(data.get_column_view(self.variable)[0], copy=True)
-
+        column = data.transform(self._target_domain).get_column(self.variable, copy=True)
         mask = np.isnan(column)
         if not np.any(mask):
             return column
@@ -203,9 +203,24 @@ class ReplaceUnknownsModel(Reprable):
             data = data.transform(
                 Orange.data.Domain(domain.attributes, None, domain.metas)
             )
-        predicted = self.model(data[mask])
-        column[mask] = predicted
+        try:
+            column[mask] = self.model(data[mask])
+        except DomainTransformationError:
+            # owpredictions showed error when imputing target using a Model
+            # based imputer (owpredictions removes the target before predicing)
+            pass
         return column
+
+    def transform(self, c):
+        assert False, "abstract in Transformation, never used here"
+
+    def __eq__(self, other):
+        return type(self) is type(other) \
+               and self.variable == other.variable \
+               and self.model == other.model
+
+    def __hash__(self):
+        return hash((type(self), hash(self.variable), hash(self.model)))
 
 
 class Model(BaseImputeMethod):
@@ -224,7 +239,8 @@ class Model(BaseImputeMethod):
         variable = data.domain[variable]
         domain = domain_with_class_var(data.domain, variable)
 
-        if self.learner.check_learner_adequacy(domain):
+        incompatibility_reason = self.learner.incompatibility_reason(domain)
+        if incompatibility_reason is None:
             data = data.transform(domain)
             model = self.learner(data)
             assert model.domain.class_var == variable
@@ -239,7 +255,7 @@ class Model(BaseImputeMethod):
 
     def supports_variable(self, variable):
         domain = Orange.data.Domain([], class_vars=variable)
-        return self.learner.check_learner_adequacy(domain)
+        return self.learner.incompatibility_reason(domain) is None
 
 
 def domain_with_class_var(domain, class_var):

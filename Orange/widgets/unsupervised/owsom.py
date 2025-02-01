@@ -1,8 +1,9 @@
 from collections import defaultdict, namedtuple
+from contextlib import contextmanager
+from typing import Optional, Union
 from xml.sax.saxutils import escape
 
 import numpy as np
-import scipy.sparse as sp
 
 from AnyQt.QtCore import Qt, QRectF, pyqtSignal as Signal, QObject, QThread, \
     pyqtSlot as Slot
@@ -13,20 +14,25 @@ from AnyQt.QtWidgets import \
     QGraphicsItem, QGraphicsRectItem, QGraphicsItemGroup, QSizePolicy, \
     QGraphicsPathItem
 
-from Orange.data import Table, Domain
+from Orange.widgets.utils.signals import lazy_table_transform
+
+from Orange.data import Table, Domain, ContinuousVariable, DiscreteVariable
+from Orange.data.util import array_equal, SharedComputeValue, get_unique_names
 from Orange.preprocess import decimal_binnings, time_binnings
 from Orange.projection.som import SOM
 
 from Orange.widgets import gui
+from Orange.widgets.utils.localization import pl
 from Orange.widgets.widget import OWWidget, Msg, Input, Output
 from Orange.widgets.settings import \
     DomainContextHandler, ContextSetting, Setting
 from Orange.widgets.utils.itemmodels import DomainModel
 from Orange.widgets.utils.widgetpreview import WidgetPreview
 from Orange.widgets.utils.annotated_data import \
-    create_annotated_table, create_groups_table, ANNOTATED_DATA_SIGNAL_NAME
+    add_columns, group_values, \
+    ANNOTATED_DATA_SIGNAL_NAME, ANNOTATED_DATA_FEATURE_NAME
 from Orange.widgets.utils.colorpalettes import \
-    BinnedContinuousPalette, LimitedDiscretePalette
+    BinnedContinuousPalette, LimitedDiscretePalette, DiscretePalette
 from Orange.widgets.visualize.utils import CanvasRectangle, CanvasText
 from Orange.widgets.visualize.utils.plotutils import wrap_legend_items
 
@@ -168,14 +174,132 @@ class ColoredCircle(QGraphicsItem):
         painter.restore()
 
 
+@contextmanager
+def disconnected_spin(spin):
+    spin.blockSignals(True)
+    try:
+        yield
+    finally:
+        spin.blockSignals(False)
+
+
 N_ITERATIONS = 200
+
+
+class SomSharedValueCompute:
+    def __init__(self, domain: Domain, model: SOM,
+                 offsets: Union[np.ndarray, None],
+                 scales: Union[np.ndarray, None]):
+        # offsets and scales are made immutable so that they are hashable
+        def immutable(a):
+            if a is not None:
+                a = a.copy()
+                a.flags.writeable = False
+            return a
+
+        self.domain = domain
+        self.model = model
+        self.offsets = immutable(offsets)
+        self.scales = immutable(scales)
+        self.__hash = None
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["__hash"] = None
+        return state
+
+    def __call__(self, data):
+        x = data.transform(self.domain).X
+        cont_x, mask, _, _ = SOM.prepare_data(x, self.offsets, self.scales)
+        winners = np.full((len(data), 2), np.nan)
+        distances = np.full(len(data), np.nan)
+        winners[mask], distances[mask] = self.model.winners(cont_x)
+        winners += 1
+        return winners, distances
+
+    # `offsets` and `scales` are ndarray's (and `model` contains ndarray's)
+    # Unless we __eq__ by identity, we can't properly define hash.
+    def __eq__(self, other):
+        return type(self) is type(other) and \
+               self.domain == other.domain \
+               and self.model == other.model \
+               and np.array_equal(self.offsets, other.offsets) \
+               and np.array_equal(self.scales, other.scales)
+
+    def __hash__(self):
+        if self.__hash is None:
+            self.__hash = hash((
+                self.domain, self.model,
+                tuple(self.offsets), tuple(self.scales)))
+        return self.__hash
+
+
+class SomCellCompute(SharedComputeValue):
+    def __init__(self, compute_shared, dim_x, hexagonal):
+        super().__init__(compute_shared)
+        self.dim_x = dim_x
+        self.hexagonal = hexagonal
+
+    def __eq__(self, other):
+        return super().__eq__(other) \
+            and self.dim_x == other.dim_x \
+            and self.hexagonal == other.hexagonal
+
+    def __hash__(self):
+        return hash((super().__hash__(), self.dim_x, self.hexagonal))
+
+    def compute(self, _, shared_data):
+        coords = shared_data[0]
+        # coords are 1-based, subtract 1
+        col = (coords[:, 0] - 1) + (coords[:, 1] - 1) * self.dim_x
+        if self.hexagonal:
+            # 1 cell less after every two rows
+            col -= col // (self.dim_x * 2 - 1)
+        return col
+
+
+class SomCoordsCompute(SharedComputeValue):
+    def __init__(self, shared, column):
+        super().__init__(shared)
+        self.column = column
+
+    def compute(self, _, shared_data):
+        return shared_data[0][:, self.column]
+
+    def __eq__(self, other):
+        return self.column == other.column and super().__eq__(other)
+
+    def __hash__(self):
+        return hash((super().__hash__(), self.column))
+
+
+class SomErrorCompute(SharedComputeValue):
+    InheritEq = True
+
+    def compute(self, _, shared_data):
+        return shared_data[1]
+
+
+class GetGroups:
+    # This assigns instances to selection groups; two instances that are not
+    # same cannot be considered equal, period.
+    InheritEq = True
+
+    def __init__(self, id_to_group, default, offset):
+        self.id_to_group = id_to_group
+        self.default = default + offset
+        self.offset = offset
+
+    def __call__(self, data, *args, **kwargs):
+        return np.array([self.id_to_group.get(id, self.default) - self.offset
+                        for id in data.ids])
 
 
 class OWSOM(OWWidget):
     name = "Self-Organizing Map"
     description = "Computation of self-organizing map."
     icon = "icons/SOM.svg"
-    keywords = ["SOM"]
+    keywords = "self-organizing map, som"
 
     class Inputs:
         data = Input("Data", Table)
@@ -196,7 +320,7 @@ class OWSOM(OWWidget):
     pie_charts = Setting(False)
     selection = Setting(None, schema_only=True)
 
-    graph_name = "view"
+    graph_name = "view"  # QGraphicsView
 
     _grid_pen = QPen(QBrush(QColor(224, 224, 224)), 2)
     _grid_pen.setCosmetic(True)
@@ -206,17 +330,24 @@ class OWSOM(OWWidget):
         ("shape", "auto_dim", "spin_x", "spin_y", "initialization", "start")
     )
 
+    class Information(OWWidget.Information):
+        modified = Msg(
+            'The parameter settings have been changed. Press "Start" to '
+            "rerun with the new settings."
+        )
+
     class Warning(OWWidget.Warning):
         ignoring_disc_variables = Msg("SOM ignores categorical variables.")
         missing_colors = \
             Msg("Some data instances have undefined value of '{}'.")
-        missing_values = \
-            Msg("{} data instance{} with undefined value(s) {} not shown.")
+        no_defined_colors = \
+            Msg("'{}' has no defined values.")
+        missing_values = Msg("{}")
         single_attribute = Msg("Data contains a single numeric column.")
 
     class Error(OWWidget.Error):
         no_numeric_variables = Msg("Data contains no numeric columns.")
-        no_defined_rows = Msg("All rows contain at least one undefined value.")
+        not_enough_data = Msg("SOM needs at least two data rows without missing values.")
 
     def __init__(self):
         super().__init__()
@@ -226,14 +357,21 @@ class OWSOM(OWWidget):
         self.stop_optimization = False
 
         self.data = self.cont_x = None
-        self.cells = self.member_data = None
+        self.scales = self.offsets = None
+        self.som = self.cells = self.member_data = None
         self.selection = None
-        self.colors = self.thresholds = self.bin_labels = None
+
+        # self.colors holds a palette or None when we need to draw same-colored
+        # circles. This happens by user's choice or when the color attribute
+        # is numeric and has no defined values, so we can't construct bins
+        self.colors: Optional[DiscretePalette] = None
+        self.thresholds = self.bin_labels = None
 
         box = gui.vBox(self.controlArea, box="SOM")
         shape = gui.comboBox(
             box, self, "", items=("Hexagonal grid", "Square grid"))
         shape.setCurrentIndex(1 - self.hexagonal)
+        shape.currentIndexChanged.connect(self.on_parameter_change)
 
         box2 = gui.indentedBox(box, 10)
         auto_dim = gui.checkBox(
@@ -241,27 +379,40 @@ class OWSOM(OWWidget):
             callback=self.on_auto_dimension_changed)
         self.manual_box = box3 = gui.hBox(box2)
         spinargs = dict(
-            value="", widget=box3, master=self, minv=5, maxv=100, step=5,
-            alignment=Qt.AlignRight)
-        spin_x = gui.spin(**spinargs)
-        spin_x.setValue(self.size_x)
+            value="",
+            widget=box3,
+            master=self,
+            minv=5,
+            maxv=100,
+            step=5,
+            alignment=Qt.AlignRight,
+            callback=self.on_parameter_change,
+        )
+        self.spin_x = gui.spin(**spinargs)
+        with disconnected_spin(self.spin_x):
+            self.spin_x.setValue(self.size_x)
         gui.widgetLabel(box3, "×")
-        spin_y = gui.spin(**spinargs)
-        spin_y.setValue(self.size_y)
+        self.spin_y = gui.spin(**spinargs)
+        with disconnected_spin(self.spin_y):
+            self.spin_y.setValue(self.size_y)
         gui.rubber(box3)
         self.manual_box.setEnabled(not self.auto_dimension)
 
         initialization = gui.comboBox(
-            box, self, "initialization",
-            items=("Initialize with PCA", "Random initialization",
-                   "Replicable random"))
+            box,
+            self,
+            "initialization",
+            items=("Initialize with PCA", "Random initialization", "Replicable random"),
+            callback=self.on_parameter_change,
+        )
 
         start = gui.button(
             box, self, "Restart", callback=self.restart_som_pressed,
             sizePolicy=(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed))
 
         self.opt_controls = self.OptControls(
-            shape, auto_dim, spin_x, spin_y, initialization, start)
+            shape, auto_dim, self.spin_x, self.spin_y, initialization, start
+        )
 
         box = gui.vBox(self.controlArea, "Color")
         gui.comboBox(
@@ -296,56 +447,58 @@ class OWSOM(OWWidget):
         self.grid_cells = None
         self.legend = None
 
+    @staticmethod
+    def _cont_domain(data):
+        attrs = data.domain.attributes
+        cont_attrs = [var for var in attrs if var.is_continuous]
+        if not cont_attrs:
+            return None
+        return Domain(cont_attrs)
+
     @Inputs.data
     def set_data(self, data):
-        def prepare_data():
-            if len(cont_attrs) < len(attrs):
-                self.Warning.ignoring_disc_variables()
-            if len(cont_attrs) == 1:
-                self.Warning.single_attribute()
-            x = Table.from_table(Domain(cont_attrs), data).X
-            if sp.issparse(x):
-                self.data = data
-                self.cont_x = x.tocsr()
-            else:
-                mask = np.all(np.isfinite(x), axis=1)
-                if not np.any(mask):
-                    self.Error.no_defined_rows()
-                else:
-                    if np.all(mask):
-                        self.data = data
-                        self.cont_x = x.copy()
-                    else:
-                        self.data = data[mask]
-                        self.cont_x = x[mask]
-                    self.cont_x -= np.min(self.cont_x, axis=0)[None, :]
-                    sums = np.sum(self.cont_x, axis=0)[None, :]
-                    sums[sums == 0] = 1
-                    self.cont_x /= sums
-
         def set_warnings():
             missing = len(data) - len(self.data)
-            if missing == 1:
-                self.Warning.missing_values(1, "", "is")
-            elif missing > 1:
-                self.Warning.missing_values(missing, "s", "are")
+            if missing:
+                self.Warning.missing_values(
+                    f'{missing} data {pl(missing, "instance")} with undefined value(s) {pl(missing, "is|are")} not shown.')
 
-        self.stop_optimization_and_wait()
-
+        cont_x = self.cont_x.copy() if self.cont_x is not None else None
+        self.data = self.cont_x = None
+        self.offsets = self.scales = None
+        new_cont_x = None
         self.closeContext()
-        self.clear()
-        self.Error.clear()
-        self.Warning.clear()
+        self.clear_messages()
 
         if data is not None:
-            attrs = data.domain.attributes
-            cont_attrs = [var for var in attrs if var.is_continuous]
-            if not cont_attrs:
+            cont_domain = self._cont_domain(data)
+            if cont_domain is None:
                 self.Error.no_numeric_variables()
             else:
-                prepare_data()
+                cont_attrs = cont_domain.attributes
+                if len(cont_attrs) < len(data.domain.attributes):
+                    self.Warning.ignoring_disc_variables()
+                if len(cont_attrs) == 1:
+                    self.Warning.single_attribute()
+
+                new_cont_x, mask, self.offsets, self.scales \
+                    = SOM.prepare_data(data.transform(cont_domain).X)
+                rows = np.sum(mask)
+                if rows == len(mask):
+                    self.data = data
+                elif rows > 1:
+                    self.data = data[mask]
+                else:
+                    self.Error.not_enough_data()
+
+        invalidated = cont_x is None or new_cont_x is None \
+            or not array_equal(cont_x, new_cont_x)
+        if invalidated:
+            self.stop_optimization_and_wait()
+            self.clear()
 
         if self.data is not None:
+            self.cont_x = new_cont_x
             self.controls.attr_color.model().set_domain(data.domain)
             self.attr_color = data.domain.class_var
             set_warnings()
@@ -353,11 +506,15 @@ class OWSOM(OWWidget):
         self.openContext(self.data)
         self.set_color_bins()
         self.create_legend()
-        self.recompute_dimensions()
-        self.start_som()
+        if invalidated:
+            with disconnected_spin(self.spin_x), disconnected_spin(self.spin_y):
+                self.recompute_dimensions()
+            self.start_som()
+        else:
+            self._redraw()
 
     def clear(self):
-        self.data = self.cont_x = None
+        self.som = self.cont_x = None
         self.cells = self.member_data = None
         self.attr_color = None
         self.colors = self.thresholds = self.bin_labels = None
@@ -366,8 +523,6 @@ class OWSOM(OWWidget):
             self.elements = None
         self.clear_selection()
         self.controls.attr_color.model().set_domain(None)
-        self.Warning.clear()
-        self.Error.clear()
 
     def recompute_dimensions(self):
         if not self.auto_dimension or self.cont_x is None:
@@ -387,6 +542,7 @@ class OWSOM(OWWidget):
             dimy = int(5 * np.round(spin_y.value() / 5))
             spin_x.setValue(dimx)
             spin_y.setValue(dimy)
+        self.on_parameter_change()
 
     def on_attr_color_change(self):
         self.controls.pie_charts.setEnabled(self.attr_color is not None)
@@ -401,6 +557,9 @@ class OWSOM(OWWidget):
     def on_pie_chart_change(self):
         self._redraw()
 
+    def on_parameter_change(self):
+        self.Information.modified()
+
     def clear_selection(self):
         self.selection = None
         self.redraw_selection()
@@ -410,15 +569,18 @@ class OWSOM(OWWidget):
             return
         if self.selection is None:
             self.selection = np.zeros(self.grid_cells.T.shape, dtype=np.int16)
+
+        selection_np = np.array(self.selection)
         if action == SomView.SelectionSet:
-            self.selection[:] = 0
-            self.selection[selection] = 1
+            selection_np[:] = 0
+            selection_np[selection] = 1
         elif action == SomView.SelectionAddToGroup:
-            self.selection[selection] = max(1, np.max(self.selection))
+            selection_np[selection] = max(1, np.max(selection_np))
         elif action == SomView.SelectionNewGroup:
-            self.selection[selection] = 1 + np.max(self.selection)
+            selection_np[selection] = 1 + np.max(selection_np)
         elif action & SomView.SelectionRemove:
-            self.selection[selection] = 0
+            selection_np[selection] = 0
+        self.selection = selection_np.tolist()
         self.redraw_selection()
         self.update_output()
 
@@ -433,6 +595,7 @@ class OWSOM(OWWidget):
             x, y = np.nonzero(self.selection)
             if len(x) > 1:
                 return
+            x, y = x[0], y[0]
             if event.key() == Qt.Key_Up and y > 0:
                 y -= 1
             if event.key() == Qt.Key_Down and y < self.size_y - 1:
@@ -443,11 +606,11 @@ class OWSOM(OWWidget):
                 x += 1
             x -= self.hexagonal and x == self.size_x - 1 and y % 2
 
-        if self.selection is not None and self.selection[x, y]:
+        if self.selection is not None and self.selection[x][y]:
             return
         selection = np.zeros(self.grid_cells.shape, dtype=bool)
         selection[x, y] = True
-        self.on_selection_change(selection)
+        self.on_selection_change(selection.tolist())
 
     def on_selection_mark_change(self, marks):
         self.redraw_selection(marks=marks)
@@ -472,7 +635,7 @@ class OWSOM(OWWidget):
             for x in range(self.size_x - (y % 2) * self.hexagonal):
                 cell = self.grid_cells[y, x]
                 marked = marks is not None and marks[x, y]
-                sel_group = self.selection is not None and self.selection[x, y]
+                sel_group = self.selection is not None and self.selection[x][y]
                 if marked:
                     cell.setBrush(mark_brush)
                     cell.setPen(mark_pen)
@@ -482,6 +645,7 @@ class OWSOM(OWWidget):
                 cell.setZValue(marked or sel_group)
 
     def restart_som_pressed(self):
+        self.Information.modified.clear()
         if self._optimizer_thread is not None:
             self.stop_optimization = True
             self._optimizer.stop_optimization = True
@@ -536,7 +700,7 @@ class OWSOM(OWWidget):
 
         self.elements = QGraphicsItemGroup()
         self.scene.addItem(self.elements)
-        if self.attr_color is None:
+        if self.colors is None:
             self._draw_same_color(sizes)
         elif self.pie_charts:
             self._draw_pie_charts(sizes)
@@ -562,19 +726,18 @@ class OWSOM(OWWidget):
                 self.elements.addToGroup(ellipse)
 
     def _get_color_column(self):
-        color_column = \
-            self.data.get_column_view(self.attr_color)[0].astype(float,
-                                                                 copy=False)
+        # if self.colors is None, we use _draw_same_color and don't call
+        # this function
+        assert self.colors is not None
+
+        color_column = self.data.get_column(self.attr_color)
         if self.attr_color.is_discrete:
             with np.errstate(invalid="ignore"):
                 int_col = color_column.astype(int)
             int_col[np.isnan(color_column)] = len(self.colors)
         else:
             int_col = np.zeros(len(color_column), dtype=int)
-            # The following line is unnecessary because rows with missing
-            # numeric data are excluded. Uncomment it if you change SOM to
-            # tolerate missing values.
-            # int_col[np.isnan(color_column)] = len(self.colors)
+            int_col[np.isnan(color_column)] = len(self.colors)
             for i, thresh in enumerate(self.thresholds, start=1):
                 int_col[color_column >= thresh] = i
         return int_col
@@ -584,6 +747,7 @@ class OWSOM(OWWidget):
             values = self.attr_color.values
         else:
             values = self._bin_names()
+        values = list(values) + ["(N/A)"]
         tot = np.sum(distribution)
         nbhp = "\N{NON-BREAKING HYPHEN}"
         return '<table style="white-space: nowrap">' + "".join(f"""
@@ -600,6 +764,8 @@ class OWSOM(OWWidget):
             + "</table>"
 
     def _draw_pie_charts(self, sizes):
+        assert self.colors is not None  # if it were, we'd call _draw_same_color
+
         fx, fy = self._grid_factors
         color_column = self._get_color_column()
         colors = self.colors.qcolors_w_nan
@@ -619,6 +785,8 @@ class OWSOM(OWWidget):
                 pie.setPos(x + (y % 2) * fx, y * fy)
 
     def _draw_colored_circles(self, sizes):
+        assert self.colors is not None  # if it were, we'd call _draw_same_color
+
         fx, fy = self._grid_factors
         color_column = self._get_color_column()
         qcolors = self.colors.qcolors_w_nan
@@ -665,7 +833,7 @@ class OWSOM(OWWidget):
         if self.cont_x is None:
             return
 
-        som = SOM(
+        self.som = SOM(
             self.size_x, self.size_y,
             hexagonal=self.hexagonal,
             pca_init=self.initialization == 0,
@@ -703,8 +871,9 @@ class OWSOM(OWWidget):
             self._optimizer_thread = None
 
         self.progressBarInit()
+        self.setInvalidated(True)
 
-        self._optimizer = Optimizer(self.cont_x, som)
+        self._optimizer = Optimizer(self.cont_x, self.som)
         self._optimizer_thread = QThread()
         self._optimizer_thread.setStackSize(5 * 2 ** 20)
         self._optimizer.update.connect(self.__update)
@@ -726,6 +895,7 @@ class OWSOM(OWWidget):
     def __done(self, som):
         self.enable_controls(True)
         self.progressBarFinished()
+        self.setInvalidated(False)
         self._assign_instances(som.weights, som.ssum_weights)
         self._redraw()
         # This is the first time we know what was selected (assuming that
@@ -751,7 +921,7 @@ class OWSOM(OWWidget):
     def _assign_instances(self, weights, ssum_weights):
         if self.cont_x is None:
             return  # the widget is shutting down while signals still processed
-        assignments = SOM.winner_from_weights(
+        assignments, _ = SOM.winner_from_weights(
             self.cont_x, weights, ssum_weights, self.hexagonal)
         members = defaultdict(list)
         for i, (x, y) in enumerate(assignments):
@@ -786,62 +956,133 @@ class OWSOM(OWWidget):
         self.view.setTransform(QTransform.fromScale(scale, scale))
         if self.hexagonal:
             self.view.setSceneRect(
-                0, -1, self.size_x - 1,
-                (self.size_y + leg_extra) * sqrt3_2 + leg_height / scale)
+                # -1.5: 1 is necessary, 0.5 is to add some border
+                -0.5, -1.5 / np.sqrt(3), self.size_x,
+                (self.size_y + leg_extra) * sqrt3_2 + leg_height / scale - 1 / np.sqrt(3))
         else:
             self.view.setSceneRect(
                 -0.25, -0.25, self.size_x - 0.5,
                 self.size_y - 0.5 + leg_height / scale)
 
     def update_output(self):
-        if self.data is None:
+        if self.som is None:
             self.Outputs.selected_data.send(None)
             self.Outputs.annotated_data.send(None)
             return
 
+        ngroups = int(self.selection is not None) and np.max(self.selection)
         indices = np.zeros(len(self.data), dtype=int)
+        id_to_group = {}
         if self.selection is not None and np.any(self.selection):
             for y in range(self.size_y):
                 for x in range(self.size_x):
                     rows = self.get_member_indices(x, y)
-                    indices[rows] = self.selection[x, y]
+                    group = self.selection[x][y]
+                    indices[rows] = group
+                    if group > 0:
+                        for id_ in self.data.ids[rows]:
+                            id_to_group[id_] = group
+
+        cont_domain = self._cont_domain(self.data)
+        shared_compute = SomSharedValueCompute(
+            cont_domain, self.som, self.offsets, self.scales)
+        cell = DiscreteVariable(
+            "som_cell",
+            values=tuple(
+                f"r{row + 1}c{col + 1}"
+                for row in range(self.size_y)
+                for col in range(self.size_x - (self.hexagonal and row % 2))),
+            compute_value=SomCellCompute(shared_compute,
+                                         self.size_x, self.hexagonal))
+        coordx = ContinuousVariable(
+            "som_row",
+            number_of_decimals=0,
+            compute_value=SomCoordsCompute(shared_compute, 1))
+        coordy = ContinuousVariable(
+            "som_col",
+            number_of_decimals=0,
+            compute_value=SomCoordsCompute(shared_compute, 0))
+        error = ContinuousVariable(
+            "som_error",
+            compute_value=SomErrorCompute(shared_compute)
+        )
+        som_attrs = (cell, coordx, coordy, error)
+
+        grp_values, _ = group_values(
+                indices, include_unselected=False, values=None)
+
+        def make_domain(values, default_grp, offset):
+            grp_var = DiscreteVariable(
+                get_unique_names(self.data.domain, ANNOTATED_DATA_FEATURE_NAME),
+                values,
+                compute_value=GetGroups(id_to_group, default_grp, offset))
+
+            if not self.data.domain.class_vars:
+                class_vars, metas = (grp_var,), som_attrs
+            else:
+                class_vars, metas = (), (grp_var,) + som_attrs
+            return add_columns(self.data.domain, (), class_vars, metas)
 
         if np.any(indices):
-            sel_data = create_groups_table(self.data, indices, False, "Group")
-            self.Outputs.selected_data.send(sel_data)
+            sel_domain = make_domain(grp_values, np.nan, 1)
+            mask = np.flatnonzero(indices)
+            self.Outputs.selected_data.send(
+                lazy_table_transform(sel_domain, self.data[mask]))
         else:
             self.Outputs.selected_data.send(None)
 
-        if np.max(indices) > 1:
-            annotated = create_groups_table(self.data, indices)
+        if ngroups > 1:
+            sel_domain = make_domain(grp_values + ["Unselected", ], ngroups, 1)
         else:
-            annotated = create_annotated_table(
-                self.data, np.flatnonzero(indices))
-        self.Outputs.annotated_data.send(annotated)
+            sel_domain = make_domain(("No", "Yes"), 0, 0)
+        self.Outputs.annotated_data.send(
+            lazy_table_transform(sel_domain, self.data))
 
     def set_color_bins(self):
+        self.Warning.no_defined_colors.clear()
+
         if self.attr_color is None:
             self.thresholds = self.bin_labels = self.colors = None
-        elif self.attr_color.is_discrete:
+            return
+
+        if self.attr_color.is_discrete:
             self.thresholds = self.bin_labels = None
             self.colors = self.attr_color.palette
+            return
+
+        col = self.data.get_column(self.attr_color)
+        col = col[np.isfinite(col)]
+        if not col.size:
+            self.Warning.no_defined_colors(self.attr_color)
+            self.thresholds = self.bin_labels = self.colors = None
+            return
+
+        if self.attr_color.is_time:
+            binning = time_binnings(col, min_bins=4)[-1]
         else:
-            col = self.data.get_column_view(self.attr_color)[0].astype(float)
-            if self.attr_color.is_time:
-                binning = time_binnings(col, min_bins=4)[-1]
-            else:
-                binning = decimal_binnings(col, min_bins=4)[-1]
-            self.thresholds = binning.thresholds[1:-1]
-            self.bin_labels = (binning.labels[1:-1], binning.short_labels[1:-1])
-            palette = BinnedContinuousPalette.from_palette(
-                self.attr_color.palette, binning.thresholds)
-            self.colors = palette
+            binning = decimal_binnings(col, min_bins=4)[-1]
+        self.thresholds = binning.thresholds[1:-1]
+        self.bin_labels = (binning.labels[1:-1], binning.short_labels[1:-1])
+        if not self.bin_labels[0] and binning.labels:
+            # Nan's are already filtered out, but it doesn't hurt much
+            # to use nanmax/nanmin
+            if np.nanmin(col) == np.nanmax(col):
+                # Handle a degenerate case with a single value
+                # Use the second threshold (because value must be smaller),
+                # but the first threshold as label (because that's the
+                # actual value in the data.
+                self.thresholds = binning.thresholds[1:]
+                self.bin_labels = (binning.labels[:1],
+                                   binning.short_labels[:1])
+        palette = BinnedContinuousPalette.from_palette(
+            self.attr_color.palette, binning.thresholds)
+        self.colors = palette
 
     def create_legend(self):
         if self.legend is not None:
             self.scene.removeItem(self.legend)
             self.legend = None
-        if self.attr_color is None:
+        if self.colors is None:
             return
 
         if self.attr_color.is_discrete:
@@ -870,7 +1111,9 @@ class OWSOM(OWWidget):
         self.set_legend_pos()
 
     def _bin_names(self):
-        labels, short_labels = self.bin_labels
+        labels, short_labels = self.bin_labels or ([], [])
+        if len(labels) <= 1:
+            return labels
         return \
             [f"< {labels[0]}"] \
             + [f"{x} - {y}" for x, y in zip(labels, short_labels[1:])] \
@@ -885,9 +1128,17 @@ class OWSOM(OWWidget):
 
     def send_report(self):
         self.report_plot()
-        if self.attr_color:
+        if self.colors:
             self.report_caption(
                 f"Self-organizing map colored by '{self.attr_color.name}'")
+
+    @classmethod
+    def migrate_settings(cls, settings, _):
+        # previously selection was saved as np.ndarray which is not supported
+        # by widget-base, change selection to list
+        selection = settings.get('selection')
+        if selection is not None and isinstance(selection, np.ndarray):
+            settings['selection'] = selection.tolist()
 
 
 def _draw_hexagon():

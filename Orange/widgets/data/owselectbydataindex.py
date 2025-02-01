@@ -3,6 +3,7 @@ import numpy as np
 from Orange.data import Table
 from Orange.widgets import widget, gui
 from Orange.widgets.utils import itemmodels
+from Orange.widgets.utils.localization import pl
 from Orange.widgets.utils.sql import check_sql_input
 from Orange.widgets.utils.widgetpreview import WidgetPreview
 from Orange.widgets.widget import Input, Output
@@ -45,34 +46,29 @@ class OWSelectByDataIndex(widget.OWWidget):
         self.extra_model_unique = itemmodels.VariableListModel()
         self.extra_model_unique_with_id = itemmodels.VariableListModel()
 
-        box = gui.hBox(self.controlArea, box=None)
-        self.infoBoxData = gui.label(
-            box, self, self.data_info_text(None), box="Data")
-        self.infoBoxExtraData = gui.label(
-            box, self, self.data_info_text(None), box="Data Subset")
+        box = gui.widgetBox(self.controlArea, True)
+        gui.label(
+            box, self, """
+Data rows keep their identity even when some or all original variables
+are replaced by variables computed from the original ones.
+
+This widget gets two data tables ("Data" and "Data Subset") that
+can be traced back to the same source. It selects all rows from Data
+that appear in Data Subset, based on row identity and not actual data.
+""".strip(), box=True)
 
     @Inputs.data
     @check_sql_input
     def set_data(self, data):
         self.data = data
-        self.infoBoxData.setText(self.data_info_text(data))
 
     @Inputs.data_subset
     @check_sql_input
     def set_data_subset(self, data):
         self.data_subset = data
-        self.infoBoxExtraData.setText(self.data_info_text(data))
 
     def handleNewSignals(self):
         self._invalidate()
-
-    @staticmethod
-    def data_info_text(data):
-        if data is None:
-            return "No data."
-        else:
-            return "{}\n{} instances\n{} variables".format(
-                data.name, len(data), len(data.domain.variables) + len(data.domain.metas))
 
     def commit(self):
         self.Warning.instances_not_matching.clear()
@@ -100,9 +96,17 @@ class OWSelectByDataIndex(widget.OWWidget):
         self.commit()
 
     def send_report(self):
-        d_text = self.data_info_text(self.data).replace("\n", ", ")
-        ds_text = self.data_info_text(self.data_subset).replace("\n", ", ")
-        self.report_items("", [("Data", d_text), ("Data Subset", ds_text)])
+        def data_info_text(data):
+            if data is None:
+                return "No data."
+            nvars = len(data.domain.variables) + len(data.domain.metas)
+            return f"{data.name}, " \
+                   f"{len(data)} {pl(len(data), 'instance')}, " \
+                   f"{nvars} {pl(nvars, 'variable')}"
+
+        self.report_items("",
+                          [("Data", data_info_text(self.data)),
+                           ("Data Subset", data_info_text(self.data_subset))])
 
 
 if __name__ == "__main__":  # pragma: no cover

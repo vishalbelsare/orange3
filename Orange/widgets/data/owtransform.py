@@ -6,15 +6,31 @@ from Orange.widgets.report.report import describe_data
 from Orange.widgets.utils.sql import check_sql_input
 from Orange.widgets.utils.widgetpreview import WidgetPreview
 from Orange.widgets.widget import OWWidget, Input, Output, Msg
+from Orange.widgets.utils.concurrent import TaskState, ConcurrentWidgetMixin
 
 
-class OWTransform(OWWidget):
+class TransformRunner:
+    @staticmethod
+    def run(
+            data: Table,
+            template_data: Table,
+            state: TaskState
+    ) -> Optional[Table]:
+        if data is None or template_data is None:
+            return None
+
+        state.set_status("Transforming...")
+        transformed_data = data.transform(template_data.domain)
+        return transformed_data
+
+
+class OWTransform(OWWidget, ConcurrentWidgetMixin):
     name = "Apply Domain"
     description = "Applies template domain on data table."
     category = "Transform"
     icon = "icons/Transform.svg"
-    priority = 2110
-    keywords = ["transform"]
+    priority = 1230
+    keywords = "apply domain, transform"
 
     class Inputs:
         data = Input("Data", Table, default=True)
@@ -31,47 +47,27 @@ class OWTransform(OWWidget):
     buttons_area_orientation = None
 
     def __init__(self):
-        super().__init__()
+        OWWidget.__init__(self)
+        ConcurrentWidgetMixin.__init__(self)
         self.data = None  # type: Optional[Table]
         self.template_data = None  # type: Optional[Table]
         self.transformed_info = describe_data(None)  # type: OrderedDict
 
-        info_box = gui.widgetBox(self.controlArea, "Info")
-        self.input_label = gui.widgetLabel(info_box, "")
-        self.template_label = gui.widgetLabel(info_box, "")
-        self.output_label = gui.widgetLabel(info_box, "")
-        self.set_input_label_text()
-        self.set_template_label_text()
+        box = gui.widgetBox(self.controlArea, True)
+        gui.label(
+            box, self, """
+The widget takes Data, to which it re-applies transformations
+that were applied to Template Data.
 
-    def set_input_label_text(self):
-        text = "No data on input."
-        if self.data:
-            text = "Input data with {:,} instances and {:,} features.".format(
-                len(self.data),
-                len(self.data.domain.attributes))
-        self.input_label.setText(text)
-
-    def set_template_label_text(self):
-        text = "No template data on input."
-        if self.data and self.template_data:
-            text = "Template domain applied."
-        elif self.template_data:
-            text = "Template data includes {:,} features.".format(
-                len(self.template_data.domain.attributes))
-        self.template_label.setText(text)
-
-    def set_output_label_text(self, data):
-        text = ""
-        if data:
-            text = "Output data includes {:,} features.".format(
-                len(data.domain.attributes))
-        self.output_label.setText(text)
+These include selecting a subset of variables as well as
+computing variables from other variables appearing in the data,
+like, for instance, discretization, feature construction, PCA etc.
+""".strip(), box=True)
 
     @Inputs.data
     @check_sql_input
     def set_data(self, data):
         self.data = data
-        self.set_input_label_text()
 
     @Inputs.template_data
     @check_sql_input
@@ -83,18 +79,8 @@ class OWTransform(OWWidget):
 
     def apply(self):
         self.clear_messages()
-        transformed_data = None
-        if self.data and self.template_data:
-            try:
-                transformed_data = self.data.transform(self.template_data.domain)
-            except Exception as ex:  # pylint: disable=broad-except
-                self.Error.error(ex)
-
-        data = transformed_data
-        self.transformed_info = describe_data(data)
-        self.Outputs.transformed_data.send(data)
-        self.set_template_label_text()
-        self.set_output_label_text(data)
+        self.cancel()
+        self.start(TransformRunner.run, self.data, self.template_data)
 
     def send_report(self):
         if self.data:
@@ -103,6 +89,21 @@ class OWTransform(OWWidget):
             self.report_domain("Template data", self.template_data.domain)
         if self.transformed_info:
             self.report_items("Transformed data", self.transformed_info)
+
+    def on_partial_result(self, _):
+        pass
+
+    def on_done(self, result: Optional[Table]):
+        self.transformed_info = describe_data(result)
+        self.Outputs.transformed_data.send(result)
+
+    def on_exception(self, ex):
+        self.Error.error(ex)
+        self.Outputs.transformed_data.send(None)
+
+    def onDeleteWidget(self):
+        self.shutdown()
+        super().onDeleteWidget()
 
 
 if __name__ == "__main__":  # pragma: no cover

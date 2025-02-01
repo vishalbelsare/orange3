@@ -4,17 +4,16 @@
 import os
 import sysconfig
 
-import pkg_resources
-
 from orangecanvas.registry import CategoryDescription
 from orangecanvas.registry.utils import category_from_package_globals
+from orangecanvas.utils.pkgmeta import get_distribution
 import orangewidget.workflow.discovery
 
 
 # Entry point for main Orange categories/widgets discovery
 def widget_discovery(discovery):
     # type: (orangewidget.workflow.discovery.WidgetDiscovery) -> None
-    dist = pkg_resources.get_distribution("Orange3")
+    dist = get_distribution("Orange3")
     pkgs = [
         "Orange.widgets.data",
         "Orange.widgets.visualize",
@@ -34,8 +33,16 @@ def widget_discovery(discovery):
             package=__package__,
         )
     )
+    discovery.handle_category(
+        CategoryDescription(
+            name="Orange Obsolete",
+            package=__package__,
+            hidden=True,
+        )
+    )
     for pkg in pkgs:
         discovery.process_category_package(pkg, distribution=dist)
+    discovery.process_widget_module("Orange.widgets.obsolete.owtable")
 
 
 WIDGET_HELP_PATH = (

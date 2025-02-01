@@ -1,6 +1,7 @@
 """
 Support for example tables wrapping data stored on a PostgreSQL server.
 """
+import contextlib
 import functools
 import logging
 import threading
@@ -347,7 +348,7 @@ class SqlTable(Table):
         return False
 
     def _compute_basic_stats(self, columns=None,
-                             include_metas=False, compute_var=False):
+                             include_metas=False, compute_variance=False):
         if self.approx_len() > LARGE_TABLE:
             self = self.sample_time(DEFAULT_SAMPLE_TIME)
 
@@ -654,3 +655,41 @@ class SqlTable(Table):
 
     def checksum(self, include_metas=True):
         return np.nan
+
+    def __get_nan_frequency(self, columns):
+        try:
+            query = self._sql_query([" + ".join([f"COUNT(*) - COUNT({col.to_sql()})"
+                                                 for col in columns])])
+            with self.backend.execute_sql_query(query) as cur:
+                return cur.fetchone()[0] / (len(self) * len(columns))
+        except BackendError:
+            return None
+
+    def get_nan_frequency_attribute(self):
+        return self.__get_nan_frequency(self.domain.attributes)
+
+    def get_nan_frequency_class(self):
+        return self.__get_nan_frequency(self.domain.class_vars)
+
+    def __getstate__(self):
+        # avoids locking magic in Table.__getstate__
+        return self.__dict__
+
+    def __setstate__(self, state):
+        # avoid locking magic in Table.__setstate__
+        self.__dict__.update(state)
+
+        # if X is defined then it was already downloaded
+        # thus ids exist to, rewrite them
+        if self._X is not None:
+            self._init_ids(self)
+
+    # pylint: disable=unused-argument
+    def _update_locks(self, *args, **kwargs):
+        # avoid locking inherited from Table
+        return
+
+    # pylint: disable=unused-argument
+    def unlocked(self, *parts):
+        # avoid locking inherited from Table
+        return contextlib.nullcontext()

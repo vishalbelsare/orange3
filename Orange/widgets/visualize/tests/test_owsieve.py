@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from AnyQt.QtCore import QEvent, QPoint, Qt
+from AnyQt.QtCore import QEvent, QPointF, Qt
 from AnyQt.QtGui import QMouseEvent
 
 from Orange.data import ContinuousVariable, DiscreteVariable, Domain, Table
@@ -24,7 +24,7 @@ class TestOWSieveDiagram(WidgetTest, WidgetOutputsTestMixin):
         super().setUpClass()
         WidgetOutputsTestMixin.init(cls)
 
-        cls.signal_name = "Data"
+        cls.signal_name = OWSieveDiagram.Inputs.data
         cls.signal_data = cls.data
         cls.titanic = Table("titanic")
         cls.iris = Table("iris")
@@ -79,8 +79,8 @@ class TestOWSieveDiagram(WidgetTest, WidgetOutputsTestMixin):
         self.widget.attr_x, self.widget.attr_y = self.data.domain[:2]
         area = self.widget.areas[0]
         self.widget.select_area(area, QMouseEvent(
-            QEvent.MouseButtonPress, QPoint(), Qt.LeftButton,
-            Qt.LeftButton, Qt.KeyboardModifiers()))
+            QEvent.MouseButtonPress, QPointF(), Qt.LeftButton,
+            Qt.LeftButton, Qt.NoModifier))
         return [0, 4, 6, 7, 11, 17, 19, 21, 22, 24, 26, 39, 40, 43, 44, 46]
 
     def test_missing_values(self):
@@ -142,17 +142,17 @@ class TestOWSieveDiagram(WidgetTest, WidgetOutputsTestMixin):
         self.send_signal(self.widget.Inputs.data, self.iris)
         self.assertEqual(len(self.widget.discrete_data.domain.variables),
                          len(self.iris.domain.variables))
-        output = self.get_output("Data")
+        output = self.get_output(self.widget.Inputs.data)
         self.assertFalse(output.is_sparse())
 
         table = self.iris.to_sparse()
         self.send_signal(self.widget.Inputs.data, table)
         self.assertEqual(len(self.widget.discrete_data.domain.variables), 2)
-        output = self.get_output("Data")
+        output = self.get_output(self.widget.Inputs.data)
         self.assertTrue(output.is_sparse())
 
-    @patch('Orange.widgets.visualize.owsieve.SieveRank.on_manual_change')
-    def test_vizrank_receives_manual_change(self, on_manual_change):
+    @patch('Orange.widgets.visualize.owsieve.SieveRank.auto_select')
+    def test_vizrank_receives_manual_change(self, auto_select):
         # Recreate the widget so the patch kicks in
         self.widget = self.create_widget(OWSieveDiagram)
         data = Table("iris.tab")
@@ -161,10 +161,9 @@ class TestOWSieveDiagram(WidgetTest, WidgetOutputsTestMixin):
         self.widget.attr_x = model[2]
         self.widget.attr_y = model[3]
         simulate.combobox_activate_index(self.widget.controls.attr_x, 4)
-        call_args = on_manual_change.call_args[0]
-        self.assertEqual(len(call_args), 2)
-        self.assertEqual(call_args[0].name, data.domain[2].name)
-        self.assertEqual(call_args[1].name, data.domain[1].name)
+        call_args = auto_select.call_args[0][0]
+        self.assertEqual([v.name for v in call_args],
+                         [data.domain[2].name, data.domain[1].name])
 
     def test_input_features(self):
         self.assertTrue(self.widget.attr_box.isEnabled())
@@ -172,10 +171,10 @@ class TestOWSieveDiagram(WidgetTest, WidgetOutputsTestMixin):
         self.send_signal(self.widget.Inputs.features,
                          AttributeList(self.iris.domain.attributes))
         self.assertFalse(self.widget.attr_box.isEnabled())
-        self.assertFalse(self.widget.vizrank.isEnabled())
+        self.assertFalse(self.widget.vizrank_button().isEnabled())
         self.send_signal(self.widget.Inputs.features, None)
         self.assertTrue(self.widget.attr_box.isEnabled())
-        self.assertTrue(self.widget.vizrank.isEnabled())
+        self.assertTrue(self.widget.vizrank_button().isEnabled())
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ import numpy as np
 from AnyQt.QtWidgets import (
     QWidget, QTableWidget, QHeaderView, QComboBox, QLineEdit, QToolButton,
     QMessageBox, QMenu, QListView, QGridLayout, QPushButton, QSizePolicy,
-    QLabel, QHBoxLayout, QDateTimeEdit)
+    QLabel, QDateTimeEdit)
 from AnyQt.QtGui import (QDoubleValidator, QStandardItemModel, QStandardItem,
                          QFontMetrics, QPalette)
 from AnyQt.QtCore import Qt, QPoint, QPersistentModelIndex, QLocale, \
@@ -24,6 +24,7 @@ from Orange.preprocess import Remove
 from Orange.widgets import widget, gui
 from Orange.widgets.settings import Setting, ContextSetting, DomainContextHandler
 from Orange.widgets.utils.widgetpreview import WidgetPreview
+from Orange.widgets.utils.localization import pl
 from Orange.widgets.widget import Input, Output
 from Orange.widgets.utils import vartype
 from Orange.widgets import report
@@ -74,31 +75,19 @@ class SelectRowsContextHandler(DomainContextHandler):
         value = super().decode_setting(setting, value, domain)
         if setting.name == 'conditions':
             CONTINUOUS = vartype(ContinuousVariable("x"))
-            # Use this after 2022/2/2:
-            # for i, (attr, tpe, op, values) in enumerate(value):
-            #     if tpe is not None:
-            for i, (attr, *tpe, op, values) in enumerate(value):
-                if tpe != [None] \
-                        or not tpe and attr not in OWSelectRows.AllTypes:
+            for i, (attr, tpe, op, values) in enumerate(value):
+                if tpe is not None:
                     attr = domain[attr]
                 # check for exact match, pylint: disable=unidiomatic-typecheck
                 if type(attr) is ContinuousVariable \
                         or OWSelectRows.AllTypes.get(attr) == CONTINUOUS:
                     values = [QLocale().toString(float(i), 'f') for i in values]
                 elif isinstance(attr, DiscreteVariable):
-                    # After 2022/2/2, use just the expression in else clause
-                    if values and isinstance(values[0], int):
-                        # Backwards compatibility. Reset setting if we detect
-                        # that the number of values decreased. Still broken if
-                        # they're reordered or we don't detect the decrease.
-                        #
-                        # indices start with 1, thus >, not >=
-                        if max(values) > len(attr.values):
-                            values = (0, )
-                    else:
-                        values = tuple(attr.to_val(val) + 1 if val else 0
-                                       for val in values if val in attr.values) \
-                                 or (0, )
+                    values = tuple(
+                        attr.to_val(val) + 1 if val else 0
+                        for val in values
+                        if val in attr.values
+                    ) or (0,)
                 value[i] = (attr, op, values)
         return value
 
@@ -109,10 +98,10 @@ class SelectRowsContextHandler(DomainContextHandler):
         conditions = context.values["conditions"]
         all_vars = attrs.copy()
         all_vars.update(metas)
-        matched = [all_vars.get(name) == tpe  # also matches "all (...)" strings
-                   # After 2022/2/2 remove this line:
-                   if len(rest) == 2 else name in all_vars
-                   for name, tpe, *rest in conditions]
+        matched = [
+            all_vars.get(name) == tpe  # also matches "all (...)" strings
+            for name, tpe, *rest in conditions
+        ]
         if any(matched):
             return 0.5 * sum(matched) / len(matched)
         return self.NO_MATCH
@@ -125,15 +114,11 @@ class SelectRowsContextHandler(DomainContextHandler):
         all_vars = attrs.copy()
         all_vars.update(metas)
         conditions = data["conditions"]
-        # Use this after 2022/2/2: if any(all_vars.get(name) == tpe:
-        # conditions[:] = [(name, tpe, *rest) for name, tpe, *rest in conditions
-        #                  if all_vars.get(name) == tpe]
         conditions[:] = [
-            (name, tpe, *rest) for name, tpe, *rest in conditions
-            # all_vars.get(name) == tpe also matches "all (...)" which are
-            # encoded with type `None`
-            if (all_vars.get(name) == tpe if len(rest) == 2
-                else name in all_vars)]
+            (name, tpe, *rest)
+            for name, tpe, *rest in conditions
+            if all_vars.get(name) == tpe
+        ]
 
 
 class FilterDiscreteType(enum.Enum):
@@ -144,20 +129,13 @@ class FilterDiscreteType(enum.Enum):
     IsDefined = "IsDefined"
 
 
-def _plural(s):
-    s = s.replace("is ", "are ")
-    for word in ("equals", "contains", "begins", "ends"):
-        s = s.replace(word, word[:-1])
-    return s
-
-
 class OWSelectRows(widget.OWWidget):
     name = "Select Rows"
     description = "Select rows from the data based on values of variables."
     icon = "icons/SelectRows.svg"
     priority = 100
     category = "Transform"
-    keywords = ["filter"]
+    keywords = "select rows, filter"
 
     class Inputs:
         data = Input("Data", Table)
@@ -180,15 +158,15 @@ class OWSelectRows(widget.OWWidget):
 
     Operators = {
         ContinuousVariable: [
-            (FilterContinuous.Equal, "equals"),
-            (FilterContinuous.NotEqual, "is not"),
-            (FilterContinuous.Less, "is below"),
-            (FilterContinuous.LessEqual, "is at most"),
-            (FilterContinuous.Greater, "is greater than"),
-            (FilterContinuous.GreaterEqual, "is at least"),
-            (FilterContinuous.Between, "is between"),
-            (FilterContinuous.Outside, "is outside"),
-            (FilterContinuous.IsDefined, "is defined"),
+            (FilterContinuous.Equal, "equals", "equal"),
+            (FilterContinuous.NotEqual, "is not", "are not"),
+            (FilterContinuous.Less, "is below", "are below"),
+            (FilterContinuous.LessEqual, "is at most", "are at most"),
+            (FilterContinuous.Greater, "is greater than", "are greater than"),
+            (FilterContinuous.GreaterEqual, "is at least", "are at least"),
+            (FilterContinuous.Between, "is between", "are between"),
+            (FilterContinuous.Outside, "is outside", "are outside"),
+            (FilterContinuous.IsDefined, "is defined", "are defined"),
         ],
         DiscreteVariable: [
             (FilterDiscreteType.Equal, "is"),
@@ -197,18 +175,22 @@ class OWSelectRows(widget.OWWidget):
             (FilterDiscreteType.IsDefined, "is defined")
         ],
         StringVariable: [
-            (FilterString.Equal, "equals"),
-            (FilterString.NotEqual, "is not"),
-            (FilterString.Less, "is before"),
-            (FilterString.LessEqual, "is equal or before"),
-            (FilterString.Greater, "is after"),
-            (FilterString.GreaterEqual, "is equal or after"),
-            (FilterString.Between, "is between"),
-            (FilterString.Outside, "is outside"),
-            (FilterString.Contains, "contains"),
-            (FilterString.StartsWith, "begins with"),
-            (FilterString.EndsWith, "ends with"),
-            (FilterString.IsDefined, "is defined"),
+            (FilterString.Equal, "equals", "equal"),
+            (FilterString.NotEqual, "is not", "are not"),
+            (FilterString.Less, "is before", "are before"),
+            (FilterString.LessEqual, "is equal or before", "are equal or before"),
+            (FilterString.Greater, "is after", "are after"),
+            (FilterString.GreaterEqual, "is equal or after", "are equal or after"),
+            (FilterString.Between, "is between", "are between"),
+            (FilterString.Outside, "is outside", "are outside"),
+            (FilterString.Contains, "contains", "contain"),
+            (FilterString.NotContain, "does not contain", "do not contain"),
+            (FilterString.StartsWith, "begins with", "begin with"),
+            (FilterString.NotStartsWith, "does not begin with", "do not begin with"),
+            (FilterString.EndsWith, "ends with", "end with"),
+            (FilterString.NotEndsWith, "does not end with", "do not end with"),
+            (FilterString.IsDefined, "is defined", "are defined"),
+            (FilterString.NotIsDefined, "is not defined", "are not defined"),
         ]
     }
 
@@ -219,13 +201,13 @@ class OWSelectRows(widget.OWWidget):
             ("All variables", 0,
              [(None, "are defined")]),
             ("All numeric variables", 2,
-             [(v, _plural(t)) for v, t in Operators[ContinuousVariable]]),
+             [(v, t) for v, _, t in Operators[ContinuousVariable]]),
             ("All string variables", 3,
-             [(v, _plural(t)) for v, t in Operators[StringVariable]])):
+             [(v, t) for v, _, t in Operators[StringVariable]])):
         Operators[_all_name] = _all_ops
         AllTypes[_all_name] = _all_type
 
-    operator_names = {vtype: [name for _, name in filters]
+    operator_names = {vtype: [name for _, name, *_ in filters]
                       for vtype, filters in Operators.items()}
 
     class Error(widget.OWWidget.Error):
@@ -269,7 +251,8 @@ class OWSelectRows(widget.OWWidget):
 
         box_setting = gui.vBox(self.buttonsArea)
         self.cb_pa = gui.checkBox(
-            box_setting, self, "purge_attributes", "Remove unused features",
+            box_setting, self, "purge_attributes",
+            "Remove unused values and constant features",
             callback=self.conditions_changed)
         self.cb_pc = gui.checkBox(
             box_setting, self, "purge_classes", "Remove unused classes",
@@ -299,8 +282,8 @@ class OWSelectRows(widget.OWWidget):
 
         index = QPersistentModelIndex(model.index(row, 3))
         temp_button = QPushButton('×', self, flat=True,
-                                  styleSheet='* {font-size: 16pt; color: silver}'
-                                             '*:hover {color: black}')
+                                  styleSheet='* {font-size: 16pt; color: palette(button-text) }'
+                                             '*:hover {color: palette(bright-text)}')
         temp_button.clicked.connect(lambda: self.remove_one(index.row()))
         self.cond_list.setCellWidget(row, 3, temp_button)
 
@@ -401,7 +384,7 @@ class OWSelectRows(widget.OWWidget):
                     model = child.popup.list_view.model()
                     for row in range(model.rowCount()):
                         item = model.item(row)
-                        if item.checkState():
+                        if item.checkState() == Qt.Checked:
                             cont.append(row + 1)
                             names.append(item.text())
                     child.desc_text = ', '.join(names)
@@ -465,7 +448,7 @@ class OWSelectRows(widget.OWWidget):
         if box and vtype == box.var_type:
             lc = self._get_lineedit_contents(box) + lc
 
-        if oper_combo.currentText().endswith(" defined"):
+        if "defined" in oper_combo.currentText():
             label = QLabel()
             label.var_type = vtype
             self.cond_list.setCellWidget(oper_combo.row, 2, label)
@@ -516,7 +499,7 @@ class OWSelectRows(widget.OWWidget):
                     invalidate_datetime()
 
                 datetime_format = (var.have_date, var.have_time)
-                column = self.data.get_column_view(var_idx)[0]
+                column = self.data.get_column(var_idx)
                 w = DateTimeWidget(self, column, datetime_format)
                 w.set_datetime(lc[0])
                 box.controls = [w]
@@ -602,7 +585,7 @@ class OWSelectRows(widget.OWWidget):
             floats, ok = zip(*[parse(v) for v in values])
             if not all(ok):
                 raise ValueError('Some values could not be parsed as floats'
-                                 'in the current locale: {}'.format(values))
+                                 f' in the current locale: {values}')
         except TypeError:
             floats = values  # values already floats
         assert all(isinstance(v, float) for v in floats)
@@ -628,7 +611,7 @@ class OWSelectRows(widget.OWWidget):
                     attr = domain[attr_index]
                     attr_type = vartype(attr)
                     operators = self.Operators[type(attr)]
-                opertype, _ = operators[oper_idx]
+                opertype, *_ = operators[oper_idx]
                 if attr_type == 0:
                     filt = data_filter.IsDefined()
                 elif attr_type in (2, 4):  # continuous, time
@@ -775,17 +758,15 @@ class OWSelectRows(widget.OWWidget):
             self.report_items(
                 "Output",
                 (("Matching data",
-                  "{} instances".format(match_inst) if match_inst else "None"),
+                  f"{match_inst} {pl(match_inst, 'instance')}" if match_inst else "None"),
                  ("Non-matching data",
-                  nonmatch_inst > 0 and "{} instances".format(nonmatch_inst))))
+                  nonmatch_inst > 0 and f"{nonmatch_inst} {pl(nonmatch_inst, 'instance')}")))
 
-    # Uncomment this on 2022/2/2
-    #
-    # @classmethod
-    # def migrate_context(cls, context, version):
-    #     if not version or version < 2:
-    #         # Just remove; can't migrate because variables types are unknown
-    #         context.values["conditions"] = []
+    @classmethod
+    def migrate_context(cls, context, version):
+        if not version or version < 2:
+            # Just remove; can't migrate because variables types are unknown
+            context.values["conditions"] = []
 
 
 class CheckBoxPopup(QWidget):

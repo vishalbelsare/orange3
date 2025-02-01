@@ -19,14 +19,19 @@ from Orange.data.io import FileFormat, UrlReader, class_from_qualified_name
 from Orange.data.io_base import MissingReaderException
 from Orange.util import log_warnings
 from Orange.widgets import widget, gui
+from Orange.widgets.utils.localization import pl
 from Orange.widgets.settings import Setting, ContextSetting, \
     PerfectDomainContextHandler, SettingProvider
 from Orange.widgets.utils.domaineditor import DomainEditor
 from Orange.widgets.utils.itemmodels import PyListModel
 from Orange.widgets.utils.filedialogs import RecentPathsWComboMixin, \
-    open_filename_dialog
+    open_filename_dialog, stored_recent_paths_prepend
+from Orange.widgets.utils.filedialogs import OWUrlDropBase
 from Orange.widgets.utils.widgetpreview import WidgetPreview
 from Orange.widgets.widget import Output, Msg
+from Orange.widgets.utils.combobox import TextEditCombo
+from Orange.widgets.utils.state_summary import missing_values
+
 
 # Backward compatibility: class RecentPath used to be defined in this module,
 # and it is used in saved (pickled) settings. It must be imported into the
@@ -78,7 +83,7 @@ class LineEditSelectOnFocus(QLineEdit):
         QTimer.singleShot(0, self.selectAll)
 
 
-class OWFile(widget.OWWidget, RecentPathsWComboMixin):
+class OWFile(OWUrlDropBase, RecentPathsWComboMixin):
     name = "File"
     id = "orange.widgets.data.file"
     description = "Read data from an input file or network " \
@@ -86,7 +91,7 @@ class OWFile(widget.OWWidget, RecentPathsWComboMixin):
     icon = "icons/File.svg"
     priority = 10
     category = "Data"
-    keywords = ["file", "load", "read", "open"]
+    keywords = "file, load, read, open"
 
     class Outputs:
         data = Output("Data", Table,
@@ -192,8 +197,9 @@ class OWFile(widget.OWWidget, RecentPathsWComboMixin):
         layout.addWidget(rb_button, 0, 0, Qt.AlignVCenter)
 
         box = gui.hBox(None, addToLayout=False, margin=0)
-        box.setSizePolicy(Policy.MinimumExpanding, Policy.Fixed)
-        self.file_combo.setSizePolicy(Policy.MinimumExpanding, Policy.Fixed)
+        box.setSizePolicy(Policy.Expanding, Policy.Fixed)
+        self.file_combo.setSizePolicy(Policy.Expanding, Policy.Fixed)
+        self.file_combo.setMinimumSize(QSize(100, 1))
         self.file_combo.activated[int].connect(self.select_file)
         box.layout().addWidget(self.file_combo)
         layout.addWidget(box, 0, 1)
@@ -213,9 +219,9 @@ class OWFile(widget.OWWidget, RecentPathsWComboMixin):
 
         self.sheet_box = gui.hBox(None, addToLayout=False, margin=0)
         self.sheet_combo = QComboBox()
-        self.sheet_combo.activated[str].connect(self.select_sheet)
-        self.sheet_combo.setSizePolicy(
-            Policy.MinimumExpanding, Policy.Fixed)
+        self.sheet_combo.textActivated.connect(self.select_sheet)
+        self.sheet_combo.setSizePolicy(Policy.Expanding, Policy.Fixed)
+        self.sheet_combo.setMinimumSize(QSize(50, 1))
         self.sheet_label = QLabel()
         self.sheet_label.setText('Sheet')
         self.sheet_label.setSizePolicy(
@@ -230,16 +236,16 @@ class OWFile(widget.OWWidget, RecentPathsWComboMixin):
         rb_button = gui.appendRadioButton(vbox, "URL:", addToLayout=False)
         layout.addWidget(rb_button, 3, 0, Qt.AlignVCenter)
 
-        self.url_combo = url_combo = QComboBox()
+        self.url_combo = url_combo = TextEditCombo()
         url_model = NamedURLModel(self.sheet_names)
         url_model.wrap(self.recent_urls)
         url_combo.setLineEdit(LineEditSelectOnFocus())
         url_combo.setModel(url_model)
         url_combo.setSizePolicy(Policy.Ignored, Policy.Fixed)
-        url_combo.setEditable(True)
         url_combo.setInsertPolicy(url_combo.InsertAtTop)
         url_edit = url_combo.lineEdit()
-        l, t, r, b = url_edit.getTextMargins()
+        margins = url_edit.textMargins()
+        l, t, r, b = margins.left(), margins.top(), margins.right(), margins.bottom()
         url_edit.setTextMargins(l + 5, t, r, b)
         layout.addWidget(url_combo, 3, 1, 1, 3)
         url_combo.activated.connect(self._url_set)
@@ -254,9 +260,10 @@ class OWFile(widget.OWWidget, RecentPathsWComboMixin):
         gui.widgetBox(self.controlArea, orientation=layout, box='File Type')
 
         box = gui.hBox(None, addToLayout=False, margin=0)
-        box.setSizePolicy(Policy.MinimumExpanding, Policy.Fixed)
+        box.setSizePolicy(Policy.Expanding, Policy.Fixed)
         self.reader_combo = QComboBox(self)
-        self.reader_combo.setSizePolicy(Policy.MinimumExpanding, Policy.Fixed)
+        self.reader_combo.setSizePolicy(Policy.Expanding, Policy.Fixed)
+        self.reader_combo.setMinimumSize(QSize(100, 1))
         self.reader_combo.activated[int].connect(self.select_reader)
 
         box.layout().addWidget(self.reader_combo)
@@ -305,8 +312,7 @@ class OWFile(widget.OWWidget, RecentPathsWComboMixin):
 
         QTimer.singleShot(0, self.load_data)
 
-    @staticmethod
-    def sizeHint():
+    def sizeHint(self):
         return QSize(600, 550)
 
     def select_file(self, n):
@@ -339,14 +345,19 @@ class OWFile(widget.OWWidget, RecentPathsWComboMixin):
                 self.load_data()
 
     def _url_set(self):
+        index = self.url_combo.currentIndex()
         url = self.url_combo.currentText()
-        pos = self.recent_urls.index(url)
         url = url.strip()
 
         if not urlparse(url).scheme:
             url = 'http://' + url
-            self.url_combo.setItemText(pos, url)
-            self.recent_urls[pos] = url
+            self.url_combo.setItemText(index, url)
+
+        if index != 0:
+            model = self.url_combo.model()
+            root = self.url_combo.rootModelIndex()
+            model.moveRow(root, index, root, 0)
+            assert self.url_combo.currentIndex() == 0
 
         self.source = self.URL
         self.load_data()
@@ -502,12 +513,6 @@ class OWFile(widget.OWWidget, RecentPathsWComboMixin):
 
     @staticmethod
     def _describe(table):
-        def missing_prop(prop):
-            if prop:
-                return f"({prop * 100:.1f}% missing values)"
-            else:
-                return "(no missing values)"
-
         domain = table.domain
         text = ""
 
@@ -519,25 +524,29 @@ class OWFile(widget.OWWidget, RecentPathsWComboMixin):
         if descs:
             text += f"<p>{'<br/>'.join(descs)}</p>"
 
-        text += f"<p>{len(table)} instance(s)"
+        text += f"<p>{len(table)} {pl(len(table), 'instance')}"
 
-        missing_in_attr = missing_prop(table.has_missing_attribute()
-                                       and table.get_nan_frequency_attribute())
-        missing_in_class = missing_prop(table.has_missing_class()
-                                        and table.get_nan_frequency_class())
-        text += f"<br/>{len(domain.attributes)} feature(s) {missing_in_attr}"
+        missing_in_attr = missing_in_class = ""
+        if table.X.size < OWFile.SIZE_LIMIT:
+            missing_in_attr = missing_values(table.get_nan_frequency_attribute())
+            missing_in_class = missing_values(table.get_nan_frequency_class())
+        nattrs = len(domain.attributes)
+        text += f"<br/>{nattrs} {pl(nattrs, 'feature')} {missing_in_attr}"
         if domain.has_continuous_class:
             text += f"<br/>Regression; numerical class {missing_in_class}"
         elif domain.has_discrete_class:
+            nvals = len(domain.class_var.values)
             text += "<br/>Classification; categorical class " \
-                f"with {len(domain.class_var.values)} values {missing_in_class}"
+                f"with {nvals} {pl(nvals, 'value')} {missing_in_class}"
         elif table.domain.class_vars:
+            ntargets = len(table.domain.class_vars)
             text += "<br/>Multi-target; " \
-                f"{len(table.domain.class_vars)} target variables " \
+                f"{ntargets} target {pl(ntargets, 'variable')} " \
                 f"{missing_in_class}"
         else:
             text += "<br/>Data has no target variable."
-        text += f"<br/>{len(domain.metas)} meta attribute(s)"
+        nmetas = len(domain.metas)
+        text += f"<br/>{nmetas} {pl(nmetas, 'meta attribute')}"
         text += "</p>"
 
         if 'Timestamp' in table.domain:
@@ -623,24 +632,18 @@ class OWFile(widget.OWWidget, RecentPathsWComboMixin):
 
         self.report_data("Data", self.data)
 
-    @staticmethod
-    def dragEnterEvent(event):
-        """Accept drops of valid file urls"""
-        urls = event.mimeData().urls()
-        if urls:
-            try:
-                FileFormat.get_reader(urls[0].toLocalFile())
-                event.acceptProposedAction()
-            except MissingReaderException:
-                pass
+    def canDropUrl(self, url: QUrl) -> bool:
+        return OWFileDropHandler().canDropUrl(url)
 
-    def dropEvent(self, event):
-        """Handle file drops"""
-        urls = event.mimeData().urls()
-        if urls:
-            self.add_path(urls[0].toLocalFile())  # add first file
+    def handleDroppedUrl(self, url: QUrl) -> None:
+        if url.isLocalFile():
+            self.add_path(url.toLocalFile())  # add first file
             self.source = self.LOCAL_FILE
             self.load_data()
+        else:
+            self.url_combo.insertItem(0, url.toString())
+            self.url_combo.setCurrentIndex(0)
+            self._url_set()
 
     def workflowEnvChanged(self, key, value, oldvalue):
         """
@@ -670,7 +673,7 @@ class OWFileDropHandler(SingleUrlDropHandler):
             r = RecentPath(os.path.abspath(path), None, None,
                            os.path.basename(path))
             return {
-                "recent_paths": [r],
+                "recent_paths": stored_recent_paths_prepend(self.WIDGET, r),
                 "source": OWFile.LOCAL_FILE,
             }
         else:

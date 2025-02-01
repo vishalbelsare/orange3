@@ -13,17 +13,21 @@ from AnyQt.QtCore import Qt, QSize
 import pyqtgraph as pg
 
 import Orange
+from Orange.base import Model
+from Orange.classification import ThresholdClassifier
+from Orange.evaluation.testing import Results
 from Orange.widgets import widget, gui, settings
 from Orange.widgets.evaluate.contexthandlers import \
     EvaluationResultsContextHandler
-from Orange.widgets.evaluate.utils import check_results_adequacy
+from Orange.widgets.evaluate.utils import check_results_adequacy, \
+    check_can_calibrate
 from Orange.widgets.utils import colorpalettes
 from Orange.widgets.utils.widgetpreview import WidgetPreview
-from Orange.widgets.widget import Input
+from Orange.widgets.visualize.utils.plotutils import GraphicsView, PlotItem
+from Orange.widgets.widget import Input, Output, Msg
 from Orange.widgets import report
 
 from Orange.widgets.evaluate.utils import results_for_preview
-from Orange.evaluation.testing import Results
 
 
 #: Points on a ROC curve
@@ -299,10 +303,16 @@ class OWROCAnalysis(widget.OWWidget):
                   "based on the evaluation of classifiers."
     icon = "icons/ROCAnalysis.svg"
     priority = 1010
-    keywords = []
+    keywords = "roc analysis, analyse"
 
     class Inputs:
         evaluation_results = Input("Evaluation Results", Orange.evaluation.Results)
+
+    class Outputs:
+        calibrated_model = Output("Calibrated Model", Model)
+
+    class Information(widget.OWWidget.Information):
+        no_output = Msg("Can't output a model: {}")
 
     buttons_area_orientation = None
     settingsHandler = EvaluationResultsContextHandler()
@@ -323,7 +333,7 @@ class OWROCAnalysis(widget.OWWidget):
     display_convex_hull = settings.Setting(False)
     display_convex_curve = settings.Setting(False)
 
-    graph_name = "plot"
+    graph_name = "plot"  # pg.GraphicsItem (pg.PlotItem)
 
     def __init__(self):
         super().__init__()
@@ -395,32 +405,28 @@ class OWROCAnalysis(widget.OWWidget):
         grid.addWidget(QLabel("Prior probability:"))
         grid.addWidget(self.target_prior_sp, 2, 1)
 
-        self.plotview = pg.GraphicsView(background="w")
+        self.plotview = GraphicsView(background=None)
         self.plotview.setFrameStyle(QFrame.StyledPanel)
         self.plotview.scene().sigMouseMoved.connect(self._on_mouse_moved)
 
-        self.plot = pg.PlotItem(enableMenu=False)
+        self.plot = PlotItem(enableMenu=False)
         self.plot.setMouseEnabled(False, False)
         self.plot.hideButtons()
-
-        pen = QPen(self.palette().color(QPalette.Text))
 
         tickfont = QFont(self.font())
         tickfont.setPixelSize(max(int(tickfont.pixelSize() * 2 // 3), 11))
 
         axis = self.plot.getAxis("bottom")
         axis.setTickFont(tickfont)
-        axis.setPen(pen)
         axis.setLabel("FP Rate (1-Specificity)")
         axis.setGrid(16)
 
         axis = self.plot.getAxis("left")
         axis.setTickFont(tickfont)
-        axis.setPen(pen)
         axis.setLabel("TP Rate (Sensitivity)")
         axis.setGrid(16)
 
-        self.plot.showGrid(True, True, alpha=0.1)
+        self.plot.showGrid(True, True, alpha=0.2)
         self.plot.setRange(xRange=(0.0, 1.0), yRange=(0.0, 1.0), padding=0.05)
 
         self.plotview.setCentralItem(self.plot)
@@ -436,6 +442,7 @@ class OWROCAnalysis(widget.OWWidget):
             self._initialize(self.results)
             self.openContext(self.results.domain.class_var,
                              self.classifier_names)
+            self._set_target_prior()
             self._setup_plot()
         else:
             self.warning()
@@ -469,7 +476,7 @@ class OWROCAnalysis(widget.OWWidget):
             listitem = self.classifiers_list_box.item(i)
             listitem.setIcon(colorpalettes.ColorIcon(self.colors[i]))
 
-        class_var = results.data.domain.class_var
+        class_var = results.domain.class_var
         self.target_cb.addItems(class_var.values)
         self.target_index = 0
         self._set_target_prior()
@@ -553,6 +560,7 @@ class OWROCAnalysis(widget.OWWidget):
                     ind = np.argmin(np.abs(points.thresholds - 0.5))
                     item = pg.TextItem(
                         text="{:.3f}".format(points.thresholds[ind]),
+                        color=foreground
                     )
                     item.setPos(points.fpr[ind], points.tpr[ind])
                     self.plot.addItem(item)
@@ -560,7 +568,7 @@ class OWROCAnalysis(widget.OWWidget):
             hull_curves = [curve.merged.hull for curve in selected]
             if hull_curves:
                 self._rocch = convex_hull(hull_curves)
-                iso_pen = QPen(QColor(Qt.black), 1)
+                iso_pen = QPen(foreground, 1.0)
                 iso_pen.setCosmetic(True)
                 self._perf_line = InfiniteLine(pen=iso_pen, antialias=True)
                 self.plot.addItem(self._perf_line)
@@ -596,7 +604,7 @@ class OWROCAnalysis(widget.OWWidget):
             OWROCAnalysis.Threshold: threshold_averaging,
             OWROCAnalysis.NoAveraging: no_averaging
         }
-
+        foreground = self.plotview.scene().palette().color(QPalette.Text)
         target = self.target_index
         selected = self.selected_classifiers
 
@@ -606,21 +614,23 @@ class OWROCAnalysis(widget.OWWidget):
 
         if self.display_convex_hull and hull_curves:
             hull = convex_hull(hull_curves)
-            hull_pen = QPen(QColor(200, 200, 200, 100), 2)
+            hull_color = QColor(foreground)
+            hull_color.setAlpha(100)
+            hull_pen = QPen(hull_color, 2)
             hull_pen.setCosmetic(True)
+            hull_color.setAlpha(50)
             item = self.plot.plot(
                 hull.fpr, hull.tpr,
                 pen=hull_pen,
-                brush=QBrush(QColor(200, 200, 200, 50)),
+                brush=QBrush(hull_color),
                 fillLevel=0)
             item.setZValue(-10000)
-
-        pen = QPen(QColor(100, 100, 100, 100), 1, Qt.DashLine)
+        line_color = self.palette().color(QPalette.Disabled, QPalette.Text)
+        pen = QPen(QColor(*line_color.getRgb()[:3], 200), 1.0, Qt.DashLine)
         pen.setCosmetic(True)
         self.plot.plot([0, 1], [0, 1], pen=pen, antialias=True)
 
-        if self.roc_averaging == OWROCAnalysis.Merge:
-            self._update_perf_line()
+        self._update_perf_line()
 
         self._update_axes_ticks()
 
@@ -639,14 +649,18 @@ class OWROCAnalysis(widget.OWWidget):
                 return None
             return [[(x, f"{x:.2f}") for x in a[::-1]]]
 
-        data = self.curve_data(self.target_index, self.selected_classifiers[0])
-        points = data.merged.points
+        axis_bottom = self.plot.getAxis("bottom")
+        axis_left = self.plot.getAxis("left")
 
-        axis = self.plot.getAxis("bottom")
-        axis.setTicks(enumticks(points.fpr))
-
-        axis = self.plot.getAxis("left")
-        axis.setTicks(enumticks(points.tpr))
+        if not self.selected_classifiers or len(self.selected_classifiers) > 1 \
+                or self.roc_averaging != OWROCAnalysis.Merge:
+            axis_bottom.setTicks(None)
+            axis_left.setTicks(None)
+        else:
+            data = self.curve_data(self.target_index, self.selected_classifiers[0])
+            points = data.merged.points
+            axis_bottom.setTicks(enumticks(points.fpr))
+            axis_left.setTicks(enumticks(points.tpr))
 
     def _on_mouse_moved(self, pos):
         target = self.target_index
@@ -725,8 +739,7 @@ class OWROCAnalysis(widget.OWWidget):
         self._on_display_perf_line_changed()
 
     def _on_display_perf_line_changed(self):
-        if self.roc_averaging == OWROCAnalysis.Merge:
-            self._update_perf_line()
+        self._update_perf_line()
 
         if self.perf_line is not None:
             self.perf_line.setVisible(self.display_perf_line)
@@ -740,9 +753,12 @@ class OWROCAnalysis(widget.OWWidget):
             self._setup_plot()
 
     def _update_perf_line(self):
-        if self._perf_line is None:
+
+        if self._perf_line is None or self.roc_averaging != OWROCAnalysis.Merge:
+            self._update_output(None)
             return
 
+        ind = None
         self._perf_line.setVisible(self.display_perf_line)
         if self.display_perf_line:
             m = roc_iso_performance_slope(
@@ -756,6 +772,26 @@ class OWROCAnalysis(widget.OWWidget):
                 self._perf_line.setPos((hull.fpr[ind[0]], hull.tpr[ind[0]]))
             else:
                 self._perf_line.setVisible(False)
+
+        self._update_output(None if ind is None else hull.thresholds[ind[0]])
+
+    def _update_output(self, threshold):
+        self.Information.no_output.clear()
+
+        if threshold is None:
+            self.Outputs.calibrated_model.send(None)
+            return
+
+        problems = check_can_calibrate(self.results, self.selected_classifiers)
+        if problems:
+            self.Information.no_output(problems)
+            self.Outputs.calibrated_model.send(None)
+            return
+
+        model = ThresholdClassifier(
+            self.results.models[0][self.selected_classifiers[0]],
+            threshold)
+        self.Outputs.calibrated_model.send(model)
 
     def onDeleteWidget(self):
         self.clear()

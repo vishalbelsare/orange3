@@ -172,8 +172,13 @@ class LearnerScorer(Scorer):
             for attr, score in zip(model_attributes, scores):
                 # Go up the chain of preprocessors to obtain the original variable, but no further
                 # than the data.domain, because the data is perhaphs already preprocessed.
-                while not (attr in data.domain) and getattr(attr, 'compute_value', False):
-                    attr = getattr(attr.compute_value, 'variable', attr)
+                while not (attr in data.domain) and attr.compute_value is not None:
+                    if hasattr(attr.compute_value, 'variable'):
+                        attr = getattr(attr.compute_value, 'variable')
+                    else:
+                        # The attributes's parent can not be identified. Thus, the attributes
+                        # score will be ignored.
+                        break
                 scores_grouped[attr].append(score)
             return [max(scores_grouped[attr])
                     if attr in scores_grouped else 0
@@ -367,7 +372,7 @@ class ReliefF(Scorer):
         from Orange.preprocess._relieff import relieff
         weights = np.asarray(relieff(data.X, data.Y,
                                      self.n_iterations, self.k_nearest,
-                                     np.array([a.is_discrete for a in data.domain.attributes]),
+                                     np.array([a.is_discrete for a in data.domain.attributes], dtype=bool),
                                      rstate))
         if feature:
             return weights[0]

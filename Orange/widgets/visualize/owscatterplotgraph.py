@@ -1,15 +1,15 @@
 import sys
 import itertools
 import warnings
+from typing import Callable
 from xml.sax.saxutils import escape
-from math import log10, floor, ceil
 from datetime import datetime, timezone
 
 import numpy as np
 from AnyQt.QtCore import Qt, QRectF, QSize, QTimer, pyqtSignal as Signal, \
-    QObject
+    QObject, QEvent
 from AnyQt.QtGui import QColor, QPen, QBrush, QPainterPath, QTransform, \
-    QPainter
+    QPainter, QPalette
 from AnyQt.QtWidgets import QApplication, QToolTip, QGraphicsTextItem, \
     QGraphicsRectItem, QGraphicsItemGroup
 
@@ -27,7 +27,7 @@ from Orange.widgets.visualize.utils.customizableplot import Updater, \
     CommonParameterSetter
 from Orange.widgets.visualize.utils.plotutils import (
     HelpEventDelegate as EventDelegate, InteractiveViewBox as ViewBox,
-    PaletteItemSample, SymbolItemSample, AxisItem
+    PaletteItemSample, SymbolItemSample, AxisItem, PlotWidget, DiscretizedScale
 )
 
 SELECTION_WIDTH = 5
@@ -38,20 +38,19 @@ MAX_COLORS = 11
 
 
 class LegendItem(PgLegendItem):
-    def __init__(self, size=None, offset=None, pen=None, brush=None):
+    def __init__(
+            self, size=None, offset=None, pen=None, brush=None,
+    ):
         super().__init__(size, offset)
 
         self.layout.setContentsMargins(5, 5, 5, 5)
         self.layout.setHorizontalSpacing(15)
         self.layout.setColumnAlignment(1, Qt.AlignLeft | Qt.AlignVCenter)
-
-        if pen is None:
-            pen = QPen(QColor(196, 197, 193, 200), 1)
-            pen.setCosmetic(True)
+        if pen is not None:
+            pen = QPen(pen)
+        if brush is not None:
+            brush = QBrush(brush)
         self.__pen = pen
-
-        if brush is None:
-            brush = QBrush(QColor(232, 232, 232, 100))
         self.__brush = brush
 
     def restoreAnchor(self, anchors):
@@ -65,16 +64,17 @@ class LegendItem(PgLegendItem):
 
     # pylint: disable=arguments-differ
     def paint(self, painter, _option, _widget=None):
-        painter.setPen(self.__pen)
-        painter.setBrush(self.__brush)
+        painter.setPen(self.pen())
+        painter.setBrush(self.brush())
         rect = self.contentsRect()
         painter.drawRoundedRect(rect, 2, 2)
 
     def addItem(self, item, name):
         super().addItem(item, name)
-        # Fix-up the label alignment
+        # Fix-up the label alignment, and color
+        color = self.palette().color(QPalette.Text)
         _, label = self.items[-1]
-        label.setText(name, justify="left")
+        label.setText(name, justify="left", color=color)
 
     def clear(self):
         """
@@ -89,6 +89,31 @@ class LegendItem(PgLegendItem):
             label.hide()
 
         self.updateSize()
+
+    def pen(self):
+        if self.__pen is not None:
+            return QPen(self.__pen)
+        else:
+            color = self.palette().color(QPalette.Disabled, QPalette.Text)
+            color.setAlpha(100)
+            pen = QPen(color, 1)
+            pen.setCosmetic(True)
+            return pen
+
+    def brush(self):
+        if self.__brush is not None:
+            return QBrush(self.__brush)
+        else:
+            color = self.palette().color(QPalette.Window)
+            color.setAlpha(150)
+            return QBrush(color)
+
+    def changeEvent(self, event: QEvent):
+        if event.type() == QEvent.PaletteChange:
+            color = self.palette().color(QPalette.Text)
+            for _, label in self.items:
+                label.setText(label.text, color=color)
+        super().changeEvent(event)
 
 
 def bound_anchor_pos(corner, parentpos):
@@ -107,60 +132,6 @@ def bound_anchor_pos(corner, parentpos):
     if iry < 0.1 and pry > 0.9:
         iry = pry = 1.0
     return (irx, iry), (prx, pry)
-
-
-class DiscretizedScale:
-    """
-    Compute suitable bins for continuous value from its minimal and
-    maximal value.
-
-    The width of the bin is a power of 10 (including negative powers).
-    The minimal value is rounded up and the maximal is rounded down. If this
-    gives less than 3 bins, the width is divided by four; if it gives
-    less than 6, it is halved.
-
-    .. attribute:: offset
-        The start of the first bin.
-
-    .. attribute:: width
-        The width of the bins
-
-    .. attribute:: bins
-        The number of bins
-
-    .. attribute:: decimals
-        The number of decimals used for printing out the boundaries
-    """
-    def __init__(self, min_v, max_v):
-        """
-        :param min_v: Minimal value
-        :type min_v: float
-        :param max_v: Maximal value
-        :type max_v: float
-        """
-        super().__init__()
-        dif = max_v - min_v if max_v != min_v else 1
-        if np.isnan(dif):
-            min_v = 0
-            dif = decimals = 1
-        else:
-            decimals = -floor(log10(dif))
-        resolution = 10 ** -decimals
-        bins = ceil(dif / resolution)
-        if bins < 6:
-            decimals += 1
-            if bins < 3:
-                resolution /= 4
-            else:
-                resolution /= 2
-            bins = ceil(dif / resolution)
-        self.offset = resolution * floor(min_v // resolution)
-        self.bins = bins
-        self.decimals = max(decimals, 0)
-        self.width = resolution
-
-    def get_bins(self):
-        return self.offset + self.width * np.arange(self.bins + 1)
 
 
 class ScatterPlotItem(pg.ScatterPlotItem):
@@ -319,6 +290,11 @@ class AxisItem(AxisItem):
             return super().tickValues(minVal, maxVal, size)
 
         ticks = bins.thresholds
+        # Remove ticks that will later be removed in AxisItem.generateDrawSpecs
+        # because they are out of range. Removing them here is needed so that
+        # they do not affect spaces and label format
+        ticks = ticks[int((ticks[0] < minVal))
+                      :len(ticks) - int((ticks[-1] > maxVal))]
 
         max_steps = max(int(size / self._label_width), 1)
         if len(ticks) > max_steps:
@@ -326,7 +302,10 @@ class AxisItem(AxisItem):
             step = int(np.ceil(float(len(ticks)) / max_steps))
             ticks = ticks[::step]
 
-        spacing = min(b - a for a, b in zip(ticks[:-1], ticks[1:]))
+        # In case of a single tick, `default` will inform tickStrings
+        # about the appropriate scale.
+        spacing = min((b - a for a, b in zip(ticks[:-1], ticks[1:])),
+                      default=maxVal - minVal)
         return [(spacing, ticks)]
 
     def tickStrings(self, values, scale, spacing):
@@ -546,8 +525,10 @@ class OWScatterPlotBase(gui.OWComponent, QObject):
 
         self.view_box = view_box(self)
         _axis = {"left": AxisItem("left"), "bottom": AxisItem("bottom")}
-        self.plot_widget = pg.PlotWidget(viewBox=self.view_box, parent=parent,
-                                         background="w", axisItems=_axis)
+        self.plot_widget = PlotWidget(
+            viewBox=self.view_box, parent=parent, background=None,
+            axisItems=_axis
+        )
         self.plot_widget.hideAxis("left")
         self.plot_widget.hideAxis("bottom")
         self.plot_widget.getPlotItem().buttonsHidden = True
@@ -624,7 +605,9 @@ class OWScatterPlotBase(gui.OWComponent, QObject):
         r = text.boundingRect()
         text.setTextWidth(r.width())
         rect = QGraphicsRectItem(0, 0, r.width() + 8, r.height() + 4)
-        rect.setBrush(QColor(224, 224, 224, 212))
+        color = self.plot_widget.palette().color(QPalette.Disabled, QPalette.Window)
+        color.setAlpha(212)
+        rect.setBrush(color)
         rect.setPen(QPen(Qt.NoPen))
         self.update_tooltip()
 
@@ -1035,17 +1018,17 @@ class OWScatterPlotBase(gui.OWComponent, QObject):
         Returns:
             (tuple): a list of pens and list of brushes
         """
-
+        alpha_subset, alpha_unset = self._alpha_for_subsets()
         if subset is not None:
-            colors = [QColor(*color, alpha)
-                      for alpha in self._alpha_for_subsets()]
-            brushes = [QBrush(color) for color in colors]
-            brush = np.where(subset, *brushes)
+            qcolor = QColor(*color, alpha_subset)
+            brush = np.where(subset, QBrush(qcolor), QBrush(QColor(0, 0, 0, 0)))
+            pen = np.where(subset,
+                           _make_pen(qcolor, 1.5),
+                           _make_pen(QColor(*color, alpha_unset), 1.5))
         else:
             qcolor = QColor(*color, self.alpha_value)
             brush = np.full(self.n_shown, QBrush(qcolor))
-        qcolor = QColor(*color, self.alpha_value)
-        pen = [_make_pen(qcolor, 1.5)] * self.n_shown
+            pen = [_make_pen(qcolor, 1.5)] * self.n_shown
         return pen, brush
 
     def _get_continuous_colors(self, c_data, subset):
@@ -1286,16 +1269,16 @@ class OWScatterPlotBase(gui.OWComponent, QObject):
                 mask = None
 
         self._signal_too_many_labels(
-            mask is not None and mask.sum() > self.MAX_VISIBLE_LABELS)
+            bool(mask is not None and mask.sum() > self.MAX_VISIBLE_LABELS))
         if self._too_many_labels or mask is None or not np.any(mask):
             return
 
-        black = pg.mkColor(0, 0, 0)
+        foreground = self.plot_widget.palette().color(QPalette.Text)
         labels = labels[mask]
         x = x[mask]
         y = y[mask]
         for label, xp, yp in zip(labels, x, y):
-            ti = TextItem(label, black)
+            ti = TextItem(label, foreground)
             ti.setPos(xp, yp)
             self.plot_widget.addItem(ti)
             self.labels.append(ti)
@@ -1482,7 +1465,7 @@ class OWScatterPlotBase(gui.OWComponent, QObject):
                 SymbolItemSample(pen=color, brush=color, size=10, symbol=symbol),
                 escape(label))
 
-    def _update_continuous_color_legend(self, label_formatter):
+    def _update_continuous_color_legend(self, label_formatter: Callable[[float], str]):
         self.color_legend.clear()
         if self.scale is None or self.scatterplot_item is None:
             return

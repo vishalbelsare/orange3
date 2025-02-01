@@ -169,7 +169,7 @@ class TestOWDataProjectionWidget(WidgetTest, ProjectionWidgetTestMixin,
         super().setUpClass()
         WidgetOutputsTestMixin.init(cls)
 
-        cls.signal_name = "Data"
+        cls.signal_name = TestableDataProjectionWidget.Inputs.data
         cls.signal_data = cls.data
         cls.same_input_output_domain = False
 
@@ -184,7 +184,7 @@ class TestOWDataProjectionWidget(WidgetTest, ProjectionWidgetTestMixin,
         points = self.widget.graph.scatterplot_item.points()
         self.widget.graph.select_by_click(None, [points[1]])
         annotated = self.get_output(self.widget.Outputs.annotated_data)
-        np.testing.assert_equal(annotated.get_column_view('Selected')[0], np.array([0, 0, 1]))
+        np.testing.assert_equal(annotated.get_column('Selected'), np.array([0, 0, 1]))
 
     def test_saved_selection(self):
         self.send_signal(self.widget.Inputs.data, self.data)

@@ -7,9 +7,9 @@ import numpy as np
 import scipy.sparse as sp
 
 from Orange import preprocess
-from Orange.preprocess import impute
+from Orange.preprocess import impute, SklImpute
 from Orange import data
-from Orange.data import Unknown, Table
+from Orange.data import Unknown, Table, Domain
 
 from Orange.classification import MajorityLearner, SimpleTreeLearner
 from Orange.regression import MeanLearner
@@ -293,6 +293,27 @@ class TestModel(unittest.TestCase):
         self.assertRaises(ValueError, imputer, data=table,
                           variable=table.domain[0])
 
+    def test_missing_imputed_columns(self):
+        housing = Table("housing")
+
+        learner = SimpleTreeLearner(min_instances=10, max_depth=10)
+        method = preprocess.impute.Model(learner)
+
+        ivar = method(housing, housing.domain.attributes[0])
+        imputed = housing.transform(
+            Domain([ivar],
+                   housing.domain.class_var)
+        )
+        removed_imputed = imputed.transform(
+            Domain([], housing.domain.class_var))
+
+        r = removed_imputed.transform(imputed.domain)
+
+        no_class = removed_imputed.transform(Domain(removed_imputed.domain.attributes, None))
+        model_prediction_for_unknowns = ivar.compute_value.model(no_class[0])
+
+        np.testing.assert_equal(r.X, model_prediction_for_unknowns)
+
 
 class TestRandom(unittest.TestCase):
     def test_replacement(self):
@@ -329,3 +350,44 @@ class TestImputer(unittest.TestCase):
         auto = data.Table(test_filename('datasets/imports-85.tab'))
         auto2 = preprocess.Impute()(auto)
         self.assertFalse(np.isnan(auto2.X).any())
+
+
+class TestSklImpute(unittest.TestCase):
+
+    def setUp(self):
+        nan = np.nan
+        X = [
+            [1.0, nan, 0.0],
+            [2.0, 1.0, 3.0],
+            [nan, nan, nan]
+        ]
+        self.imputed_mean = [
+            [1.0, 1.0, 0.0],
+            [2.0, 1.0, 3.0],
+            [1.5, 1.0, 1.5]
+        ]
+        domain = data.Domain((data.ContinuousVariable(n) for n in "ABC"))
+        self.table = data.Table.from_numpy(domain, np.array(X))
+
+    def test_values(self):
+        imputed = SklImpute()(self.table)
+        np.testing.assert_equal(imputed.X, self.imputed_mean)
+
+    def test_sparse(self):
+        sparse = self.table.to_sparse()
+        self.assertTrue(sp.issparse(sparse.X))
+        imputed = SklImpute()(sparse)
+        self.assertTrue(sp.issparse(imputed.X))
+        np.testing.assert_equal(imputed.X.todense(), self.imputed_mean)
+
+    def test_transform(self):
+        imputed = SklImpute()(self.table)
+        transformed = self.table.transform(imputed.domain)
+        np.testing.assert_equal(transformed.X, self.imputed_mean)
+
+    def test_transform_sparse(self):
+        sparse = self.table.to_sparse()
+        imputed = SklImpute()(sparse)
+        self.assertTrue(sp.issparse(sparse.X))
+        transformed = sparse.transform(imputed.domain)
+        np.testing.assert_equal(transformed.X.todense(), self.imputed_mean)

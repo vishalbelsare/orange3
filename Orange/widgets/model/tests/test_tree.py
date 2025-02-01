@@ -1,5 +1,6 @@
 # pylint: disable=protected-access
 import numpy as np
+from AnyQt.QtCore import Qt
 
 from Orange.base import Model
 from Orange.data import Table
@@ -35,7 +36,7 @@ class TestOWClassificationTree(WidgetTest, WidgetLearnerTestMixin):
         when pruning parameters are not checked
         """
         for cb in self.checks:
-            cb.setCheckState(False)
+            cb.setCheckState(Qt.Unchecked)
         self.parameters = [DefaultParameterMapping(par.name, val)
                            for par, val in zip(self.parameters, (None, 2, 1))]
         self.test_parameters()
@@ -46,11 +47,11 @@ class TestOWClassificationTree(WidgetTest, WidgetLearnerTestMixin):
         GH-2430
         """
         table1 = Table("iris")
-        self.send_signal("Data", table1)
-        model_dense = self.get_output("Model")
+        self.send_signal(self.widget.Inputs.data, table1)
+        model_dense = self.get_output(self.widget.Outputs.model)
         table2 = Table("iris").to_sparse()
-        self.send_signal("Data", table2)
-        model_sparse = self.get_output("Model")
+        self.send_signal(self.widget.Inputs.data, table2)
+        model_sparse = self.get_output(self.widget.Outputs.model)
         self.assertTrue(np.array_equal(model_dense._code, model_sparse._code))
         self.assertTrue(np.array_equal(model_dense._values, model_sparse._values))
 
@@ -60,10 +61,10 @@ class TestOWClassificationTree(WidgetTest, WidgetLearnerTestMixin):
         GH-2497
         """
         table1 = Table("housing")
-        self.send_signal("Data", table1)
-        model_dense = self.get_output("Model")
+        self.send_signal(self.widget.Inputs.data, table1)
+        model_dense = self.get_output(self.widget.Outputs.model)
         table2 = Table("housing").to_sparse()
-        self.send_signal("Data", table2)
-        model_sparse = self.get_output("Model")
+        self.send_signal(self.widget.Inputs.data, table2)
+        model_sparse = self.get_output(self.widget.Outputs.model)
         self.assertTrue(np.array_equal(model_dense._code, model_sparse._code))
         self.assertTrue(np.array_equal(model_dense._values, model_sparse._values))

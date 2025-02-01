@@ -12,7 +12,8 @@ from collections import namedtuple
 
 from AnyQt.QtWidgets import (
     QLabel, QLineEdit, QTextBrowser, QSplitter, QTreeView,
-    QStyleOptionViewItem, QStyledItemDelegate, QStyle, QApplication
+    QStyleOptionViewItem, QStyledItemDelegate, QStyle, QApplication,
+    QHBoxLayout, QComboBox
 )
 from AnyQt.QtGui import QStandardItemModel, QStandardItem, QBrush, QColor
 from AnyQt.QtCore import (
@@ -25,13 +26,23 @@ from serverfiles import LocalFiles, ServerFiles, sizeformat
 
 import Orange.data
 from Orange.misc.environ import data_dir
-from Orange.widgets import settings, gui
+from Orange.widgets import  gui
+from Orange.widgets.settings import Setting
 from Orange.widgets.utils.signals import Output
 from Orange.widgets.utils.widgetpreview import WidgetPreview
 from Orange.widgets.widget import OWWidget, Msg
 
 
 log = logging.getLogger(__name__)
+
+# These two constants are used in settings (and in the proxy filter model).
+# The corresponding options in the combo box are translatable, therefore
+# the settings must be stored in language-independent form.
+GENERAL_DOMAIN = None
+ALL_DOMAINS = ""  # The setting is Optional[str], so don't use other types here
+
+# The number of characters at which filter overrides the domain and language
+FILTER_OVERRIDE_LENGTH = 4
 
 
 def ensure_local(index_url, file_path, local_cache_path,
@@ -100,6 +111,8 @@ class UniformHeightIndicatorDelegate(
 
 
 class Namespace(SimpleNamespace):
+    PUBLISHED, UNLISTED = range(2)
+
     def __init__(self, **kwargs):
         self.file_path = None
         self.prefix = None
@@ -119,8 +132,11 @@ class Namespace(SimpleNamespace):
         self.references = []
         self.seealso = []
         self.tags = []
+        self.language = "English"
+        self.domain = None
+        self.publication_status = self.PUBLISHED
 
-        super(Namespace, self).__init__(**kwargs)
+        super().__init__(**kwargs)
 
         # if title missing, use filename
         if not self.title and self.filename:
@@ -137,13 +153,53 @@ class TreeViewWithReturn(QTreeView):
             super().keyPressEvent(e)
 
 
+class SortFilterProxyWithLanguage(QSortFilterProxyModel):
+    def __init__(self):
+        super().__init__()
+        self.__language = None
+        self.__domain = None
+        self.__filter = None
+
+    def setFilterFixedString(self, pattern):
+        self.__filter = pattern and pattern.casefold()
+        super().setFilterFixedString(pattern)
+
+    def setLanguage(self, language):
+        self.__language = language
+        self.invalidateFilter()
+
+    def language(self):
+        return self.__language
+
+    def setDomain(self, domain):
+        self.__domain = domain
+        self.invalidateFilter()
+
+    def domain(self):
+        return self.__domain
+
+    def filterAcceptsRow(self, row, parent):
+        source = self.sourceModel()
+        data = source.index(row, 0).data(Qt.UserRole)
+        in_filter = (
+            self.__filter is not None
+            and len(self.__filter) >= FILTER_OVERRIDE_LENGTH
+            and self.__filter in data.title.casefold()
+        )
+        published_ok = data.publication_status == Namespace.PUBLISHED
+        domain_ok = self.__domain in (ALL_DOMAINS, data.domain)
+        language_ok = self.__language in (None, data.language)
+        return (super().filterAcceptsRow(row, parent)
+            and (published_ok and domain_ok and language_ok
+                 or in_filter))
+
 class OWDataSets(OWWidget):
     name = "Datasets"
     description = "Load a dataset from an online repository"
     icon = "icons/DataSets.svg"
     priority = 20
     replaces = ["orangecontrib.prototypes.widgets.owdatasets.OWDataSets"]
-    keywords = ["online", "data sets"]
+    keywords = "datasets, online, data, sets"
 
     want_control_area = False
 
@@ -152,6 +208,12 @@ class OWDataSets(OWWidget):
     # Take care when refactoring! (used in e.g. single-cell)
     INDEX_URL = "https://datasets.biolab.si/"
     DATASET_DIR = "datasets"
+    DEFAULT_LANG = "English"
+    ALL_LANGUAGES = "All Languages"
+
+    # These two combo options are translatable; others (domain names) are not
+    GENERAL_DOMAIN_LABEL = "(General)"
+    ALL_DOMAINS_LABEL = "(Show all)"
 
     # override HEADER_SCHEMA to define new columns
     # if schema is changed override methods: self.assign_delegates and
@@ -179,11 +241,15 @@ class OWDataSets(OWWidget):
         data = Output("Data", Orange.data.Table)
 
     #: Selected dataset id
-    selected_id = settings.Setting(None)   # type: Optional[str]
+    selected_id: Optional[str] = Setting(None)
+    language = Setting(DEFAULT_LANG)
+    domain = Setting(GENERAL_DOMAIN)
+    filter_hint: Optional[str] = Setting(None)
+    settings_version = 2
 
     #: main area splitter state
-    splitter_state = settings.Setting(b'')  # type: bytes
-    header_state = settings.Setting(b'')    # type: bytes
+    splitter_state = Setting(b'')  # type: bytes
+    header_state = Setting(b'')    # type: bytes
 
     def __init__(self):
         super().__init__()
@@ -204,10 +270,46 @@ class OWDataSets(OWWidget):
 
         self.__awaiting_state = None  # type: Optional[_FetchState]
 
+        layout = QHBoxLayout()
         self.filterLineEdit = QLineEdit(
             textChanged=self.filter, placeholderText="Search for data set ..."
         )
-        self.mainArea.layout().addWidget(self.filterLineEdit)
+        self.filterLineEdit.setToolTip(
+            "Typing four letters or more overrides domain and language filters")
+        layout.addWidget(self.filterLineEdit)
+
+        self.combo_elements = []
+
+        layout.addSpacing(20)
+        label = QLabel("Show data sets in ")
+        layout.addWidget(label)
+        self.combo_elements.append(label)
+
+        lang_combo = self.language_combo = QComboBox()
+        languages = [self.DEFAULT_LANG, self.ALL_LANGUAGES]
+        if self.language is not None and self.language not in languages:
+            languages.insert(1, self.language)
+        lang_combo.addItems(languages)
+        if self.language is None:
+            lang_combo.setCurrentIndex(lang_combo.count() - 1)
+        else:
+            lang_combo.setCurrentText(self.language)
+        lang_combo.activated.connect(self._on_language_changed)
+        layout.addWidget(lang_combo)
+        self.combo_elements.append(lang_combo)
+
+        domain_combo = self.domain_combo = QComboBox()
+        domain_combo.addItem(self.GENERAL_DOMAIN_LABEL)
+        domain_combo.activated.connect(self._on_domain_changed)
+        if self.core_widget:
+            layout.addSpacing(20)
+            label = QLabel("Domain:")
+            layout.addWidget(label)
+            self.combo_elements.append(label)
+            layout.addWidget(domain_combo)
+        self.combo_elements.append(domain_combo)
+
+        self.mainArea.layout().addLayout(layout)
 
         self.splitter = QSplitter(orientation=Qt.Vertical)
 
@@ -248,10 +350,13 @@ class OWDataSets(OWWidget):
         )
         self.mainArea.layout().addWidget(self.splitter)
 
-        proxy = QSortFilterProxyModel()
+        proxy = SortFilterProxyWithLanguage()
         proxy.setFilterKeyColumn(-1)
         proxy.setFilterCaseSensitivity(Qt.CaseInsensitive)
         self.view.setModel(proxy)
+        if not self.core_widget:
+            self.domain = ALL_DOMAINS
+            self.view.model().setDomain(self.domain)
 
         if self.splitter_state:
             self.splitter.restoreState(self.splitter_state)
@@ -266,6 +371,20 @@ class OWDataSets(OWWidget):
         w = FutureWatcher(f, parent=self)
         w.done.connect(self.__set_index)
 
+        self._on_language_changed()
+
+    # Single cell add-on has a data set widget that derives from this one
+    # although this class isn't defined as open. Adding the domain broke
+    # single-cell. A proper solution would be to split this widget into an
+    # (open) base class and a closed widget that adds the domain functionality.
+    # Yet, simply excluding three chunks of code makes this code simpler
+    # - which is better, if we assume that extending this widget is an anomaly.
+    @property
+    def core_widget(self):
+        # Compare by names; unit tests wrap widget classes in to detect
+        # missing onDeleteWidget calls
+        return type(self).__name__ == OWDataSets.__name__
+
     def assign_delegates(self):
         # NOTE: All columns must have size hinting delegates.
         # QTreeView queries only the columns displayed in the viewport so
@@ -274,7 +393,7 @@ class OWDataSets(OWWidget):
         self.view.setItemDelegate(UniformHeightDelegate(self))
         self.view.setItemDelegateForColumn(
             self.Header.islocal,
-            UniformHeightIndicatorDelegate(self, role=Qt.DisplayRole, indicatorSize=4)
+            UniformHeightIndicatorDelegate(self, indicatorSize=4)
         )
         self.view.setItemDelegateForColumn(
             self.Header.size,
@@ -312,6 +431,39 @@ class OWDataSets(OWWidget):
                          islocal=islocal, outdated=outdated, **info)
 
     def create_model(self):
+        self.update_language_combo()
+        self.update_domain_combo()
+        return self.update_model()
+
+    def update_language_combo(self):
+        combo = self.language_combo
+        current_language = combo.currentText()
+        allkeys = set(self.allinfo_local) | set(self.allinfo_remote)
+        languages = {self._parse_info(key).language for key in allkeys}
+        if self.language is not None:
+            languages.add(self.language)
+        languages = sorted(languages)
+        combo.clear()
+        if self.DEFAULT_LANG not in languages:
+            combo.addItem(self.DEFAULT_LANG)
+        combo.addItems(languages + [self.ALL_LANGUAGES])
+        if current_language in languages or current_language == self.ALL_LANGUAGES:
+            combo.setCurrentText(current_language)
+        elif self.DEFAULT_LANG in languages:
+            combo.setCurrentText(self.DEFAULT_LANG)
+        else:
+            combo.setCurrentText(self.ALL_LANGUAGES)
+
+    def update_domain_combo(self):
+        combo = self.domain_combo
+        allkeys = set(self.allinfo_local) | set(self.allinfo_remote)
+        domains = {self._parse_info(key).domain for key in allkeys}
+        domains -= {None, "sc"}
+        if domains:
+            combo.addItems(sorted(domains))
+            combo.addItem(self.ALL_DOMAINS_LABEL)
+
+    def update_model(self):
         allkeys = set(self.allinfo_local) | set(self.allinfo_remote)
         allkeys = sorted(allkeys)
 
@@ -319,10 +471,14 @@ class OWDataSets(OWWidget):
         model.setHorizontalHeaderLabels(self._header_labels)
 
         current_index = -1
+        localinfo = list_local(self.local_cache_path)
         for i, file_path in enumerate(allkeys):
             datainfo = self._parse_info(file_path)
             item1 = QStandardItem()
-            item1.setData(" " if datainfo.islocal else "", Qt.DisplayRole)
+            # this elegant and spotless trick is used for sorting
+            state = self.indicator_state_for_info(datainfo, localinfo)
+            item1.setData({None: "", False: " ", True: "  "}[state], Qt.DisplayRole)
+            item1.setData(state, UniformHeightIndicatorDelegate.IndicatorRole)
             item1.setData(self.IndicatorBrushes[0], Qt.ForegroundRole)
             item1.setData(datainfo, Qt.UserRole)
             item2 = QStandardItem(datainfo.title)
@@ -342,10 +498,44 @@ class OWDataSets(OWWidget):
             row = [item1, item2, item3, item4, item5, item6, item7]
             model.appendRow(row)
 
-            if os.path.join(*file_path) == self.selected_id:
+            # for settings do not use os.path.join (Windows separator is different)
+            if file_path[-1] == self.selected_id:
                 current_index = i
+                if self.core_widget:
+                    self.domain = datainfo.domain
+                    if self.domain == "sc":  # domain from the list of ignored domain
+                        self.domain = ALL_DOMAINS
+                    self.__update_domain_combo()
+                    self._on_domain_changed()
 
         return model, current_index
+
+    def __update_domain_combo(self):
+        combo = self.domain_combo
+        if self.domain == GENERAL_DOMAIN:
+            combo.setCurrentIndex(0)
+        elif self.domain == ALL_DOMAINS:
+            combo.setCurrentIndex(combo.count() - 1)
+        else:
+            combo.setCurrentText(self.domain)
+
+    def _on_language_changed(self):
+        combo = self.language_combo
+        if combo.currentIndex() == combo.count() - 1:
+            self.language = None
+        else:
+            self.language = combo.currentText()
+        self.view.model().setLanguage(self.language)
+
+    def _on_domain_changed(self):
+        combo = self.domain_combo
+        if combo.currentIndex() == 0:
+            self.domain = GENERAL_DOMAIN
+        elif combo.currentIndex() == combo.count() - 1:
+            self.domain = ALL_DOMAINS
+        else:
+            self.domain = combo.currentText()
+        self.view.model().setDomain(self.domain)
 
     @Slot(object)
     def __set_index(self, f):
@@ -368,14 +558,26 @@ class OWDataSets(OWWidget):
             self.allinfo_remote = {}
 
         model, current_index = self.create_model()
+        self.set_model(model, current_index)
 
+    def set_model(self, model, current_index):
         self.view.model().setSourceModel(model)
+        if current_index != -1:
+            for hint in (
+                    self.filter_hint,
+                    model.index(current_index, 0).data(Qt.UserRole).title):
+                if self.view.model().filterAcceptsRow(current_index,
+                                                      QModelIndex()):
+                    break
+                self.filterLineEdit.setText(hint)
+                self.filter()
+
         self.view.selectionModel().selectionChanged.connect(
             self.__on_selection
         )
 
         scw = self.view.setColumnWidth
-        width = self.view.fontMetrics().width
+        width = self.view.fontMetrics().horizontalAdvance
         self.view.resizeColumnToContents(0)
         scw(self.Header.title, width("X" * 37))
         scw(self.Header.size, 20 + max(width("888 bytes "), width("9999.9 MB ")))
@@ -392,20 +594,26 @@ class OWDataSets(OWWidget):
                 QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
             self.commit()
 
+    def indicator_state_for_info(self, info, localinfo):
+        if not info.file_path in localinfo:
+            return None
+        return (
+            os.path.join(self.local_cache_path, *info.file_path)
+            == self.current_output)
+
     def __update_cached_state(self):
         model = self.view.model().sourceModel()
-        localinfo = list_local(self.local_cache_path)
         assert isinstance(model, QStandardItemModel)
         allinfo = []
+        localinfo = list_local(self.local_cache_path)
         for i in range(model.rowCount()):
             item = model.item(i, 0)
             info = item.data(Qt.UserRole)
-            is_local = info.file_path in localinfo
-            is_current = (is_local and
-                          os.path.join(self.local_cache_path, *info.file_path)
-                          == self.current_output)
-            item.setData(" " * (is_local + is_current), Qt.DisplayRole)
-            item.setData(self.IndicatorBrushes[is_current], Qt.ForegroundRole)
+            state = self.indicator_state_for_info(info, localinfo)
+            # this elegant and spotless trick is used for sorting
+            item.setData({None: "", False: " ", True: "  "}[state], Qt.DisplayRole)
+            item.setData(state, UniformHeightIndicatorDelegate.IndicatorRole)
+            item.setData(self.IndicatorBrushes[bool(state)], Qt.ForegroundRole)
             allinfo.append(info)
 
     def selected_dataset(self):
@@ -428,6 +636,18 @@ class OWDataSets(OWWidget):
 
     def filter(self):
         filter_string = self.filterLineEdit.text().strip()
+        enable_combos = len(filter_string) < FILTER_OVERRIDE_LENGTH
+        if enable_combos is not self.domain_combo.isEnabled():
+            for element in self.combo_elements:
+                element.setEnabled(enable_combos)
+            if enable_combos:
+                self.__update_domain_combo()
+                self.language_combo.setCurrentText(self.language)
+            else:
+                self.domain_combo.setCurrentText(self.ALL_DOMAINS_LABEL)
+                self.language_combo.setCurrentText(self.ALL_LANGUAGES)
+
+        self.filter_hint = filter_string
         proxyModel = self.view.model()
         if proxyModel:
             proxyModel.setFilterFixedString(filter_string)
@@ -442,10 +662,8 @@ class OWDataSets(OWWidget):
             di = current.data(Qt.UserRole)
             text = description_html(di)
             self.descriptionlabel.setText(text)
-            self.selected_id = os.path.join(di.prefix, di.filename)
         else:
             self.descriptionlabel.setText("")
-            self.selected_id = None
 
     def commit(self):
         """
@@ -458,6 +676,7 @@ class OWDataSets(OWWidget):
         di = self.selected_dataset()
         if di is not None:
             self.Error.clear()
+            self.selected_id = di.file_path[-1]
 
             if self.__awaiting_state is not None:
                 # disconnect from the __commit_complete
@@ -473,8 +692,7 @@ class OWDataSets(OWWidget):
                 self.__awaiting_state = None
 
             if not di.islocal:
-                pr = progress()
-                callback = lambda pr=pr: pr.advance.emit()
+                pr = Progress()
                 pr.advance.connect(self.__progress_advance, Qt.QueuedConnection)
 
                 self.progressBarInit()
@@ -484,7 +702,7 @@ class OWDataSets(OWWidget):
                 f = self._executor.submit(
                     ensure_local, self.INDEX_URL, di.file_path,
                     self.local_cache_path, force=di.outdated,
-                    progress_advance=callback)
+                    progress_advance=pr.advance.emit)
                 w = FutureWatcher(f, parent=self)
                 w.done.connect(self.__commit_complete)
                 self.__awaiting_state = _FetchState(f, w, pr)
@@ -493,6 +711,7 @@ class OWDataSets(OWWidget):
                 self.setBlocking(False)
                 self.commit_cached(di.file_path)
         else:
+            self.selected_id = None
             self.load_and_output(None)
 
     @Slot(object)
@@ -535,8 +754,7 @@ class OWDataSets(OWWidget):
             self.__awaiting_state.pb.advance.disconnect(self.__progress_advance)
             self.__awaiting_state = None
 
-    @staticmethod
-    def sizeHint():
+    def sizeHint(self):
         return QSize(1100, 500)
 
     def closeEvent(self, event):
@@ -558,6 +776,15 @@ class OWDataSets(OWWidget):
     def load_data(path):
         return Orange.data.Table(path)
 
+    @classmethod
+    def migrate_settings(cls, settings, version: Optional[int] = None):
+        selected_id = settings.get("selected_id")
+        if isinstance(selected_id, str):
+            # until including 3.36.0 selected dataset was saved with \ on Windows
+            selected_id = selected_id.replace("\\", "/")
+            if version is None or version < 2:
+                settings["selected_id"] = selected_id.split("/")[-1]
+
 
 class FutureWatcher(QObject):
     done = Signal(object)
@@ -575,7 +802,7 @@ class FutureWatcher(QObject):
         self.done.emit(self.__future)
 
 
-class progress(QObject):
+class Progress(QObject):
     advance = Signal()
 
 
@@ -601,7 +828,7 @@ def make_html_list(items):
     style = '"margin: 5px; text-indent: -40px; margin-left: 40px;"'
 
     def format_item(i):
-        return '<p style={}><small>{}</small></p>'.format(style, i)
+        return f'<p style={style}><small>{i}</small></p>'
 
     return '\n'.join([format_item(i) for i in items])
 
@@ -612,11 +839,11 @@ def description_html(datainfo):
     Summarize a data info as a html fragment.
     """
     html = []
-    year = " ({})".format(str(datainfo.year)) if datainfo.year else ""
-    source = ", from {}".format(datainfo.source) if datainfo.source else ""
+    year = f" ({datainfo.year})" if datainfo.year else ""
+    source = f", from {datainfo.source}" if datainfo.source else ""
 
-    html.append("<b>{}</b>{}{}".format(escape(datainfo.title), year, source))
-    html.append("<p>{}</p>".format(datainfo.description))
+    html.append(f"<b>{escape(datainfo.title)}</b>{year}{source}")
+    html.append(f"<p>{datainfo.description}</p>")
     seealso = make_html_list(datainfo.seealso)
     if seealso:
         html.append("<small><b>See Also</b>\n" + seealso + "</small>")

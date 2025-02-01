@@ -17,11 +17,12 @@ import numpy as np
 import scipy.sparse as sp
 
 from Orange import data
-from Orange.data import (filter, Unknown, Variable, Table, DiscreteVariable,
+from Orange.data import (filter, Unknown, Table, DiscreteVariable,
                          ContinuousVariable, Domain, StringVariable)
 from Orange.data.util import SharedComputeValue
 from Orange.tests import test_dirname
-from Orange.data.table import _optimize_indices
+from Orange.data.table import _optimize_indices, _select_from_selection, \
+    _FromTableConversion
 
 
 class TableTestCase(unittest.TestCase):
@@ -495,9 +496,13 @@ class TableTestCase(unittest.TestCase):
         self.assertNotEqual(id(t.metas), id(copy.metas))
 
         # ensure that copied sparse arrays do not share data
+        # and that both are unlockable
         with t.unlocked():
             t.X[0, 0] = 42
         self.assertEqual(copy.X[0, 0], 5.1)
+        with copy.unlocked():
+            copy.X[0, 0] = 43
+        self.assertEqual(t.X[0, 0], 42)
 
     def test_concatenate(self):
         d1 = data.Domain(
@@ -715,6 +720,16 @@ class TableTestCase(unittest.TestCase):
             np.testing.assert_almost_equal(table.X, table2.X)
             np.testing.assert_almost_equal(table.Y, table2.Y)
             self.assertEqual(table.domain[0], table2.domain[0])
+        finally:
+            os.remove("iris.pickle")
+
+    def test_read_pickle_ids(self):
+        table = data.Table("iris")
+        try:
+            table.save("iris.pickle")
+            table1 = data.Table.from_file("iris.pickle")
+            table2 = data.Table.from_file("iris.pickle")
+            self.assertEqual(len(set(table1.ids) | set(table2.ids)), 300)
         finally:
             os.remove("iris.pickle")
 
@@ -1161,7 +1176,8 @@ class TableTestCase(unittest.TestCase):
         table2 = table[:4]
         self.assertEqual(table2.attributes[1], "test")
         table2.attributes[1] = "modified"
-        self.assertEqual(table.attributes[1], "modified")
+        self.assertEqual(table.attributes[1], "test")
+        self.assertEqual(table2.attributes[1], "modified")
 
     # TODO Test conjunctions and disjunctions of conditions
 
@@ -1177,7 +1193,10 @@ class TableTestCase(unittest.TestCase):
         table = data.Table("iris")[:1]
         with table.unlocked_reference():
             table.X = sp.csr_matrix(table.X)
-        repr(table)     # make sure repr does not crash
+        r = repr(table)     # make sure repr does not crash
+        self.assertEqual(r.replace("\n", ""),
+                         "[[sepal length=5.1, sepal width=3.5, "
+                         "petal length=1.4, petal width=0.2 | Iris-setosa]]")
 
     def test_inf(self):
         a = np.array([[2, 0, 0, 0],
@@ -1186,6 +1205,34 @@ class TableTestCase(unittest.TestCase):
         with self.assertWarns(Warning):
             tab = data.Table.from_numpy(None, a)
         self.assertEqual(tab.get_nan_frequency_attribute(), 3/12)
+
+    def test_str(self):
+        iris = Table("iris")
+        # instance
+        self.assertEqual("[5.1, 3.5, 1.4, 0.2 | Iris-setosa]", str(iris[0]))
+        # table
+        table_str = str(iris)
+        lines = table_str.split('\n')
+        self.assertEqual(150, len(lines))
+        self.assertEqual("[[5.1, 3.5, 1.4, 0.2 | Iris-setosa],", lines[0])
+        self.assertEqual(" [5.9, 3.0, 5.1, 1.8 | Iris-virginica]]", lines[-1])
+
+    def test_str_sparse(self):
+        iris = Table("iris")
+        with iris.unlocked_reference():
+            iris.X = sp.csr_matrix(iris.X)
+        # instance
+        s0 = "[sepal length=5.1, sepal width=3.5, " \
+             "petal length=1.4, petal width=0.2 | Iris-setosa]"
+        self.assertEqual(s0, str(iris[0]))
+        # table
+        table_str = str(iris)
+        lines = table_str.split('\n')
+        self.assertEqual(150, len(lines))
+        self.assertEqual("[" + s0 + ",", lines[0])
+        slast = "[sepal length=5.9, sepal width=3.0, " \
+                "petal length=5.1, petal width=1.8 | Iris-virginica]"
+        self.assertEqual(" " + slast + "]", lines[-1])
 
 
 def column_sizes(table):
@@ -1200,6 +1247,15 @@ class TableTests(unittest.TestCase):
     metas = ["Meta %i" % i for i in range(5)]
     nrows = 10
     row_indices = (1, 5, 7, 9)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.saved_max_rows_at_once = _FromTableConversion.max_rows_at_once
+        _FromTableConversion.max_rows_at_once = cls.nrows - 1
+
+    @classmethod
+    def tearDownClass(cls):
+        _FromTableConversion.max_rows_at_once = cls.saved_max_rows_at_once
 
     def setUp(self):
         self.data = np.random.random((self.nrows, len(self.attributes)))
@@ -1694,24 +1750,38 @@ class CreateTableWithDomainAndTable(TableTests):
             self.assert_table_with_filter_matches(
                 new_table, self.table, rows=indices)
 
-    @patch.object(Table, "from_table_rows", wraps=Table.from_table_rows)
-    def test_can_filter_row_with_slice_from_table_rows(self, from_table_rows):
+    def test_can_filter_row_with_slice_from_table_rows(self):
         # calling from_table with the same domain will forward to from_table_rows
-        for slice_ in self.interesting_slices:
-            from_table_rows.reset_mock()
-            new_table = data.Table.from_table(
-                self.domain, self.table, row_indices=slice_)
-            self.assert_table_with_filter_matches(
-                new_table, self.table, rows=slice_)
-            from_table_rows.assert_called()
+        # and thus _FromTableConversion.convert should not be called
+        with patch.object(_FromTableConversion, "convert") as convert:
+            for slice_ in self.interesting_slices:
+                new_table = data.Table.from_table(
+                    self.domain, self.table, row_indices=slice_)
+                self.assert_table_with_filter_matches(
+                    new_table, self.table, rows=slice_)
+                convert.assert_not_called()
 
     def test_can_filter_row_with_slice_from_table(self):
-        # calling from_table with a domain copy will use indexing in from_table
-        for slice_ in self.interesting_slices:
-            new_table = data.Table.from_table(
-                self.domain.copy(), self.table, row_indices=slice_)
-            self.assert_table_with_filter_matches(
-                new_table, self.table, rows=slice_)
+
+        # a utility class needed for mocking of the convert method in this case
+        class MockedConversion(_FromTableConversion):
+            objects = []
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.convert = Mock(wraps=self.convert)
+                self.objects.append(self)
+
+        # calling from_table with a domain copy will use indexing in from_table and
+        # _FromTableConversion.convert
+        with patch("Orange.data.table._FromTableConversion", MockedConversion):
+            for slice_ in self.interesting_slices:
+                new_table = data.Table.from_table(
+                    self.domain.copy(), self.table, row_indices=slice_)
+                self.assert_table_with_filter_matches(
+                    new_table, self.table, rows=slice_)
+                self.assertEqual(len(MockedConversion.objects), 1)
+                MockedConversion.objects.clear()
 
     def test_can_use_attributes_as_new_columns(self):
         a, _, _ = column_sizes(self.table)
@@ -1783,6 +1853,36 @@ class CreateTableWithDomainAndTable(TableTests):
         self.assert_table_with_filter_matches(
             new_table, self.table[:0], xcols=order[:a], ycols=order[a:a+c], mcols=order[a+c:])
 
+    def test_from_table_with_boolean_row_filter(self):
+        a, c, m = column_sizes(self.table)
+        domain = self.table.domain
+
+        sel = [False]*len(self.table)
+        sel[2] = True
+
+        with patch.object(Table, "from_table_rows", wraps=Table.from_table_rows) \
+                as from_table_rows:
+            new_table = Table.from_table(self.table.domain, self.table, row_indices=sel)
+            from_table_rows.assert_called()
+            self.assert_table_with_filter_matches(
+                new_table, self.table[2:3])
+
+        new_domain1 = Domain(domain.attributes[:1], domain.class_vars[:1], domain.metas[:1])
+        with patch.object(Table, "from_table_rows", wraps=Table.from_table_rows) \
+                as from_table_rows:
+            new_table = Table.from_table(new_domain1, self.table, row_indices=sel)
+            from_table_rows.assert_not_called()
+            self.assert_table_with_filter_matches(
+                new_table, self.table[2:3],
+                xcols=[0], ycols=[a], mcols=[a+c+m-1])
+
+        new_domain2 = Domain(domain.attributes[:1] + (ContinuousVariable("new"),),
+                            domain.class_vars[:1], domain.metas[:1])
+        new_table = Table.from_table(new_domain2, self.table, row_indices=sel)
+        self.assert_table_with_filter_matches(
+            new_table.transform(new_domain1), self.table[2:3],
+            xcols=[0], ycols=[a], mcols=[a+c+m-1])
+
     def test_from_table_sparse_move_some_to_empty_metas(self):
         iris = data.Table("iris").to_sparse()
         new_domain = data.domain.Domain(
@@ -1847,6 +1947,63 @@ class CreateTableWithDomainAndTable(TableTests):
         self.assertEqual(back_brown.X.shape, brown.X.shape)
         self.assertEqual(back_brown.metas.shape, brown.metas.shape)
 
+    def test_from_table_partwise(self):
+        def sum_x(d):
+            return d.X.sum(axis=1)
+        sum_x = Mock(wraps=sum_x)
+
+        def sum_y(d):
+            return d.Y.sum(axis=1)
+        sum_y = Mock(wraps=sum_y)
+
+        def sum_metas(d):
+            return d.metas.sum(axis=1)
+        sum_metas = Mock(wraps=sum_metas)
+
+        sum_x_var = ContinuousVariable("sum_x", compute_value=sum_x)
+        sum_y_var = ContinuousVariable("sum_y", compute_value=sum_y)
+        sum_metas_var = ContinuousVariable("sum_metas", compute_value=sum_metas)
+        target_domain = Domain([sum_x_var], [sum_y_var], [sum_metas_var])
+
+        def assure_sum():
+            np.testing.assert_equal(orig.X.sum(axis=1), transformed.X[:,0])
+            np.testing.assert_equal(orig.Y.sum(axis=1), transformed.Y)
+            np.testing.assert_equal(orig.metas.sum(axis=1), transformed.metas[:,0])
+
+        def long_table(rows):
+            avars = [ContinuousVariable(n) for n in "abcdef"]
+            vals = np.random.RandomState(0).random((rows, 6))
+            domain = Domain(avars[:2], avars[2:4], avars[4:])
+            return Table.from_numpy(domain, X=vals[:, :2], Y=vals[:, 2:4], metas=vals[:, 4:])
+
+        max_rows = _FromTableConversion.max_rows_at_once
+
+        # domain conversion fits into a single part
+        orig = long_table(max_rows)
+        transformed = Table.from_table(target_domain, orig)
+        assure_sum()
+        sum_x.assert_called_once()
+        sum_y.assert_called_once()
+        sum_metas.assert_called_once()
+
+        sum_x.reset_mock()
+        sum_y.reset_mock()
+        sum_metas.reset_mock()
+
+        # domain conversion does not fit a single part
+        orig = long_table(max_rows + 1)
+        transformed = Table.from_table(target_domain, orig)
+        assure_sum()
+        self.assertEqual(sum_x.call_count, 2)
+        self.assertEqual(sum_y.call_count, 2)
+        self.assertEqual(sum_metas.call_count, 2)
+        self.assertEqual(len(sum_x.call_args_list[0][0][0]), max_rows)
+        self.assertEqual(len(sum_x.call_args_list[1][0][0]), 1)
+        self.assertEqual(len(sum_y.call_args_list[0][0][0]), max_rows)
+        self.assertEqual(len(sum_y.call_args_list[1][0][0]), 1)
+        self.assertEqual(len(sum_metas.call_args_list[0][0][0]), max_rows)
+        self.assertEqual(len(sum_metas.call_args_list[1][0][0]), 1)
+
     def test_from_table_shared_compute_value(self):
         iris = data.Table("iris").to_sparse()
         d1 = Domain(
@@ -1888,6 +2045,46 @@ class CreateTableWithDomainAndTable(TableTests):
         np.testing.assert_almost_equal(new_table.Y, Y)
         np.testing.assert_almost_equal(new_table.metas, magic[rows, mcols])
         np.testing.assert_almost_equal(new_table.W, old_table.W[rows])
+
+    def test_attributes_copied(self):
+        """Table created from table attributes dict copied"""
+        self.table.attributes = {"A": "Test", "B": []}
+
+        # from_table
+        new_table = self.table.from_table(self.table.domain, self.table)
+        self.assertDictEqual(new_table.attributes, {"A": "Test", "B": []})
+        new_table.attributes["A"] = "Changed"
+        new_table.attributes["B"].append(1)
+        self.assertDictEqual(new_table.attributes, {"A": "Changed", "B": [1]})
+        # attributes dict of old table not be changed since new dist is a copy
+        self.assertDictEqual(self.table.attributes, {"A": "Test", "B": []})
+
+        # from_table_rows
+        new_table = self.table.from_table_rows(self.table, [1, 2])
+        self.assertDictEqual(new_table.attributes, {"A": "Test", "B": []})
+        new_table.attributes["A"] = "Changed"
+        new_table.attributes["B"].append(1)
+        self.assertDictEqual(new_table.attributes, {"A": "Changed", "B": [1]})
+        # attributes dict of old table not be changed since new dist is a copy
+        self.assertDictEqual(self.table.attributes, {"A": "Test", "B": []})
+
+    def test_attributes_copied_once(self):
+        A = Mock()
+        A.__deepcopy__ = Mock()
+        self.table.attributes = {"A": A}
+
+        # a single direct transformation
+        self.table.from_table(self.table.domain, self.table)
+        self.assertEqual(1, A.__deepcopy__.call_count)
+        A.__deepcopy__.reset_mock()
+
+        # hierarchy of transformations
+        ndom = Domain([a.copy(compute_value=lambda x: x.transform(Domain([a])))
+                       for a in self.table.domain.attributes])
+        self.table.from_table(ndom, self.table)
+        self.assertEqual(1, A.__deepcopy__.call_count)
+        # HISTORIC: before only the outermost transformation deepcopied the
+        # attributes, here were 23 calls to __deepcopy__ instead of 1
 
 
 def isspecial(s):
@@ -1962,7 +2159,6 @@ class TableIndexingTests(TableTests):
             np.testing.assert_almost_equal(
                 np.array(list(row)), new_row)
 
-
     def test_can_select_a_subset_of_rows_and_columns(self):
         for r in self.rows:
             for c in self.multiple_columns:
@@ -1995,7 +2191,6 @@ class TableIndexingTests(TableTests):
                 np.testing.assert_almost_equal(table.metas,
                                                self.table.metas[r, metas])
 
-
     def test_optimize_indices(self):
         # ordinary conversion
         self.assertEqual(_optimize_indices([1, 2, 3], 4), slice(1, 4, 1))
@@ -2006,8 +2201,14 @@ class TableIndexingTests(TableTests):
         np.testing.assert_equal(_optimize_indices([1, 2, 4], 5), [1, 2, 4])
         np.testing.assert_equal(_optimize_indices((1, 2, 4), 5), [1, 2, 4])
 
-        # leave boolean arrays
-        np.testing.assert_equal(_optimize_indices([True, False, True], 3), [True, False, True])
+        # internally convert boolean arrays into indices
+        np.testing.assert_equal(_optimize_indices([False, False, False, False], 4), [])
+        np.testing.assert_equal(_optimize_indices([True, False, True, True], 4), [0, 2, 3])
+        np.testing.assert_equal(_optimize_indices([True, False, True], 3), slice(0, 4, 2))
+        with self.assertRaises(IndexError):
+            _optimize_indices([True, False, True], 2)
+        with self.assertRaises(IndexError):
+            _optimize_indices([True, False, True], 4)
 
         # do not convert if step is negative
         np.testing.assert_equal(_optimize_indices([4, 2, 0], 5), [4, 2, 0])
@@ -2022,6 +2223,23 @@ class TableIndexingTests(TableTests):
         # single element
         self.assertEqual(_optimize_indices([1], 2), slice(1, 2, 1))
         self.assertEqual(_optimize_indices([-2], 5), slice(-2, -3, -1))
+
+    def test_select_from_selection(self):
+        fn = _select_from_selection
+        self.assertEqual(fn(slice(10), slice(11), 10),
+                         slice(0, 10, 1))
+        self.assertEqual(fn(slice(10), slice(None, 10, 2), 10),
+                         slice(0, 10, 2))
+        self.assertEqual(fn(slice(None, 10, 2), slice(None, 10, 2), 10),
+                         slice(0, 10, 4))
+        self.assertEqual(fn(slice(None, None, -1), slice(0, 9, None), 10),
+                         slice(9, 0, -1))  # [9, 8, 7, 6, 5, 4, 3, 2, 1]
+        self.assertEqual(fn(slice(None, None, -1), slice(9, 10, None), 10),
+                         slice(0, None, -1))  # [0]
+        self.assertEqual(fn(slice(None, 10, 2), slice(None, None, -1), 10),
+                         slice(8, None, -2))
+        self.assertEqual(fn(slice(None, 10, 2), slice(None, None, -2), 10),
+                         slice(8, None, -4))
 
 
 class TableElementAssignmentTest(TableTests):
@@ -2163,47 +2381,61 @@ class InterfaceTest(unittest.TestCase):
                     self.table[i, j] = new_value
                     self.assertEqual(self.table[i, j], new_value)
 
-    def test_subclasses(self):
-        from pathlib import Path
-
-        class _ExtendedTable(data.Table):
-            pass
-
-        data_file = _ExtendedTable('iris')
-        data_url = _ExtendedTable.from_url(
-            Path(os.path.dirname(__file__), 'datasets/test1.tab').as_uri())
-
-        self.assertIsInstance(data_file, _ExtendedTable)
-        self.assertIsInstance(data_url, _ExtendedTable)
-
 
 class TestTableStats(TableTests):
     def test_get_nan_frequency(self):
+        metas = [DiscreteVariable("x", values=tuple("abc")), StringVariable("s")]
+        meta_data = np.array([list(range(self.nrows)), ["x"] * self.nrows]).T
         domain = self.create_domain(self.attributes, self.class_vars)
-        table = data.Table(domain, self.data, self.class_data)
-        self.assertEqual(table.get_nan_frequency_attribute(), 0)
-        self.assertEqual(table.get_nan_frequency_class(), 0)
+        domain = Domain(domain.attributes, domain.class_vars, metas)
+        table = data.Table(domain, self.data, self.class_data, meta_data)
+
+        def test_counts(at, cl, me):
+            x, y, metas = table.X, table.Y, table.metas
+            for _ in range(2):
+                self.assertEqual(table.get_nan_count_attribute(), at)
+                self.assertEqual(table.get_nan_count_class(), cl)
+                self.assertEqual(table.get_nan_count_metas(), me)
+                self.assertEqual(table.get_nan_frequency_attribute(), at / np.prod(x.shape))
+                self.assertEqual(table.get_nan_frequency_class(), cl / np.prod(y.shape))
+                self.assertEqual(table.get_nan_frequency_metas(), me / np.prod(metas.shape))
+                with table.unlocked():
+                    table.X = sp.csr_matrix(x)
+                    table.Y = sp.csr_matrix(y)
+            with table.unlocked():
+                table.X, table.Y = x, y
+
+        test_counts(0, 0, 0)
 
         with table.unlocked():
             table.X[1, 2] = table.X[4, 5] = np.nan
-        self.assertEqual(table.get_nan_frequency_attribute(), 2 / table.X.size)
-        self.assertEqual(table.get_nan_frequency_class(), 0)
+        test_counts(2, 0, 0)
 
         with table.unlocked():
             table.Y[3:6] = np.nan
-        self.assertEqual(table.get_nan_frequency_attribute(), 2 / table.X.size)
-        self.assertEqual(table.get_nan_frequency_class(), 3 / table.Y.size)
+        test_counts(2, 3, 0)
 
         with table.unlocked():
             table.X[1, 2] = table.X[4, 5] = 0
-        self.assertEqual(table.get_nan_frequency_attribute(), 0)
-        self.assertEqual(table.get_nan_frequency_class(), 3 / table.Y.size)
+        test_counts(0, 3, 0)
+
+        with table.unlocked():
+            table.metas[1, 0] = table.metas[3, 0] = np.nan
+        test_counts(0, 3, 2)
+
+        with table.unlocked():
+            table.metas[5, 1] = ""
+        test_counts(0, 3, 3)
 
     def test_get_nan_frequency_empty_table(self):
         domain = self.create_domain(self.attributes, self.class_vars)
         table = data.Table.from_domain(domain)
+        self.assertEqual(table.get_nan_count_attribute(), 0)
+        self.assertEqual(table.get_nan_count_class(), 0)
+        self.assertEqual(table.get_nan_count_metas(), 0)
         self.assertEqual(table.get_nan_frequency_attribute(), 0)
         self.assertEqual(table.get_nan_frequency_class(), 0)
+        self.assertEqual(table.get_nan_frequency_metas(), 0)
 
 
 class TestRowInstance(unittest.TestCase):
@@ -3113,6 +3345,11 @@ class TestTableTranspose(unittest.TestCase):
         # original should not change
         self.assertDictEqual(table.domain.attributes[0].attributes,
                              {"attr1": "a1", "attr2": "aa1"})
+
+    def test_transpose_name(self):
+        table = Table("iris")
+        transposed = Table.transpose(table)
+        self.assertEqual(table.name, transposed.name)
 
     def _compare_tables(self, table1, table2):
         self.assertEqual(table1.n_rows, table2.n_rows)

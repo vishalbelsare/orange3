@@ -137,7 +137,7 @@ class OWHeatMap(widget.OWWidget):
     description = "Plot a data matrix heatmap."
     icon = "icons/Heatmap.svg"
     priority = 260
-    keywords = []
+    keywords = "heat map"
 
     class Inputs:
         data = Input("Data", Table)
@@ -187,11 +187,11 @@ class OWHeatMap(widget.OWWidget):
 
     auto_commit = settings.Setting(True)
 
-    graph_name = "scene"
+    graph_name = "scene"  # QGraphicsScene (HeatmapScene)
 
     class Information(widget.OWWidget.Information):
         sampled = Msg("Data has been sampled")
-        discrete_ignored = Msg("{} categorical feature{} ignored")
+        discrete_ignored = Msg("Categorical features are ignored.")
         row_clust = Msg("{}")
         col_clust = Msg("{}")
         sparse_densified = Msg("Showing this data may require a lot of memory")
@@ -229,8 +229,8 @@ class OWHeatMap(widget.OWWidget):
         #: The original data with all features (retained to
         #: preserve the domain on the output)
         self.input_data = None
-        #: The effective data striped of discrete features, and often
-        #: merged using k-means
+        #: The effective data stripped of discrete features and hidden
+        #: attributes, and often merged using k-means
         self.data = None
         self.effective_data = None
         #: Source of column annotations (derived from self.data)
@@ -602,21 +602,23 @@ class OWHeatMap(widget.OWWidget):
             self.Error.no_continuous()
             input_data = data = None
 
-        # Data contains some discrete attributes which must be filtered
+        # Data contains some discrete or hidden attributes which must be
+        # filtered
         if data is not None and \
-                any(var.is_discrete for var in data.domain.attributes):
+                any(var.is_discrete or var.attributes.get('hidden', False)
+                    for var in data.domain.attributes):
             ndisc = sum(var.is_discrete for var in data.domain.attributes)
             data = data.transform(
                 Domain([var for var in data.domain.attributes
-                        if var.is_continuous],
+                        if var.is_continuous and
+                        not var.attributes.get('hidden', False)],
                        data.domain.class_vars,
                        data.domain.metas))
             if not data.domain.attributes:
                 self.Error.no_continuous()
                 input_data = data = None
             else:
-                self.Information.discrete_ignored(
-                    ndisc, "s" if ndisc > 1 else "")
+                self.Information.discrete_ignored()
 
         self.data = data
         self.input_data = input_data
@@ -689,7 +691,11 @@ class OWHeatMap(widget.OWWidget):
     def update_heatmaps(self):
         if self.data is not None:
             self.clear_scene()
-            self.clear_messages()
+            self.Error.clear()
+            self.Warning.clear()
+            self.Information.row_clust.clear()
+            self.Information.col_clust.clear()
+            self.Information.sampled.clear()
             if self.col_clustering != Clustering.None_ and \
                     len(self.data.domain.attributes) < 2:
                 self.Error.not_enough_features()
@@ -1108,7 +1114,7 @@ class OWHeatMap(widget.OWWidget):
         var = self.annotation_color_var
         if var is None:
             return None
-        column_data = column_data_from_table(self.input_data, var)
+        column_data = self.input_data.get_column(var)
         merges = self._merge_row_indices()
         if merges is not None:
             column_data = aggregate(var, column_data, merges)
@@ -1353,26 +1359,15 @@ def column_str_from_table(
         column: Union[int, Orange.data.Variable],
 ) -> np.ndarray:
     var = table.domain[column]
-    data, _ = table.get_column_view(column)
+    data = table.get_column(column)
     return np.asarray([var.str_val(v) for v in data], dtype=object)
-
-
-def column_data_from_table(
-        table: Orange.data.Table,
-        column: Union[int, Orange.data.Variable],
-) -> np.ndarray:
-    var = table.domain[column]
-    data, _ = table.get_column_view(column)
-    if var.is_primitive() and data.dtype.kind != "f":
-        data = data.astype(float)
-    return data
 
 
 def color_annotation_data(
         table: Table, var: Union[int, str, Variable]
 ) -> Tuple[np.ndarray, ColorMap, Variable]:
     var = table.domain[var]
-    column_data = column_data_from_table(table, var)
+    column_data = table.get_column(var)
     data, colormap = colorize(var, column_data)
     return data, colormap, var
 

@@ -46,7 +46,7 @@ conda config --add channels conda-forge
 conda config --set channel_priority strict
 
 # Create and activate an environment for Orange
-conda create python=3 --yes --name orange3
+conda create python=3.10 --yes --name orange3
 conda activate orange3
 
 # Install Orange
@@ -63,7 +63,9 @@ conda install orange3-<addon name>
 ### Installing with pip
 
 We recommend using our [standalone installer](https://orange.biolab.si/download) or conda, but Orange is also installable with pip. You will need a C/C++ compiler (on Windows we suggest using Microsoft Visual Studio Build Tools).
-
+Orange needs PyQt to run. Install either:
+- PyQt5 and PyQtWebEngine: `pip install -r requirements-pyqt.txt` 
+- PyQt6 and PyQt6-WebEngine: `pip install PyQt6 PyQt6-WebEngine`
 
 ### Installing with winget (Windows only)
 
@@ -132,11 +134,13 @@ export MY_GITHUB_USERNAME=replaceme
 create a conda environment, clone your fork, and install it:
 
 ```Shell
-conda create python=3 --yes --name orange3
+conda create python=3.10 --yes --name orange3
 conda activate orange3
 
 git clone ssh://git@github.com/$MY_GITHUB_USERNAME/orange3
 
+# Install PyQT and PyQtWebEngine. You can also use PyQt6
+pip install -r orange3/requirements-pyqt.txt
 pip install -e orange3
 ```
 
@@ -172,8 +176,11 @@ export MY_GITHUB_USERNAME=replaceme
 create a conda environment, clone your forks, and install them:
 
 ```Shell
-conda create python=3 --yes --name orange3
+conda create python=3.10 --yes --name orange3
 conda activate orange3
+
+# Install PyQT and PyQtWebEngine. You can also use PyQt6
+pip install -r requirements-pyqt.txt
 
 git clone ssh://git@github.com/$MY_GITHUB_USERNAME/orange-widget-base
 pip install -e orange-widget-base

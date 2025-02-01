@@ -5,6 +5,278 @@ Change Log
 ------------
 
 
+[3.38.1] - 2024-12-23
+--------------------
+##### Enhancements
+* Scatter Plot: Error Bars ([#6934](../../pull/6934))
+
+##### Bugfixes
+* 1 line headers: only allow single-letter types and flags ([#6959](../../pull/6959))
+* Group By: fix categorical aggregations ([#6958](../../pull/6958))
+* Orange can be imported without Qt (fixed importing localization) ([#6955](../../pull/6955))
+* Fix documentation in packages: fix sphinx build command ([#6950](../../pull/6950))
+* httpx 0.28 support: use mounts instead of proxies ([#6943](../../pull/6943))
+* owpredicttions: Remove special magic value 2 ([#6933](../../pull/6933))
+
+
+[3.38.0] - 2024-11-15
+--------------------
+##### Enhancements
+* Parameter Fitter: Basic implementation ([#6921](../../pull/6921))
+* Datasets: Add domain field; respect "Unlisted" ([#6920](../../pull/6920))
+* Datasets: Let the filter override domain and language ([#6930](../../pull/6930))
+* ScoringSheet and ScoringSheetViewer widgets ([#6817](../../pull/6817))
+* Multilingual package and installation ([#6828](../../pull/6828))
+
+##### Bugfixes
+* Calibrated Learner: Prevent in place modification of base learner ([#6917](../../pull/6917))
+* ListView: Fix selection ([#6823](../../pull/6823))
+* plotutils: Fix scene layout tracking in AnchorItem ([#6859](../../pull/6859))
+* oweditdomain: Hide "categories mapping" warning on change ([#6865](../../pull/6865))
+* Logistic regression: fix penalty argument for no regularization ([#6886](../../pull/6886))
+* Avoid slowdowns by caching Domain.__eq__ ([#6764](../../pull/6764))
+* SVM: degree has to be an integer ([#6866](../../pull/6866))
+* Only deepcopy the .attributes for the outermost Table transformation ([#6849](../../pull/6849))
+* Line plot: compatibility with scipy 1.14 ([#6845](../../pull/6845))
+* PCA: ensure tests pass on sklearn 1.4 and 1.5, which can return different results ([#6821](../../pull/6821))
+* Remove Orange implementation of randomized PCA for sparse data ([#6815](../../pull/6815))
+
+
+[3.37.0] - 2024-05-27
+--------------------
+##### Enhancements
+* Permutation Plot: Add widget ([#6762](../../pull/6762))
+* PLS: Move from Orange-spectroscopy ([#6734](../../pull/6734))
+* Open draged files on CSV Import, Load Model and Distance File widgets ([#6747](../../pull/6747))
+* Predictions: Output annotated table
+* Update t-SNE widget ([#6345](../../pull/6345))
+* CSV Import: Skip multi rows edit ([#6691](../../pull/6691))
+* Remove use of pkg_resources ([#6655](../../pull/6655))
+* Data Info: Show statistics about missing values ([#6623](../../pull/6623))
+
+##### Bugfixes
+* Edit Domain: Partial restore state on categories mismatch ([#6776](../../pull/6776))
+* Distances: Spearman actually computes Spearman instead of Pearson ([#6804](../../pull/6804))
+* tableview: Remove toggle selection on corner widget click ([#6802](../../pull/6802))
+* _simple_tree.c: Fix compilation error with gcc 14 ([#6800](../../pull/6800))
+* OWSom: Fix crash for data without class variable ([#6763](../../pull/6763))
+* io_util: Fix memory usage when parsing columns ([#6757](../../pull/6757))
+* pythoneditor/editor: Change order in `terminate` ([#6756](../../pull/6756))
+* Minor fixes to reenable falling CI ([#6751](../../pull/6751))
+* Fix failing tests on Python 3.11.8 on Windows ([#6737](../../pull/6737))
+* Table.add_column - Do not try to insert data in locked empty array ([#6743](../../pull/6743))
+* test_owcsvimport: Workaround for segfault in tests on macos ([#6735](../../pull/6735))
+* Domain Editor - Adapt to dark mode ([#6727](../../pull/6727))
+* Predictions: Output annotated table
+* CSV Import: Add explicit datetime conversion ([#6696](../../pull/6696))
+* setup.py: Replace use of imp module ([#6680](../../pull/6680))
+* Writers: Store nans in StringVariable as empty strings instead of 'nan' ([#6670](../../pull/6670))
+* Fix impute.Model for derived domains ([#6668](../../pull/6668))
+* CN2 Rule Induction: Fix model's effective name ([#6652](../../pull/6652))
+
+
+[3.36.2] - 2023-10-31
+--------------------
+##### Enhancements
+* oweditdomain: Add variable filter ([#6603](../../pull/6603))
+* IO - Change origin attribute when not find on system ([#6555](../../pull/6555))
+* Predictions: Output errors ([#6577](../../pull/6577))
+
+##### Bugfixes
+* EmbedderCache - Handle cache persisting when no permissions ([#6611](../../pull/6611))
+
+
+[3.36.1] - 2023-09-22
+--------------------
+##### Bugfixes
+* Distributions: Fix selection output ([#6578](../../pull/6578))
+* Datasets: save selected dataset platform independently ([#6575](../../pull/6575))
+
+
+[3.36.0] - 2023-09-08
+--------------------
+##### Enhancements
+* Update widget.json
+* feature-constructor2-stamped.png - resize and index
+* Formula documentation: Minor changes
+* index.rst - fix reference to formula
+* move accidentally displaced formula.md
+* SOM: output columns with coordinates and errors ([#6542](../../pull/6542))
+* Lazy signals for Hierarchical Clustering ([#6348](../../pull/6348))
+* PCA widget runs a separate thread ([#6528](../../pull/6528))
+* Edit Domain: Change types of multiple variables ([#6426](../../pull/6426))
+* owsavebase: Display a warning when auto save is disabled ([#6454](../../pull/6454))
+* Select Columns: Accept partially correct drops ([#6390](../../pull/6390))
+
+##### Bugfixes
+* Update widget.json
+* feature-constructor2-stamped.png - resize and index
+* Formula documentation: Minor changes
+* index.rst - fix reference to formula
+* move accidentally displaced formula.md
+* Predictions: Fix column size hinting ([#6563](../../pull/6563))
+* Naive Bayes: fix predictions with unknown values ([#6564](../../pull/6564))
+* Scatter Plot - Handle input features that are hidden in data ([#6531](../../pull/6531))
+* Adapt tests to pandas 2.1 and fix deprecations ([#6560](../../pull/6560))
+* Adapt to newly released pandas 2.1 ([#6559](../../pull/6559))
+* CSV Import - Change datetime format parsing ([#6539](../../pull/6539))
+* owdiscretize: Fix formatting display string when user role is undefined ([#6498](../../pull/6498))
+* Neural Network: Default learner name propagation ([#6526](../../pull/6526))
+* PCA - Output instance of table subclass when instance of table subclass on input ([#6536](../../pull/6536))
+* owpredictions: Fix a type error in report when using NoopDelegate ([#6537](../../pull/6537))
+* Scatter Plot - Fix Vizrank for hidden attributes ([#6530](../../pull/6530))
+* config: Replace and fix use of pkg_resources.parse_version ([#6523](../../pull/6523))
+* Fix classification trees for data with repeated feature values ([#6488](../../pull/6488))
+* Group By - Fix error with hidden attributes ([#6473](../../pull/6473))
+* Sql - Fix comparison with values trailing spaces ([#6470](../../pull/6470))
+* ListView - empty variable when all values unselected ([#6441](../../pull/6441))
+
+
+[3.35.0] - 2023-05-05
+---------------------                                                                                       
+##### Enhancements
+* Neighbours - Sort resulting instances in order according to distance ([#6425](../../pull/6425))
+* SOM - Warn user to restart optimization after parameter change ([#6438](../../pull/6438))
+* Update requirements-core.txt
+* TimeVariable - add formats with UTC offset
+* Skip pandas==2.0.0
+* Data Table: Subset input ([#6405](../../pull/6405))
+* Data Table: Restore applied sorting ([#6370](../../pull/6370))
+* widgets.data.utils.tableview: Disconnect specific slot
+* Select Rows: Better label for purging unused values/features ([#6383](../../pull/6383))
+* Single input data table widget ([#6346](../../pull/6346))
+* Continuize: Specific options for variables ([#6181](../../pull/6181))
+* Datasets: Add language selection ([#6358](../../pull/6358))
+* MDS: Show Kruskal stress ([#6309](../../pull/6309))
+* Group By - add quantile aggregations ([#6304](../../pull/6304))
+* MCC: Add Matthews correlation coefficient score ([#6264](../../pull/6264))
+* Improve scorer selection in Test and Score and predictions ([#6282](../../pull/6282))
+* Feature Constructor: Enable comprehensions and lambdas in expressions ([#6272](../../pull/6272))
+
+##### Bugfixes
+* Edit Domain no longer forgets its settings ([#6415](../../pull/6415))
+* SOM: Store selection Settings in list instead of np.ndarray ([#6423](../../pull/6423))
+* pca: n_features_ attribute of decomposition.PCA is deprecated in favor of n_features_in_ ([#6249](../../pull/6249))
+* Update requirements-core.txt
+* TimeVariable - add formats with UTC offset
+* Skip pandas==2.0.0
+* tableview: Fix errors with sparse basket columns ([#6409](../../pull/6409))
+* owtable: Remove multiple connections to 'selectionFinished' ([#6404](../../pull/6404))
+* widgets.data.utils.tableview: Disconnect specific slot
+* Drop table after testing ([#6351](../../pull/6351))
+* MDS: Remove repeated updates at the end of optimization ([#6337](../../pull/6337))
+* Select Rows - Fix checked groups not considered in PyQt6 ([#6336](../../pull/6336))
+* Edit Domain - set have_time and have_date to time variables ([#6324](../../pull/6324))
+* Rank - make sorting setting PyQt6 compatible ([#6301](../../pull/6301))
+* Concatenate - preserve table names when compute value ignored ([#6331](../../pull/6331))
+* Fix unpickling domains: do not pickle indices (which can cause problems) ([#6317](../../pull/6317))
+* stats.utils: Don't count zeros as nans ([#6314](../../pull/6314))
+* File Widget: Fix recent urls save/restore ([#6259](../../pull/6259))
+* Fix Color for python 3.10 ([#6293](../../pull/6293))
+* listfilter: Fix dragDropActionDidComplete signal type ([#6292](../../pull/6292))
+* Table.from_table works correctly with boolean indices ([#6278](../../pull/6278))
+* Pythagorean Forest: Fix report ([#6276](../../pull/6276))
+* Implement predict() in simple tree and simple RF models ([#6258](../../pull/6258))
+* Bar Plot: Fix annotation by enumeration ([#6270](../../pull/6270))
+* Color: fix coloring of computed (processed) variables ([#6261](../../pull/6261))
+
+
+[3.34.1] - 2022-12-13
+--------------------
+#### Bugfixes
+* Pin scikit-learn requirement to <1.2.0 due to changes in PCA
+
+
+[3.34.0] - 2022-12-05
+--------------------
+##### Enhancements
+* Faster normalization ([#6202](../../pull/6202))
+* io.UrlReader: Add support for google drive share urls ([#6201](../../pull/6201))
+* Table: Add methods get_column and set_column ([#6058](../../pull/6058))
+* owfeatureconstructor: raise settings version
+* owfeaturecontructor: move meta to the end of namedtuple
+* Aggregate Columns: Add additional options for selection ([#6056](../../pull/6056))
+
+##### Bugfixes
+* conda-recipe: Remove explicit host numpy pinning ([#6235](../../pull/6235))
+* Data Sampler: Fix crash when requesting an empty sample ([#6208](../../pull/6208))
+* Remove pyqt5 install magic ([#6153](../../pull/6153))
+* stats: Handle empty array ([#6221](../../pull/6221))
+* Preprocess: Fix reporting for remove sparse and impute ([#6212](../../pull/6212))
+* Weighted mean computation in Orange.statistics.util.stats ([#6204](../../pull/6204))
+* owfeatureconstructor: raise settings version
+* owfeaturecontructor: move meta to the end of namedtuple
+
+
+[3.33.0] - 2022-09-30
+--------------------
+##### Enhancements
+* drophandlers: Preserve defaults history ([#6069](../../pull/6069))
+* owlogisticregression: Add option for no regularization ([#6093](../../pull/6093))
+* Predictions: Show errors ([#6012](../../pull/6012))
+* Add support for PyQt6 ([#5884](../../pull/5884))
+* Feature Constructor: Make concurrent ([#5992](../../pull/5992))
+* Feature constructor optimization ([#5975](../../pull/5975))
+* Discretize: Simplify interface, add nicer binning ([#5919](../../pull/5919))
+
+##### Bugfixes
+* owboxplot: Fix an error in widget cleanup during tests ([#6136](../../pull/6136))
+* Group By - fix std and sum for TimeVariable ([#6133](../../pull/6133))
+* Handle timezones in Edit Domain ([#6123](../../pull/6123))
+* owfeatureconstructor: Cast FeatureFunc result to array ([#6115](../../pull/6115))
+* Server embedder - send bytes as content ([#6051](../../pull/6051))
+* plotutils - replace MidButton with MiddleButton ([#6124](../../pull/6124))
+* Feature Constructor cast function is not picklable ([#6002](../../pull/6002))
+* test_owfile: Fix unreliable `test_warning_from_another_thread` ([#6085](../../pull/6085))
+* Embedders - fix proxies, default on http, tests ([#6028](../../pull/6028))
+* TableModel: Define foreground color when providing background ([#6011](../../pull/6011))
+* owdistancemap: Fix an implicit float->int conversion error ([#5998](../../pull/5998))
+* Neighbours - support Table derived output types ([#5986](../../pull/5986))
+* Predictions: allow predicting probabilities for classless data ([#5972](../../pull/5972))
+* owcsvimport: Reduce sample size ([#5960](../../pull/5960))
+* make usable_scorers backwards compatible ([#5943](../../pull/5943))
+* owpythonscript: Fix implicit float to int cast error ([#5944](../../pull/5944))
+
+
+[3.32.0] - 2022-04-01
+--------------------
+##### Enhancements
+* Enable multitarget problem types for OWTestAndScore and OWPredictions ([#5848](../../pull/5848))
+* Datetime format selection ([#5819](../../pull/5819))
+* Predictions: Allow choosing a target ([#5790](../../pull/5790))
+* Server embedder: use queue, handle unsuccessful requests at the end ([#5835](../../pull/5835))
+* orange-canvas: Add cmd parameter to clear all settings/caches ([#5844](../../pull/5844))
+* New icons and splash screen ([#5814](../../pull/5814))
+* Use palette colors in more places ([#5680](../../pull/5680))
+* File: explicit file format choice ([#5736](../../pull/5736))
+* Learner widgets: Inform about potential problems when overriding preprocessors ([#5710](../../pull/5710))
+
+##### Bugfixes
+* Orange.data.Table: deprecated is_view and is_copy ([#5913](../../pull/5913))
+* owrocanalysis: Fix an index error in custom tick calculation ([#5904](../../pull/5904))
+* SOM: Fix crash when color is constant ([#5860](../../pull/5860))
+* plotutils: Fix implicit conversion to int warning error ([#5874](../../pull/5874))
+* Calibration: Fix crash on empty folds ([#5859](../../pull/5859))
+* Scatter Plot: Replot when input features change ([#5837](../../pull/5837))
+* Nomogram: Purge class_var values ([#5847](../../pull/5847))
+* Scatter plot: Fix rotation of regression line label ([#5840](../../pull/5840))
+* widgets.evaluate.utils: call resizeColumnsToContents before setting hidden header sections. ([#5851](../../pull/5851))
+* tSNE, Freeviz: Set effective_data ([#5839](../../pull/5839))
+* Linear Projection: Fix LDA ([#5828](../../pull/5828))
+* Decorate overridden input data handler ([#5836](../../pull/5836))
+* Table: from_file/from_url remove type conversion ([#5812](../../pull/5812))
+* Group by: Restore aggregations if removed due to open context ([#5823](../../pull/5823))
+* Ensure unlockable sparse arrays after Table.copy ([#5807](../../pull/5807))
+* ExcelReader: Write roles ([#5810](../../pull/5810))
+* owfeatureconstructor: Always update models on data change ([#5804](../../pull/5804))
+* File: remove some resizing limits ([#5815](../../pull/5815))
+* owfeaturestatistics: Fix implicit int conversion error on resize ([#5799](../../pull/5799))
+* table_from_frame: replace nan with String.Unknown for string variable ([#5795](../../pull/5795))
+* Update (and test) minimum dependencies ([#5781](../../pull/5781))
+* test_owdistancematrix: Do not download data for testing ([#5773](../../pull/5773))
+* Silhouette plot text width ([#5756](../../pull/5756))
+
+
 [3.31.1] - 2022-01-07
 --------------------
 ##### Bugfixes
@@ -1639,7 +1911,18 @@ Change Log
 * Initial version based on Python 1.5.2 and Qt 2.3
 
 
-[next]: https://github.com/biolab/orange3/compare/3.31.1...HEAD
+[next]: https://github.com/biolab/orange3/compare/3.38.1..HEAD
+[3.38.1]: https://github.com/biolab/orange3/compare/3.38.0...3.38.1
+[3.38.0]: https://github.com/biolab/orange3/compare/3.37.0...3.38.0
+[3.37.0]: https://github.com/biolab/orange3/compare/3.36.2...3.37.0
+[3.36.2]: https://github.com/biolab/orange3/compare/3.36.1...3.36.2
+[3.36.1]: https://github.com/biolab/orange3/compare/3.36.0...3.36.1
+[3.36.0]: https://github.com/biolab/orange3/compare/3.35.0...3.36.0
+[3.35.0]: https://github.com/biolab/orange3/compare/3.34.1...3.35.0
+[3.34.1]: https://github.com/biolab/orange3/compare/3.34.0...3.34.1
+[3.34.0]: https://github.com/biolab/orange3/compare/3.33.0...3.34.0
+[3.33.0]: https://github.com/biolab/orange3/compare/3.32.0...3.33.0
+[3.32.0]: https://github.com/biolab/orange3/compare/3.31.1...3.32.0
 [3.31.1]: https://github.com/biolab/orange3/compare/3.31.0...3.31.1
 [3.31.0]: https://github.com/biolab/orange3/compare/3.30.2...3.31.0
 [3.30.2]: https://github.com/biolab/orange3/compare/3.30.1...3.30.2

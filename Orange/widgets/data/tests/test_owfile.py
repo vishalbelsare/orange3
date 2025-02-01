@@ -3,17 +3,18 @@
 from os import path, remove, getcwd
 from os.path import dirname
 import unittest
+from threading import Thread
 from unittest.mock import Mock, patch
 import pickle
 import tempfile
 import warnings
-import time
 
 import numpy as np
 import scipy.sparse as sp
 
-from AnyQt.QtCore import QMimeData, QPoint, Qt, QUrl, QThread, QObject
+from AnyQt.QtCore import QMimeData, QPoint, Qt, QUrl, QPointF
 from AnyQt.QtGui import QDragEnterEvent, QDropEvent
+from AnyQt.QtTest import QTest
 from AnyQt.QtWidgets import QComboBox
 
 import Orange
@@ -70,21 +71,29 @@ class TestOWFile(WidgetTest):
     event_data = None
 
     def setUp(self):
+        super().setUp()
         self.widget = self.create_widget(OWFile)  # type: OWFile
         dataset_dirs.append(dirname(__file__))
 
     def tearDown(self):
         dataset_dirs.pop()
+        super().tearDown()
+
+    def test_describe_call_get_nans(self):
+        table = Table("iris")
+        with patch.object(Table, "get_nan_frequency_attribute", return_value=0.) as mock:
+            self.widget._describe(table)
+            mock.assert_called()
+
+        table = Table.from_numpy(domain=None, X=np.random.random((10000, 1000)))
+        with patch.object(Table, "get_nan_frequency_attribute", return_value=0.) as mock:
+            self.widget._describe(table)
+            mock.assert_not_called()
 
     def test_dragEnterEvent_accepts_urls(self):
         event = self._drag_enter_event(QUrl.fromLocalFile(TITANIC_PATH))
         self.widget.dragEnterEvent(event)
         self.assertTrue(event.isAccepted())
-
-    def test_dragEnterEvent_skips_osx_file_references(self):
-        event = self._drag_enter_event(QUrl.fromLocalFile('/.file/id=12345'))
-        self.widget.dragEnterEvent(event)
-        self.assertFalse(event.isAccepted())
 
     def test_dragEnterEvent_skips_usupported_files(self):
         event = self._drag_enter_event(QUrl.fromLocalFile('file.unsupported'))
@@ -110,13 +119,19 @@ class TestOWFile(WidgetTest):
         self.assertTrue(path.samefile(self.widget.last_path(), TITANIC_PATH))
         self.widget.load_data.assert_called_with()
 
+        event = self._drop_event(QUrl("https://example.com/aa.csv"))
+        self.widget.load_data.reset_mock()
+        self.widget.dropEvent(event)
+        self.assertEqual(self.widget.source, OWFile.URL)
+        self.widget.load_data.assert_called_with()
+
     def _drop_event(self, url):
         # make sure data does not get garbage collected before it used
         self.event_data = data = QMimeData()
         data.setUrls([QUrl(url)])
 
         return QDropEvent(
-            QPoint(0, 0), Qt.MoveAction, data,
+            QPointF(0, 0), Qt.MoveAction, data,
             Qt.NoButton, Qt.NoModifier, QDropEvent.Drop)
 
     def test_check_file_size(self):
@@ -666,23 +681,13 @@ a
 
     @patch("os.path.exists", new=lambda _: True)
     def test_warning_from_another_thread(self):
-        class AnotherWidget(QObject):
-            # This must be a method, not a staticmethod to run in the thread
-            def issue_warning(self):  # pylint: disable=no-self-use
-                time.sleep(0.1)
-                warnings.warn("warning from another thread")
-                warning_thread.quit()
-
         def read():
-            warning_thread.start()
-            time.sleep(0.2)
+            thread = Thread(
+                target=lambda: warnings.warn("warning from another thread")
+            )
+            thread.start()
+            thread.join()
             return Table(TITANIC_PATH)
-
-        warning_thread = QThread()
-        another_widget = AnotherWidget()
-        another_widget.moveToThread(warning_thread)
-        warning_thread.started.connect(another_widget.issue_warning)
-
         reader = Mock()
         reader.read = read
         self.widget._get_reader = lambda: reader
@@ -693,7 +698,6 @@ a
         with self.assertWarns(UserWarning):
             self.widget._try_load()
             self.assertFalse(self.widget.Warning.load_warning.is_shown())
-
 
     @patch("os.path.exists", new=lambda _: True)
     def test_warning_from_this_thread(self):
@@ -713,6 +717,24 @@ a
         self.assertTrue(self.widget.Warning.load_warning.is_shown())
         self.assertIn(WARNING_MSG, str(self.widget.Warning.load_warning))
 
+    def test_recent_url_serialization(self):
+        with patch.object(self.widget, "load_data", lambda: None):
+            self.widget.url_combo.insertItem(0, "https://example.com/test.tab")
+            self.widget.url_combo.insertItem(1, "https://example.com/test1.tab")
+            self.widget.source = OWFile.URL
+            s = self.widget.settingsHandler.pack_data(self.widget)
+            self.assertEqual(s["recent_urls"],
+                             ["https://example.com/test.tab",
+                              "https://example.com/test1.tab"])
+            self.widget.url_combo.lineEdit().clear()
+            QTest.keyClicks(self.widget.url_combo, "https://example.com/test1.tab")
+            QTest.keyClick(self.widget.url_combo, Qt.Key_Enter)
+            # must move the entered url to first position
+            s = self.widget.settingsHandler.pack_data(self.widget)
+            self.assertEqual(s["recent_urls"],
+                             ["https://example.com/test1.tab",
+                              "https://example.com/test.tab"])
+
 
 class TestOWFileDropHandler(unittest.TestCase):
     def test_canDropUrl(self):
@@ -727,6 +749,19 @@ class TestOWFileDropHandler(unittest.TestCase):
         self.assertEqual(r["recent_urls"], ["https://example.com/test.tab"])
         r = handler.parametersFromUrl(QUrl.fromLocalFile("test.tab"))
         self.assertEqual(r["source"], OWFile.LOCAL_FILE)
+        self.assertEqual(r["recent_paths"][0].basename, "test.tab")
+
+        defs = {
+            "source": OWFile.LOCAL_FILE,
+            "recent_paths": [
+                RecentPath("/foo.tab", None,  None, "foo.tab"),
+                RecentPath(path.abspath("test.tab"), None, None, "test.tab"),
+            ]
+        }
+        with patch.object(OWFile.settingsHandler, "defaults", defs):
+            r = handler.parametersFromUrl(QUrl.fromLocalFile("test.tab"))
+
+        self.assertEqual(len(r["recent_paths"]), 2)
         self.assertEqual(r["recent_paths"][0].basename, "test.tab")
 
 

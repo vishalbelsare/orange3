@@ -215,7 +215,7 @@ class OWRuleLearner(OWBaseLearner):
         "Orange.widgets.classify.owrules.OWRuleLearner",
     ]
     priority = 19
-    keywords = []
+    keywords = "cn2 rule induction"
 
     LEARNER = CustomRuleLearner
     supports_sparse = False
@@ -225,7 +225,6 @@ class OWRuleLearner(OWBaseLearner):
     storage_measures = ["entropy", "laplace", "wracc"]
 
     # default parameter values
-    learner_name = Setting("CN2 rule inducer")
     rule_ordering = Setting(0)
     covering_algorithm = Setting(0)
     gamma = Setting(0.7)
@@ -267,7 +266,7 @@ class OWRuleLearner(OWBaseLearner):
             widget=insert_gamma_box, master=self, value="gamma", minv=0.0,
             maxv=1.0, step=0.01, label="γ:", orientation=Qt.Horizontal,
             callback=self.settings_changed, alignment=Qt.AlignRight,
-            enabled=self.storage_covers[self.covering_algorithm] == "weighted")
+            enabled=self.covering_algorithm == 1)
 
         # bottom-level search procedure (search bias)
         middle_box = gui.vBox(widget=self.controlArea, box="Rule search")
@@ -314,8 +313,7 @@ class OWRuleLearner(OWBaseLearner):
             checked="checked_parent_alpha")
 
     def settings_changed(self, *args, **kwargs):
-        self.gamma_spin.setDisabled(
-            self.storage_covers[self.covering_algorithm] != "weighted")
+        self.gamma_spin.setDisabled(self.covering_algorithm == 0)
         super().settings_changed(*args, **kwargs)
 
     def update_model(self):
@@ -330,7 +328,7 @@ class OWRuleLearner(OWBaseLearner):
             except MemoryError:
                 self.Error.out_of_memory()
             else:
-                self.model.name = self.learner_name
+                self.model.name = self.effective_learner_name()
                 self.model.instances = self.data
                 self.valid_data = True
         self.Outputs.model.send(self.model)

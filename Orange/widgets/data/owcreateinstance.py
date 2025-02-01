@@ -1,4 +1,4 @@
-from typing import Optional, Callable, List, Union, Dict
+from typing import Optional, Callable, List, Union, Dict, Tuple
 from collections import namedtuple
 from functools import singledispatch
 
@@ -7,7 +7,7 @@ import numpy as np
 from AnyQt.QtCore import Qt, QSortFilterProxyModel, QSize, QDateTime, \
     QModelIndex, Signal, QPoint, QRect, QEvent
 from AnyQt.QtGui import QStandardItemModel, QStandardItem, QIcon, QPainter, \
-    QColor
+    QColor, QValidator
 from AnyQt.QtWidgets import QLineEdit, QTableView, QSlider, \
     QComboBox, QStyledItemDelegate, QWidget, QDateTimeEdit, QHBoxLayout, \
     QDoubleSpinBox, QSizePolicy, QStyleOptionViewItem, QLabel, QMenu, QAction
@@ -16,6 +16,7 @@ from orangewidget.gui import Slider
 
 from Orange.data import DiscreteVariable, ContinuousVariable, \
     TimeVariable, Table, StringVariable, Variable, Domain
+from Orange.data.util import get_unique_names
 from Orange.widgets import gui
 from Orange.widgets.utils.itemmodels import TableModel
 from Orange.widgets.settings import Setting
@@ -51,27 +52,35 @@ class VariableEditor(QWidget):
 
 
 class DiscreteVariableEditor(VariableEditor):
-    valueChanged = Signal(int)
-
-    def __init__(self, parent: QWidget, items: List[str], callback: Callable):
+    def __init__(self, parent: QWidget, items: Tuple[str], callback: Callable):
         super().__init__(parent, callback)
         self._combo = QComboBox(
             parent,
             maximumWidth=180,
             sizePolicy=QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         )
-        self._combo.addItems(items)
-        self._combo.currentIndexChanged.connect(self.valueChanged)
+        self._combo.addItems(items + ("?",))
+        self._combo.currentIndexChanged.connect(self.__on_index_changed)
         self.layout().addWidget(self._combo)
 
     @property
-    def value(self) -> int:
-        return self._combo.currentIndex()
+    def value(self) -> Union[int, float]:
+        return self._map_to_var_values()
 
     @value.setter
     def value(self, value: float):
+        if np.isnan(value):
+            value = self._combo.model().rowCount() - 1
         assert value == int(value)
         self._combo.setCurrentIndex(int(value))
+
+    def __on_index_changed(self):
+        self.valueChanged.emit(self._map_to_var_values())
+
+    def _map_to_var_values(self) -> Union[int, float]:
+        n_values = self._combo.model().rowCount() - 1
+        current = self._combo.currentIndex()
+        return current if current < n_values else np.nan
 
 
 class ContinuousVariableEditor(VariableEditor):
@@ -105,6 +114,17 @@ class ContinuousVariableEditor(VariableEditor):
             def sizeHint(self) -> QSize:
                 size: QSize = super().sizeHint()
                 return QSize(size.width(), size.height() + 2)
+
+            def validate(self, text: str, pos: int) -> Tuple[int, str, int]:
+                state, text, pos = super().validate(text, pos)
+                if text == "":
+                    state = QValidator.Acceptable
+                return state, text, pos
+
+            def textFromValue(self, value):
+                if not np.isfinite(value):
+                    return "?"
+                return super().textFromValue(value)
 
         self._spin = DoubleSpinBox(
             parent,
@@ -188,7 +208,8 @@ class ContinuousVariableEditor(VariableEditor):
         self.value = self.__map_from_slider(self._slider.value())
 
     def _apply_spin_value(self):
-        self.value = self._spin.value()
+        value = self._spin.value()
+        self.value = value if np.isfinite(value) else np.nan
 
     def __round_value(self, value):
         return round(value, self._n_decimals)
@@ -364,7 +385,9 @@ def _(variable: TimeVariable, _: np.ndarray,
     return TimeVariableEditor(parent, variable, callback)
 
 
-def majority(values: np.ndarray) -> int:
+def majority(values: np.ndarray) -> Union[int, float]:
+    if all(np.isnan(values)):
+        return np.nan
     return np.bincount(values[~np.isnan(values)].astype(int)).argmax()
 
 
@@ -387,7 +410,7 @@ class VariableItemModel(QStandardItemModel):
                     [(TableModel.Meta, m) for m in domain.metas]
         for place, variable in variables:
             if variable.is_primitive():
-                values = data.get_column_view(variable)[0].astype(float)
+                values = data.get_column(variable)
                 if all(np.isnan(values)):
                     self.dataHasNanColumn.emit()
                     continue
@@ -452,8 +475,8 @@ class OWCreateInstance(OWWidget):
     description = "Interactively create a data instance from sample dataset."
     icon = "icons/CreateInstance.svg"
     category = "Transform"
-    keywords = ["simulator"]
-    priority = 4000
+    keywords = "create instance, simulator"
+    priority = 2310
 
     class Inputs:
         data = Input("Data", Table)
@@ -467,6 +490,7 @@ class OWCreateInstance(OWWidget):
                            "removed from the list.")
 
     want_main_area = False
+    BUTTONS = ["Median", "Mean", "Random", "Input"]
     ACTIONS = ["median", "mean", "random", "input"]
     HEADER = [["name", "Variable"],
               ["variable", "Value"]]
@@ -512,10 +536,10 @@ class OWCreateInstance(OWWidget):
 
         box = gui.hBox(vbox, objectName="buttonBox")
         gui.rubber(box)
-        for name in self.ACTIONS:
+        for name, action in zip(self.BUTTONS, self.ACTIONS):
             gui.button(
-                box, self, name.capitalize(),
-                lambda *args, fun=name: self._initialize_values(fun),
+                box, self, name,
+                lambda *args, fun=action: self._initialize_values(fun),
                 autoDefault=False
             )
         gui.rubber(box)
@@ -576,11 +600,7 @@ class OWCreateInstance(OWWidget):
             if fun == "input":
                 if variable not in self.reference.domain:
                     continue
-                values = self.reference.get_column_view(variable)[0]
-                if variable.is_primitive():
-                    values = values.astype(float)
-                    if all(np.isnan(values)):
-                        continue
+                values = self.reference.get_column(variable)
             else:
                 values = self.model.data(index, ValuesRole)
 
@@ -646,14 +666,27 @@ class OWCreateInstance(OWWidget):
                 data[:, var_name] = value
         return data
 
-    def _append_to_data(self, data: Table) -> Table:
+    def _append_to_data(self, instance: Table) -> Table:
         assert self.data
-        assert len(data) == 1
+        assert len(instance) == 1
+        source_label = "__source_widget"
 
-        var = DiscreteVariable("Source ID", values=(self.data.name, data.name))
-        data = Table.concatenate([self.data, data], axis=0)
-        domain = Domain(data.domain.attributes, data.domain.class_vars,
-                        data.domain.metas + (var,))
+        data = Table.concatenate([self.data, instance], axis=0)
+        domain = self.data.domain
+        with data.unlocked():
+            for attrs, part in ((domain.attributes, data.X),
+                            (domain.class_vars, data.Y.reshape(len(data), -1)),
+                            (domain.metas, data.metas)):
+                for idx, var in enumerate(attrs):
+                    if var.attributes.get(source_label) == OWCreateInstance:
+                            part[-1, idx] = 1
+                            return data
+
+        name = get_unique_names(self.data.domain, "Source ID")
+        var = DiscreteVariable(name, values=(self.data.name, instance.name))
+        var.attributes[source_label] = OWCreateInstance
+        domain = Domain(domain.attributes, domain.class_vars,
+                        domain.metas + (var,))
         data = data.transform(domain)
         with data.unlocked(data.metas):
             data.metas[: len(self.data), -1] = 0

@@ -69,7 +69,7 @@ class OWConcurrentWidget(OWDataProjectionWidget, ConcurrentWidgetMixin):
         if self.task is not None:
             self.cancel()
             self.run_button.setText("Resume")
-            self.commit()
+            self.commit.deferred()
         # Resume task
         else:
             self._run()
@@ -103,6 +103,7 @@ class OWConcurrentWidget(OWDataProjectionWidget, ConcurrentWidgetMixin):
         raise ex
 
     # OWDataProjectionWidget
+    @OWDataProjectionWidget.Inputs.data
     def set_data(self, data: Table):
         super().set_data(data)
         if self._invalidated:

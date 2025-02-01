@@ -1,6 +1,7 @@
 import math
 from collections import namedtuple
 from itertools import chain, count
+
 import numpy as np
 
 from AnyQt.QtWidgets import (
@@ -70,10 +71,63 @@ class BoxData:
 
 
 class FilterGraphicsRectItem(QGraphicsRectItem):
-    def __init__(self, data_range, *args):
+    def __init__(self, data_range, *args, add_lpad=True, add_rpad=True):
         super().__init__(*args)
         self.data_range = data_range
+        self.__add_lpad = add_lpad
+        self.__add_rpad = add_rpad
+        self.__is_hovered = False
         self.setFlag(QGraphicsItem.ItemIsSelectable)
+        self.setAcceptHoverEvents(True)
+
+    def set_right_padding(self, add_rpad: bool):
+        self.__add_rpad = add_rpad
+
+    def hoverEnterEvent(self, _) -> None:
+        self.__is_hovered = True
+        self.update()
+
+    def hoverLeaveEvent(self, _) -> None:
+        self.__is_hovered = False
+        self.update()
+
+    def boundingRect(self) -> QRectF:
+        br = super().boundingRect()
+        d = 7
+        return br.adjusted(-d if self.__add_lpad else 0, -d,
+                           d if self.__add_rpad else 0, d)
+
+    def shape(self) -> QPainterPath:
+        sh = QPainterPath()
+        sh.addRect(self.boundingRect())
+        return sh
+
+    def paint(self, painter: QPainter, *_, **__) -> None:
+        if self.__is_hovered:
+            painter.save()
+            brush = self.brush()
+            color = brush.color()
+            color.setAlpha(100)
+            brush.setColor(color)
+            painter.setBrush(brush)
+            painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(self.boundingRect(), 2, 2)
+            painter.restore()
+
+        painter.save()
+        painter.setBrush(self.brush())
+        painter.setPen(self.pen())
+        painter.drawRect(self.rect())
+        painter.restore()
+
+        if self.isSelected():
+            painter.save()
+            pen = QPen(Qt.black)
+            pen.setStyle(Qt.DashLine)
+            pen.setWidth(2)
+            painter.setPen(pen)
+            painter.drawRect(self.rect())
+            painter.restore()
 
 
 class SortProxyModel(QSortFilterProxyModel):
@@ -83,12 +137,13 @@ class SortProxyModel(QSortFilterProxyModel):
         r_score = right.data(role)
         return r_score is not None and (l_score is None or l_score < r_score)
 
+
 class OWBoxPlot(widget.OWWidget):
     name = "Box Plot"
     description = "Visualize the distribution of feature values in a box plot."
     icon = "icons/BoxPlot.svg"
     priority = 100
-    keywords = ["whisker"]
+    keywords = "box plot, whisker"
 
     class Inputs:
         data = Input("Data", Orange.data.Table)
@@ -145,7 +200,7 @@ class OWBoxPlot(widget.OWWidget):
     _box_brush = QBrush(QColor(0x33, 0x88, 0xff, 0xc0))
     _attr_brush = QBrush(QColor(0x33, 0x00, 0xff))
 
-    graph_name = "box_scene"
+    graph_name = "box_scene"  # QGraphicsScene
 
     def __init__(self):
         super().__init__()
@@ -254,8 +309,7 @@ class OWBoxPlot(widget.OWWidget):
         return QSize(900, 500)
 
     def eventFilter(self, obj, event):
-        if obj is self.box_view.viewport() and \
-                event.type() == QEvent.Resize:
+        if event.type() == QEvent.Resize and obj is self.box_view.viewport():
             self.update_graph()
         return super().eventFilter(obj, event)
 
@@ -298,6 +352,7 @@ class OWBoxPlot(widget.OWWidget):
             self.apply_attr_sorting()
             self.apply_group_sorting()
             self.update_graph()
+            self._scroll_to_top()
             self.select_box_items()
 
         self.update_box_visibilities()
@@ -352,7 +407,7 @@ class OWBoxPlot(widget.OWWidget):
                 return 3
             if attr.is_continuous:
                 # One-way ANOVA
-                col = data.get_column_view(attr)[0].astype(float)
+                col = data.get_column(attr)
                 groups = (col[group_col == i] for i in range(n_groups))
                 groups = (col[~np.isnan(col)] for col in groups)
                 groups = [group for group in groups if len(group) > 1]
@@ -370,8 +425,8 @@ class OWBoxPlot(widget.OWWidget):
         group_var = self.group_var
         if self.order_by_importance and group_var is not None:
             n_groups = len(group_var.values)
-            group_col = data.get_column_view(group_var)[0] if \
-                domain.has_continuous_attributes(
+            group_col = data.get_column(group_var) \
+                if domain.has_continuous_attributes(
                     include_class=True, include_metas=True) else None
             self._sort_list(self.attrs, self.attr_list, compute_score)
         else:
@@ -403,7 +458,7 @@ class OWBoxPlot(widget.OWWidget):
         attr = self.attribute
         if self.order_grouping_by_importance:
             if attr.is_continuous:
-                attr_col = data.get_column_view(attr)[0].astype(float)
+                attr_col = data.get_column(attr)
             self._sort_list(self.group_vars, self.group_list, compute_stat)
         else:
             self._sort_list(self.group_vars, self.group_list, None)
@@ -441,6 +496,7 @@ class OWBoxPlot(widget.OWWidget):
             return  # should never come here
         self.group_var = selected.indexes()[0].data(gui.TableVariable)
         self._variables_changed(self.apply_attr_sorting)
+        self._scroll_to_top()
 
     def attr_changed(self, selected):
         if not selected:
@@ -455,6 +511,10 @@ class OWBoxPlot(widget.OWWidget):
         self.update_graph()
         self.update_box_visibilities()
         self.commit()
+
+    def _scroll_to_top(self):
+        scrollbar = self.box_view.verticalScrollBar()
+        scrollbar.setValue(scrollbar.minimum())
 
     def update_graph(self):
         pending_selection = self.selection
@@ -472,14 +532,6 @@ class OWBoxPlot(widget.OWWidget):
             self.selection = pending_selection
             self.draw_stat()
             self.select_box_items()
-
-            if self.attribute.is_continuous:
-                heights = 90 if self.show_annotations else 60
-                self.box_view.centerOn(self.scene_min_x + self.scene_width / 2,
-                                       -30 - len(self.stats) * heights / 2 + 45)
-            else:
-                self.box_view.centerOn(self.scene_width / 2,
-                                       -30 - len(self.boxes) * 40 / 2 + 45)
         finally:
             self.box_scene.selectionChanged.connect(self.on_selection_changed)
 
@@ -493,8 +545,8 @@ class OWBoxPlot(widget.OWWidget):
         if isinstance(attr, np.ndarray):
             attr_col = attr
         else:
-            attr_col = data.get_column_view(group)[0].astype(float)
-        group_col = data.get_column_view(group)[0].astype(float)
+            attr_col = data.get_column(group)
+        group_col = data.get_column(group)
         groups = [attr_col[group_col == i] for i in range(len(group.values))]
         groups = [col[~np.isnan(col)] for col in groups]
         return groups
@@ -516,7 +568,7 @@ class OWBoxPlot(widget.OWWidget):
             group_var_labels = self.group_var.values + ("",)
             if self.attribute.is_continuous:
                 stats, label_texts = [], []
-                attr_col = dataset.get_column_view(attr)[0].astype(float)
+                attr_col = dataset.get_column(attr)
                 for group, value in \
                         zip(self._group_cols(dataset, self.group_var, attr_col),
                             group_var_labels):
@@ -535,7 +587,7 @@ class OWBoxPlot(widget.OWWidget):
         else:
             self.conts = None
             if self.attribute.is_continuous:
-                attr_col = dataset.get_column_view(attr)[0].astype(float)
+                attr_col = dataset.get_column(attr)
                 self.stats = [BoxData(attr_col)]
             else:
                 self.dist = distribution.get_distribution(dataset, attr)
@@ -637,7 +689,7 @@ class OWBoxPlot(widget.OWWidget):
         if not self.show_stretched:
             if self.group_var:
                 self.labels = [
-                    QGraphicsTextItem("{}".format(int(sum(cont))))
+                    QGraphicsTextItem(f"{int(sum(cont))}")
                     for cont in self.conts.array_with_unknowns
                     if np.sum(cont) > 0]
             else:
@@ -853,7 +905,7 @@ class OWBoxPlot(widget.OWWidget):
 
     def draw_axis(self):
         """Draw the horizontal axis and sets self.scale_x"""
-        misssing_stats = not self.stats
+        missing_stats = not self.stats
         stats = self.stats or [BoxData(np.array([0.]), self.attribute)]
         mean_labels = self.mean_labels or [self.mean_label(stats[0], self.attribute, "")]
         bottom = min(stat.a_min for stat in stats)
@@ -873,7 +925,7 @@ class OWBoxPlot(widget.OWWidget):
         viewrect = bv.viewport().rect().adjusted(15, 15, -15, -30)
         self.scale_x = scale_x = viewrect.width() / (gtop - gbottom)
 
-        # In principle we should repeat this until convergence since the new
+        # In principle, we should repeat this until convergence since the new
         # scaling is too conservative. (No chance am I doing this.)
         mlb = min(stat.mean + mean_lab.min_x / scale_x
                   for stat, mean_lab in zip(stats, mean_labels))
@@ -892,7 +944,7 @@ class OWBoxPlot(widget.OWWidget):
                                        self._pen_axis_tick)
             l.setZValue(100)
             t = QGraphicsSimpleTextItem(
-                self.attribute.str_val(val) if not misssing_stats else "?")
+                self.attribute.str_val(val) if not missing_stats else "?")
             t.setFont(self._axis_font)
             t.setFlag(QGraphicsItem.ItemIgnoresTransformations)
             r = t.boundingRect()
@@ -908,13 +960,22 @@ class OWBoxPlot(widget.OWWidget):
         self.box_scene.addLine(
             bottom * scale_x - 4, 0, top * scale_x + 4, 0, self._pen_axis)
 
+        t = QGraphicsSimpleTextItem(self.attribute.name)
+        t.setFont(self._axis_font)
+        t.setFlag(QGraphicsItem.ItemIgnoresTransformations)
+        t.setPos(
+            self.scene_min_x + (self.scene_width - t.boundingRect().width()) / 2,
+            8 + 1.5 * self._axis_font.pixelSize())
+        self.box_scene.addItem(t)
+
     def draw_stat(self):
         if self.stat_test:
             label = QGraphicsSimpleTextItem(self.stat_test)
             brect = self.box_scene.sceneRect()
-            label.setPos(brect.center().x() - label.boundingRect().width()/2,
-                         8 + self._axis_font.pixelSize()*2)
+            label.setPos(brect.x(),
+                         32 + self._axis_font.pixelSize() * 3.6)
             label.setFlag(QGraphicsItem.ItemIgnoresTransformations)
+            label.setFont(self._axis_font)
             self.box_scene.addItem(label)
 
     def draw_axis_disc(self):
@@ -1082,6 +1143,7 @@ class OWBoxPlot(widget.OWWidget):
         values = attr.values + ("",)
         colors = attr.palette.qcolors_w_nan
         total = sum(dist)
+        rect = None
         for freq, value, color in zip(dist, values, colors):
             if freq < 1e-6:
                 continue
@@ -1090,7 +1152,8 @@ class OWBoxPlot(widget.OWWidget):
                 v /= ss
             v *= self.scale_x
             cond = DiscDataRange(value, group_val)
-            rect = FilterGraphicsRectItem(cond, cum + 1, -6, v - 2, 12)
+            kw = {"add_lpad": rect is None, "add_rpad": False}
+            rect = FilterGraphicsRectItem(cond, cum + 1, -6, v - 2, 12, **kw)
             rect.setBrush(QBrush(color))
             rect.setPen(QPen(Qt.NoPen))
             value = value or missing_val_str
@@ -1103,6 +1166,8 @@ class OWBoxPlot(widget.OWWidget):
             box.append(rect)
             box.append(text)
             cum += v
+        if rect is not None:
+            rect.set_right_padding(True)
         return box
 
     def on_selection_changed(self):
@@ -1214,9 +1279,9 @@ class OWBoxPlot(widget.OWWidget):
         self.report_plot()
         text = ""
         if self.attribute:
-            text += "Box plot for attribute '{}' ".format(self.attribute.name)
+            text += f"Box plot for attribute '{self.attribute.name}' "
         if self.group_var:
-            text += "grouped by '{}'".format(self.group_var.name)
+            text += f"grouped by '{self.group_var.name}'"
         if text:
             self.report_caption(text)
 

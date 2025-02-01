@@ -4,14 +4,12 @@ import os
 import sys
 import subprocess
 from setuptools import setup, find_packages, Command
+from setuptools.command.install import install
 
 from distutils.command import install_data, sdist
 from distutils.command.build_ext import build_ext
 from distutils.command import config, build
 from distutils.core import Extension
-
-if sys.version_info < (3, 4):
-    sys.exit('Orange requires Python >= 3.4')
 
 try:
     import numpy
@@ -21,30 +19,22 @@ except ImportError:
 
 try:
     # need sphinx and recommonmark for build_htmlhelp command
-    from sphinx.setup_command import BuildDoc
     # pylint: disable=unused-import
+    import sphinx
     import recommonmark
     have_sphinx = True
 except ImportError:
     have_sphinx = False
 
 try:
-    from Cython.Distutils.build_ext import new_build_ext as build_ext
+    from Cython.Build import cythonize
     have_cython = True
 except ImportError:
     have_cython = False
 
-try:
-    import PyQt5.QtCore  # pylint: disable=unused-import
-    have_pyqt5 = True
-except ImportError:
-    have_pyqt5 = False
-
-is_conda = os.path.exists(os.path.join(sys.prefix, 'conda-meta'))
-
 NAME = 'Orange3'
 
-VERSION = '3.32.0'
+VERSION = '3.39.0'
 ISRELEASED = False
 # full version identifier including a git revision identifier for development
 # build/releases (this is filled/updated in `write_version_py`)
@@ -56,7 +46,13 @@ LONG_DESCRIPTION = open(README_FILE).read()
 LONG_DESCRIPTION_CONTENT_TYPE = 'text/markdown'
 AUTHOR = 'Bioinformatics Laboratory, FRI UL'
 AUTHOR_EMAIL = 'info@biolab.si'
-URL = 'http://orange.biolab.si/'
+URL = 'https://orangedatamining.com/'
+PROJECT_URLS = {
+    'Documentation': 'https://orangedatamining.com/docs',
+    'Source Code': 'https://github.com/biolab/orange3',
+    'Issue Tracker': 'https://github.com/biolab/orange3/issues',
+    'Donate': 'https://github.com/sponsors/biolab'
+}
 LICENSE = 'GPLv3+'
 
 KEYWORDS = [
@@ -83,13 +79,11 @@ CLASSIFIERS = [
     'Intended Audience :: Developers',
 ]
 
+PYTHON_REQUIRES = ">=3.9"
+
+
 requirements = ['requirements-core.txt', 'requirements-gui.txt']
 
-# pyqt5 is named pyqt5 on pypi and pyqt on conda
-# due to possible conflicts, skip the pyqt5 requirement in conda environments
-# that already have pyqt
-if not (is_conda and have_pyqt5):
-    requirements.append('requirements-pyqt.txt')
 
 INSTALL_REQUIRES = sorted(set(
     line.partition('#')[0].strip()
@@ -170,8 +164,12 @@ if not release:
         GIT_REVISION = git_version()
     elif os.path.exists('Orange/version.py'):
         # must be a source distribution, use existing version file
-        import imp
-        version = imp.load_source("Orange.version", "Orange/version.py")
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "Orange.version", filename
+        )
+        version = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(version)
         GIT_REVISION = version.git_revision
     else:
         GIT_REVISION = "Unknown"
@@ -393,16 +391,23 @@ HAVE_SPHINX_SOURCE = os.path.isdir("doc/visual-programming/source")
 HAVE_BUILD_HTML = os.path.exists("doc/visual-programming/build/htmlhelp/index.html")
 
 if have_sphinx and HAVE_SPHINX_SOURCE:
-    class build_htmlhelp(BuildDoc):
+    class build_htmlhelp(Command):
+        user_options = []
+
+        def finalize_options(self):
+            pass
+
         def initialize_options(self):
-            super().initialize_options()
             self.build_dir = "doc/visual-programming/build"
-            self.source_dir = "doc/visual-programming/source"
-            self.builder = "htmlhelp"
-            self.version = VERSION
 
         def run(self):
-            super().run()
+            subprocess.check_call([
+                "sphinx-build", "-b", "htmlhelp", "-d", "build/doctrees",
+                "-D", f"version={VERSION}",
+                "source", "build"
+                ],
+                cwd="doc/visual-programming"
+            )
             helpdir = os.path.join(self.build_dir, "htmlhelp")
             files = find_htmlhelp_files(helpdir)
             # add the build files to distribution
@@ -441,14 +446,7 @@ def ext_modules():
     if os.name == 'posix':
         libraries.append("m")
 
-    return [
-        # Cython extensions. Will be automatically cythonized.
-        Extension(
-            "*",
-            ["Orange/*/*.pyx"],
-            include_dirs=includes,
-            libraries=libraries,
-        ),
+    modules = [
         Extension(
             "Orange.classification._simple_tree",
             sources=[
@@ -471,10 +469,38 @@ def ext_modules():
         ),
     ]
 
+    if have_cython:
+        modules += cythonize(Extension(
+            "*",
+            ["Orange/*/*.pyx"],
+            include_dirs=includes,
+            libraries=libraries,
+        ))
+
+    return modules
+
+
+class InstallMultilingualCommand(install):
+    def run(self):
+        super().run()
+        self.compile_to_multilingual()
+
+    def compile_to_multilingual(self):
+        # Import locally so that editable install won't require trubar
+        # pylint: disable=import-outside-toplevel
+        from trubar import translate
+
+        package_dir = os.path.dirname(os.path.abspath(__file__))
+        translate(
+            "msgs.jaml",
+            source_dir=os.path.join(self.install_lib, "Orange"),
+            config_file=os.path.join(package_dir, "i18n", "trubar-config.yaml"))
+
 
 def setup_package():
     write_version_py()
     cmdclass = {
+        'install': InstallMultilingualCommand,
         'lint': LintCommand,
         'coverage': CoverageCommand,
         'config': config,
@@ -485,17 +511,14 @@ def setup_package():
         # numpy.distutils insist all data files are installed in site-packages
         'install_data': install_data.install_data
     }
-    if have_numpy and have_cython:
-        extra_args = {}
-        cmdclass["build_ext"] = build_ext
-    else:
+    if not (have_numpy and have_cython):
         # substitute a build_ext command with one that raises an error when
         # building. In order to fully support `pip install` we need to
         # survive a `./setup egg_info` without numpy so pip can properly
         # query our install dependencies
-        extra_args = {}
         cmdclass["build_ext"] = build_ext_error
 
+    extra_args = {}
     setup(
         name=NAME,
         version=FULLVERSION,
@@ -505,6 +528,7 @@ def setup_package():
         author=AUTHOR,
         author_email=AUTHOR_EMAIL,
         url=URL,
+        project_urls=PROJECT_URLS,
         license=LICENSE,
         keywords=KEYWORDS,
         classifiers=CLASSIFIERS,
@@ -514,6 +538,7 @@ def setup_package():
         data_files=DATA_FILES,
         install_requires=INSTALL_REQUIRES,
         extras_require=EXTRAS_REQUIRE,
+        python_requires=PYTHON_REQUIRES,
         entry_points=ENTRY_POINTS,
         zip_safe=False,
         test_suite='Orange.tests.suite',

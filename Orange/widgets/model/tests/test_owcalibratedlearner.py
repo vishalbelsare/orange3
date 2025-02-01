@@ -9,6 +9,7 @@ from Orange.data import Table
 from Orange.widgets.model.owcalibratedlearner import OWCalibratedLearner
 from Orange.widgets.tests.base import WidgetTest, WidgetLearnerTestMixin, \
     datasets
+from Orange.widgets.tests.utils import qbuttongroup_emit_clicked
 
 
 class TestOWCalibratedLearner(WidgetTest, WidgetLearnerTestMixin):
@@ -28,10 +29,10 @@ class TestOWCalibratedLearner(WidgetTest, WidgetLearnerTestMixin):
     def test_output_learner(self):
         """Check if learner is on output after apply"""
         # Overridden to change the output type in the last test
-        initial = self.get_output("Learner")
+        initial = self.get_output(self.widget.Outputs.learner)
         self.assertIsNotNone(initial, "Does not initialize the learner output")
-        self.widget.apply_button.button.click()
-        newlearner = self.get_output("Learner")
+        self.click_apply()
+        newlearner = self.get_output(self.widget.Outputs.learner)
         self.assertIsNot(initial, newlearner,
                          "Does not send a new learner instance on `Apply`.")
         self.assertIsNotNone(newlearner)
@@ -43,10 +44,10 @@ class TestOWCalibratedLearner(WidgetTest, WidgetLearnerTestMixin):
         """Check if model is on output after sending data and apply"""
         # Overridden to change the output type in the last two test
         self.assertIsNone(self.get_output(self.widget.Outputs.model))
-        self.widget.apply_button.button.click()
+        self.click_apply()
         self.assertIsNone(self.get_output(self.widget.Outputs.model))
-        self.send_signal('Data', self.data)
-        self.widget.apply_button.button.click()
+        self.send_signal(self.widget.Inputs.data, self.data)
+        self.click_apply()
         self.wait_until_stop_blocking()
         model = self.get_output(self.widget.Outputs.model)
         self.assertIsNotNone(model)
@@ -94,7 +95,7 @@ class TestOWCalibratedLearner(WidgetTest, WidgetLearnerTestMixin):
         widget.calibration = widget.NoCalibration
         widget.threshold = widget.NoThresholdOptimization
         learner = self.widget.create_learner()
-        self.assertIs(learner, self.widget.base_learner)
+        self.assertIsNot(learner, self.widget.base_learner)
 
         widget.calibration = widget.SigmoidCalibration
         widget.threshold = widget.OptimizeF1
@@ -140,16 +141,16 @@ class TestOWCalibratedLearner(WidgetTest, WidgetLearnerTestMixin):
 
         widget.calibration = widget.IsotonicCalibration
         widget.threshold = widget.OptimizeCA
-        widget.controls.calibration.group.buttonClicked[int].emit(
-            widget.IsotonicCalibration)
+        qbuttongroup_emit_clicked(widget.controls.calibration.group,
+                                  widget.IsotonicCalibration)
 
         learner = self.get_output(widget.Outputs.learner)
         self.assertEqual(learner.name, "Foo + Isotonic + CA")
 
         widget.calibration = widget.NoCalibration
         widget.threshold = widget.OptimizeCA
-        widget.controls.calibration.group.buttonClicked[int].emit(
-            widget.NoCalibration)
+        qbuttongroup_emit_clicked(widget.controls.calibration.group,
+                                  widget.NoCalibration)
         learner = self.get_output(widget.Outputs.learner)
         self.assertEqual(learner.name, "Foo + CA")
 

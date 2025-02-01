@@ -1,17 +1,20 @@
-from itertools import chain
+import math
+from typing import List, Callable, Optional
 from xml.sax.saxutils import escape
 
 import numpy as np
+import scipy.stats as ss
 from scipy.stats import linregress
 from sklearn.neighbors import NearestNeighbors
 from sklearn.metrics import r2_score
 
-from AnyQt.QtCore import Qt, QTimer, QPointF, Signal
-from AnyQt.QtGui import QColor, QFont
-from AnyQt.QtWidgets import QGroupBox, QPushButton
+from AnyQt.QtCore import Qt, QTimer, QPointF
+from AnyQt.QtGui import QColor, QFont, QFontMetrics
+from AnyQt.QtWidgets import QGroupBox, QSizePolicy, QPushButton
 
 import pyqtgraph as pg
 
+from orangewidget.utils import load_styled_icon
 from orangewidget.utils.combobox import ComboBoxSearch
 
 from Orange.data import Table, Domain, DiscreteVariable, Variable
@@ -27,47 +30,21 @@ from Orange.widgets.utils.itemmodels import DomainModel
 from Orange.widgets.utils.widgetpreview import WidgetPreview
 from Orange.widgets.visualize.owscatterplotgraph import OWScatterPlotBase, \
     ScatterBaseParameterSetter
-from Orange.widgets.visualize.utils import VizRankDialogAttrPair
+from Orange.widgets.visualize.utils.error_bars_dialog import ErrorBarsDialog
+from Orange.widgets.visualize.utils.vizrank import VizRankDialogAttrPair, \
+    VizRankMixin
 from Orange.widgets.visualize.utils.customizableplot import Updater
 from Orange.widgets.visualize.utils.widget import OWDataProjectionWidget
 from Orange.widgets.widget import AttributeList, Msg, Input, Output
 
 
 class ScatterPlotVizRank(VizRankDialogAttrPair):
-    captionTitle = "Score Plots"
     minK = 10
-    attr_color = None
-
-    def __init__(self, master):
-        super().__init__(master)
-        self.attr_color = self.master.attr_color
-
-    def initialize(self):
-        self.attr_color = self.master.attr_color
-        super().initialize()
-
-    def check_preconditions(self):
-        self.Information.add_message(
-            "color_required", "Color variable is not selected")
-        self.Information.color_required.clear()
-        if not super().check_preconditions():
-            return False
-        if not self.attr_color:
-            self.Information.color_required()
-            return False
-        return True
-
-    def iterate_states(self, initial_state):
-        # If we put initialization of `self.attrs` to `initialize`,
-        # `score_heuristic` would be run on every call to `set_data`.
-        if initial_state is None:  # on the first call, compute order
-            self.attrs = self.score_heuristic()
-        yield from super().iterate_states(initial_state)
 
     def compute_score(self, state):
         # pylint: disable=invalid-unary-operand-type
-        attrs = [self.attrs[i] for i in state]
-        data = self.master.data
+        attrs = [self.attr_order[i] for i in state]
+        data = self.data
         data = data.transform(Domain(attrs, self.attr_color))
         data = data[~np.isnan(data.X).any(axis=1) & ~np.isnan(data.Y).T]
         if len(data) < self.minK:
@@ -80,21 +57,21 @@ class ScatterPlotVizRank(VizRankDialogAttrPair):
                    n_neighbors / len(data.Y)
         else:
             return -r2_score(data.Y, np.mean(data.Y[ind], axis=1)) * \
-                   (len(data.Y) / len(self.master.data))
+                   (len(data.Y) / len(self.data))
 
-    def bar_length(self, score):
-        return max(0, -score)
-
-    def score_heuristic(self):
+    def score_attributes(self):
         assert self.attr_color is not None
-        master_domain = self.master.data.domain
-        vars = [v for v in chain(master_domain.variables, master_domain.metas)
-                if v is not self.attr_color and v.is_primitive()]
-        domain = Domain(attributes=vars, class_vars=self.attr_color)
-        data = self.master.data.transform(domain)
+        attrs = [
+            v
+            for v in self.attrs  # same attributes that are in xy combos
+            if v is not self.attr_color and v.is_primitive()
+        ]
+        domain = Domain(attributes=attrs, class_vars=self.attr_color)
+        data = self.data.transform(domain)
         relief = ReliefF if isinstance(domain.class_var, DiscreteVariable) \
             else RReliefF
-        weights = relief(n_iterations=100, k_nearest=self.minK)(data)
+        weights = relief(
+            n_iterations=100, k_nearest=self.minK, random_state=0)(data)
         attrs = sorted(zip(weights, domain.attributes),
                        key=lambda x: (-x[0], x[1].name))
         return [a for _, a in attrs]
@@ -132,6 +109,8 @@ class ParameterSetter(ScatterBaseParameterSetter):
             self.reg_line_settings.update(**settings)
             Updater.update_inf_lines(self.reg_line_items,
                                      **self.reg_line_settings)
+            Updater.update_lines(self.ellipse_items,
+                                 **self.reg_line_settings)
             self.master.update_reg_line_label_colors()
 
         def update_line_label(**settings):
@@ -157,32 +136,48 @@ class ParameterSetter(ScatterBaseParameterSetter):
         return [line.label for line in self.master.reg_line_items
                 if hasattr(line, "label")]
 
+    @property
+    def ellipse_items(self):
+        return self.master.ellipse_items
+
 
 class OWScatterPlotGraph(OWScatterPlotBase):
     show_reg_line = Setting(False)
     orthonormal_regression = Setting(False)
+    show_ellipse = Setting(False)
     jitter_continuous = Setting(False)
 
     def __init__(self, scatter_widget, parent):
         super().__init__(scatter_widget, parent)
         self.parameter_setter = ParameterSetter(self)
         self.reg_line_items = []
+        self.ellipse_items: List[pg.PlotCurveItem] = []
+        self.error_bars_items: List[pg.ErrorBarItem] = []
+        self.view_box.sigResized.connect(self.update_error_bars)
+        self.view_box.sigRangeChanged.connect(self.update_error_bars)
 
     def clear(self):
         super().clear()
         self.reg_line_items.clear()
+        self.ellipse_items.clear()
+        self.error_bars_items.clear()
 
     def update_coordinates(self):
         super().update_coordinates()
         self.update_axes()
+        self.update_error_bars()
         # Don't update_regression line here: update_coordinates is always
         # followed by update_point_props, which calls update_colors
 
     def update_colors(self):
         super().update_colors()
         self.update_regression_line()
+        self.update_ellipse()
 
     def jitter_coordinates(self, x, y):
+        if self.jitter_size == 0:
+            return x, y
+
         def get_span(attr):
             if attr.is_discrete:
                 # Assuming the maximal jitter size is 10, a span of 4 will
@@ -194,7 +189,7 @@ class OWScatterPlotGraph(OWScatterPlotBase):
                 return 0  # No jittering
         span_x = get_span(self.master.attr_x)
         span_y = get_span(self.master.attr_y)
-        if self.jitter_size == 0 or (span_x == 0 and span_y == 0):
+        if span_x == 0 and span_y == 0:
             return x, y
         return self._jitter_data(x, y, span_x, span_y)
 
@@ -244,17 +239,12 @@ class OWScatterPlotGraph(OWScatterPlotBase):
         slope, intercept, rvalue, _, _ = linregress(x, y)
         angle = np.degrees(np.arctan(slope))
         start_y = min_x * slope + intercept
-        rotate = 135 < angle % 360 < 315
-        l_opts = dict(color=color, position=abs(rotate - 0.85),
+        l_opts = dict(color=color, position=0.85,
                       rotateAxis=(1, 0), movable=True)
-        reg_line_item = pg.InfiniteLine(
+        return pg.InfiniteLine(
             pos=QPointF(min_x, start_y), angle=angle,
             pen=pg.mkPen(color=color, width=width, style=style),
             label=f"r = {rvalue:.2f}", labelOpts=l_opts)
-        if rotate:
-            reg_line_item.label.angle = 180
-            reg_line_item.label.updateTransform()
-        return reg_line_item
 
     def _add_line(self, x, y, color):
         width = self.parameter_setter.reg_line_settings[Updater.WIDTH_LABEL]
@@ -288,17 +278,28 @@ class OWScatterPlotGraph(OWScatterPlotBase):
         self.update_reg_line_label_colors()
 
     def update_regression_line(self):
-        for line in self.reg_line_items:
-            self.plot_widget.removeItem(line)
-        self.reg_line_items.clear()
-        if not (self.show_reg_line
-                and self.master.can_draw_regresssion_line()):
+        self._update_curve(self.reg_line_items,
+                           self.show_reg_line,
+                           self._add_line)
+        self.update_reg_line_label_colors()
+
+    def update_ellipse(self):
+        self._update_curve(self.ellipse_items,
+                           self.show_ellipse,
+                           self._add_ellipse)
+
+    def _update_curve(self, items: List, show: bool, add: Callable):
+        for item in items:
+            self.plot_widget.removeItem(item)
+        items.clear()
+        if not (show and self.master.can_draw_regression_line()):
             return
         x, y = self.master.get_coordinates_data()
-        if x is None:
+        if x is None or len(x) < 2:
             return
-        self._add_line(x, y, QColor("#505050"))
-        if self.master.is_continuous_color() or self.palette is None:
+        add(x, y, QColor("#505050"))
+        if self.master.is_continuous_color() or self.palette is None \
+                or len(self.palette) == 0:
             return
         c_data = self.master.get_color_data()
         if c_data is None:
@@ -307,20 +308,88 @@ class OWScatterPlotGraph(OWScatterPlotBase):
         for val in range(c_data.max() + 1):
             mask = c_data == val
             if mask.sum() > 1:
-                self._add_line(x[mask], y[mask], self.palette[val].darker(135))
-        self.update_reg_line_label_colors()
+                add(x[mask], y[mask], self.palette[val].darker(135))
+
+    def _add_ellipse(self, x: np.ndarray, y: np.ndarray, color: QColor) -> np.ndarray:
+        # https://github.com/ChristianGoueguel/HotellingEllipse/blob/master/R/ellipseCoord.R
+        points = np.vstack([x, y]).T
+        mu = np.mean(points, axis=0)
+        cov = np.cov(*(points - mu).T)
+        vals, vects = np.linalg.eig(cov)
+        angle = math.atan2(vects[1, 0], vects[0, 0])
+        matrix = np.array([[np.cos(angle), -np.sin(angle)],
+                           [np.sin(angle), np.cos(angle)]])
+
+        n = len(x)
+        f = ss.f.ppf(0.95, 2, n - 2)
+        f = f * 2 * (n - 1) / (n - 2)
+        m = [np.pi * i / 100 for i in range(201)]
+        cx = np.cos(m) * np.sqrt(vals[0] * f)
+        cy = np.sin(m) * np.sqrt(vals[1] * f)
+
+        pts = np.vstack([cx, cy])
+        pts = matrix.dot(pts)
+        cx = pts[0] + mu[0]
+        cy = pts[1] + mu[1]
+
+        width = self.parameter_setter.reg_line_settings[Updater.WIDTH_LABEL]
+        alpha = self.parameter_setter.reg_line_settings[Updater.ALPHA_LABEL]
+        style = self.parameter_setter.reg_line_settings[Updater.STYLE_LABEL]
+        style = Updater.LINE_STYLES[style]
+        color.setAlpha(alpha)
+
+        pen = pg.mkPen(color=color, width=width, style=style)
+        ellipse = pg.PlotCurveItem(cx, cy, pen=pen)
+        self.plot_widget.addItem(ellipse)
+        self.ellipse_items.append(ellipse)
+
+    def update_jittering(self):
+        super().update_jittering()
+        self.update_error_bars()
+
+    def update_error_bars(self):
+        for item in self.error_bars_items:
+            self.plot_widget.removeItem(item)
+        self.error_bars_items.clear()
+        if not self.master.can_draw_regression_line():
+            return
+
+        x, y = self.get_coordinates()
+        if x is None:
+            return
+
+        top, bottom, left, right = self.master.get_errors_data()
+        if top is None and bottom is None and left is None and right is None:
+            return
+
+        px, py = self.view_box.viewPixelSize()
+        pen = pg.mkPen(color=QColor("#505050"))
+
+        # x axis
+        error_bars = pg.ErrorBarItem(x=x, y=y, left=left, right=right,
+                                     beam=py * 10, pen=pen)
+        error_bars.setZValue(-1)
+        self.plot_widget.addItem(error_bars)
+        self.error_bars_items.append(error_bars)
+
+        # y axis
+        error_bars = pg.ErrorBarItem(x=x, y=y, top=top, bottom=bottom,
+                                     beam=px * 10, pen=pen)
+        error_bars.setZValue(-1)
+        self.plot_widget.addItem(error_bars)
+        self.error_bars_items.append(error_bars)
 
 
-class OWScatterPlot(OWDataProjectionWidget):
+class OWScatterPlot(OWDataProjectionWidget, VizRankMixin(ScatterPlotVizRank)):
     """Scatterplot visualization with explorative analysis and intelligent
     data visualization enhancements."""
 
-    name = 'Scatter Plot'
+    name = "Scatter Plot"
     description = "Interactive scatter plot visualization with " \
                   "intelligent data visualization enhancements."
     icon = "icons/ScatterPlot.svg"
     priority = 140
-    keywords = []
+    keywords = "scatter plot"
 
     class Inputs(OWDataProjectionWidget.Inputs):
         features = Input("Features", AttributeList)
@@ -332,13 +401,17 @@ class OWScatterPlot(OWDataProjectionWidget):
     auto_sample = Setting(True)
     attr_x = ContextSetting(None)
     attr_y = ContextSetting(None)
+    attr_x_upper = ContextSetting(None)
+    attr_x_lower = ContextSetting(None)
+    attr_x_is_abs = Setting(False)
+    attr_y_upper = ContextSetting(None)
+    attr_y_lower = ContextSetting(None)
+    attr_y_is_abs = Setting(False)
     tooltip_shows_all = Setting(True)
 
     GRAPH_CLASS = OWScatterPlotGraph
     graph = SettingProvider(OWScatterPlotGraph)
     embedding_variables_names = None
-
-    xy_changed_manually = Signal(Variable, Variable)
 
     class Warning(OWDataProjectionWidget.Warning):
         missing_coords = Msg(
@@ -355,9 +428,12 @@ class OWScatterPlot(OWDataProjectionWidget):
         self.xy_model: DomainModel = None
         self.cb_attr_x: ComboBoxSearch = None
         self.cb_attr_y: ComboBoxSearch = None
-        self.vizrank: ScatterPlotVizRank = None
-        self.vizrank_button: QPushButton = None
+        self.button_attr_x: QPushButton = None
+        self.button_attr_y: QPushButton = None
+        self.__x_axis_dlg: ErrorBarsDialog = None
+        self.__y_axis_dlg: ErrorBarsDialog = None
         self.sampling: QGroupBox = None
+        self._xy_invalidated: bool = True
 
         self.sql_data = None  # Orange.data.sql.table.SqlTable
         self.attribute_selection_list = None  # list of Orange.data.Variable
@@ -389,6 +465,12 @@ class OWScatterPlot(OWDataProjectionWidget):
             "If checked, fit line to group (minimize distance from points);\n"
             "otherwise fit y as a function of x (minimize vertical distances)",
             disabledBy=self.cb_reg_line)
+        gui.checkBox(
+            self._plot_box, self,
+            value="graph.show_ellipse",
+            label="Show confidence ellipse",
+            tooltip="Hotelling's T² confidence ellipse (α=95%)",
+            callback=self.graph.update_ellipse)
 
     def _add_controls_axis(self):
         common_options = dict(
@@ -399,19 +481,70 @@ class OWScatterPlot(OWDataProjectionWidget):
                                  spacing=2 if gui.is_macstyle() else 8)
         dmod = DomainModel
         self.xy_model = DomainModel(dmod.MIXED, valid_types=dmod.PRIMITIVE)
+
+        hor_icon, ver_icon = self.__get_bar_icons()
+        width = 3 * QFontMetrics(self.font()).horizontalAdvance("m")
+        hbox = gui.hBox(self.attr_box, spacing=0)
         self.cb_attr_x = gui.comboBox(
-            self.attr_box, self, "attr_x", label="Axis x:",
+            hbox, self, "attr_x", label="Axis x:",
             callback=self.set_attr_from_combo,
             model=self.xy_model, **common_options,
         )
+        self.button_attr_x = gui.button(
+            hbox, self, "", callback=self.__on_x_button_clicked,
+            autoDefault=False, width=width, enabled=False,
+            sizePolicy=(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        )
+        self.button_attr_x.setIcon(hor_icon)
+
+        hbox = gui.hBox(self.attr_box, spacing=0)
         self.cb_attr_y = gui.comboBox(
-            self.attr_box, self, "attr_y", label="Axis y:",
+            hbox, self, "attr_y", label="Axis y:",
             callback=self.set_attr_from_combo,
             model=self.xy_model, **common_options,
         )
+        self.button_attr_y = gui.button(
+            hbox, self, "", callback=self.__on_y_button_clicked,
+            autoDefault=False, width=width, enabled=False,
+            sizePolicy=(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        )
+        self.button_attr_y.setIcon(ver_icon)
+
         vizrank_box = gui.hBox(self.attr_box)
-        self.vizrank, self.vizrank_button = ScatterPlotVizRank.add_vizrank(
-            vizrank_box, self, "Find Informative Projections", self.set_attr)
+        button = self.vizrank_button("Find Informative Projections")
+        vizrank_box.layout().addWidget(button)
+        self.vizrankSelectionChanged.connect(self.set_attr)
+
+        self.__x_axis_dlg = ErrorBarsDialog(self)
+        self.__x_axis_dlg.changed.connect(self.__on_x_dlg_changed)
+        self.__y_axis_dlg = ErrorBarsDialog(self)
+        self.__y_axis_dlg.changed.connect(self.__on_y_dlg_changed)
+
+    def __on_x_button_clicked(self):
+        self.__show_bars_dlg(
+            self.__x_axis_dlg, self.button_attr_x,
+            self.attr_x_upper, self.attr_x_lower, self.attr_x_is_abs)
+
+    def __on_y_button_clicked(self):
+        self.__show_bars_dlg(
+            self.__y_axis_dlg, self.button_attr_y,
+            self.attr_y_upper, self.attr_y_lower, self.attr_y_is_abs)
+
+    def __show_bars_dlg(self, dlg, button, upper, lower, is_abs):
+        pos = button.mapToGlobal(button.rect().bottomLeft())
+        dlg.show_dlg(self.data.domain,
+                     pos.x(), pos.y(),
+                     upper, lower, is_abs)
+
+    def __on_x_dlg_changed(self):
+        self.attr_x_upper, self.attr_x_lower, self.attr_x_is_abs = \
+            self.__x_axis_dlg.get_data()
+        self.graph.update_error_bars()
+
+    def __on_y_dlg_changed(self):
+        self.attr_y_upper, self.attr_y_lower, self.attr_y_is_abs = \
+            self.__y_axis_dlg.get_data()
+        self.graph.update_error_bars()
 
     def _add_controls_sampling(self):
         self.sampling = gui.auto_commit(
@@ -420,18 +553,24 @@ class OWScatterPlot(OWDataProjectionWidget):
         self.sampling.setVisible(False)
 
     @property
-    def effective_variables(self):
-        return [self.attr_x, self.attr_y] if self.attr_x and self.attr_y else []
+    def effective_variables(self) -> list[Variable]:
+        variables = []
+        if self.attr_x and self.attr_y:
+            variables.append(self.attr_x)
+            if self.attr_x.name != self.attr_y.name:
+                variables.append(self.attr_y)
+        for var in (self.attr_x_upper, self.attr_x_lower,
+                    self.attr_y_upper, self.attr_y_lower):
+            # set is not used to preserve order
+            if var and var not in variables:
+                variables.append(var)
+        return variables
 
     @property
     def effective_data(self):
-        eff_var = self.effective_variables
-        if eff_var and self.attr_x.name == self.attr_y.name:
-            eff_var = [self.attr_x]
-        return self.data.transform(Domain(eff_var))
+        return self.data.transform(Domain(self.effective_variables))
 
-    def _vizrank_color_change(self):
-        self.vizrank.initialize()
+    def init_vizrank(self):
         err_msg = ""
         if self.data is None:
             err_msg = "No data on input"
@@ -441,15 +580,17 @@ class OWScatterPlot(OWDataProjectionWidget):
             err_msg = "Not enough features for ranking"
         elif self.attr_color is None:
             err_msg = "Color variable is not selected"
-        elif np.isnan(self.data.get_column_view(
-                self.attr_color)[0].astype(float)).all():
+        elif np.isnan(self.data.get_column(self.attr_color)).all():
             err_msg = "Color variable has no values"
-        self.vizrank_button.setEnabled(not err_msg)
-        self.vizrank_button.setToolTip(err_msg)
+        if not err_msg:
+            super().init_vizrank(self.data, list(self.xy_model), self.attr_color)
+        else:
+            self.disable_vizrank(err_msg)
 
+    @OWDataProjectionWidget.Inputs.data
     def set_data(self, data):
         super().set_data(data)
-        self._vizrank_color_change()
+        self.init_vizrank()
 
         def findvar(name, iterable):
             """Find a Orange.data.Variable in `iterable` by name"""
@@ -495,6 +636,14 @@ class OWScatterPlot(OWDataProjectionWidget):
                                       len(self.data.domain.variables) == 0):
             self.data = None
 
+    def enable_controls(self):
+        super().enable_controls()
+        enabled = bool(self.data) and \
+            self.data.domain.has_continuous_attributes(include_class=True,
+                                                       include_metas=True)
+        self.button_attr_x.setEnabled(enabled)
+        self.button_attr_y.setEnabled(enabled)
+
     def get_embedding(self):
         self.valid_data = None
         if self.data is None:
@@ -513,6 +662,31 @@ class OWScatterPlot(OWDataProjectionWidget):
             msg.missing_coords(self.attr_x.name, self.attr_y.name)
         return np.vstack((x_data, y_data)).T
 
+    def get_errors_data(self) -> tuple[
+        Optional[np.ndarray], Optional[np.ndarray],
+        Optional[np.ndarray], Optional[np.ndarray]
+    ]:
+        x_data = self.get_column(self.attr_x)
+        y_data = self.get_column(self.attr_y)
+        top, bottom, left, right = [None] * 4
+        if self.attr_x_upper:
+            right = self.get_column(self.attr_x_upper)
+            if self.attr_x_is_abs:
+                right = right - x_data
+        if self.attr_x_lower:
+            left = self.get_column(self.attr_x_lower)
+            if self.attr_x_is_abs:
+                left = x_data - left
+        if self.attr_y_upper:
+            top = self.get_column(self.attr_y_upper)
+            if self.attr_y_is_abs:
+                top = top - y_data
+        if self.attr_y_lower:
+            bottom = self.get_column(self.attr_y_lower)
+            if self.attr_y_is_abs:
+                bottom = y_data - bottom
+        return top, bottom, left, right
+
     # Tooltip
     def _point_tooltip(self, point_id, skip_attrs=()):
         point_data = self.data[point_id]
@@ -526,9 +700,10 @@ class OWScatterPlot(OWDataProjectionWidget):
                 text = "<b>{}</b><br/><br/>{}".format(text, others)
         return text
 
-    def can_draw_regresssion_line(self):
+    def can_draw_regression_line(self):
         return self.data is not None and \
                self.data.domain is not None and \
+               self.attr_x is not None and self.attr_y is not None and \
                self.attr_x.is_continuous and \
                self.attr_y.is_continuous
 
@@ -551,6 +726,8 @@ class OWScatterPlot(OWDataProjectionWidget):
         self.attr_x = self.xy_model[0] if self.xy_model else None
         self.attr_y = self.xy_model[1] if len(self.xy_model) >= 2 \
             else self.attr_x
+        self.attr_x_upper, self.attr_x_lower = None, None
+        self.attr_y_upper, self.attr_y_lower = None, None
 
     def switch_sampling(self):
         self.__timer.stop()
@@ -558,54 +735,69 @@ class OWScatterPlot(OWDataProjectionWidget):
             self.add_data()
             self.__timer.start()
 
-    def set_subset_data(self, subset_data):
+    @OWDataProjectionWidget.Inputs.data_subset
+    def set_subset_data(self, subset: Optional[Table]):
         self.warning()
-        if isinstance(subset_data, SqlTable):
-            if subset_data.approx_len() < AUTO_DL_LIMIT:
-                subset_data = Table(subset_data)
+        if isinstance(subset, SqlTable):
+            if subset.approx_len() < AUTO_DL_LIMIT:
+                subset = Table(subset)
             else:
                 self.warning("Data subset does not support large Sql tables")
-                subset_data = None
-        super().set_subset_data(subset_data)
+                subset = None
+        super().set_subset_data(subset)
 
     # called when all signals are received, so the graph is updated only once
     def handleNewSignals(self):
         self.attr_box.setEnabled(True)
-        self.vizrank.setEnabled(True)
         if self.attribute_selection_list and self.data is not None and \
-                self.data.domain is not None and \
-                all(attr in self.data.domain for attr
-                        in self.attribute_selection_list):
-            self.attr_x, self.attr_y = self.attribute_selection_list[:2]
+                self.data.domain is not None:
             self.attr_box.setEnabled(False)
-            self.vizrank.setEnabled(False)
+            if all(attr in self.xy_model for attr in self.attribute_selection_list):
+                self.attr_x, self.attr_y = self.attribute_selection_list
+            else:
+                self.attr_x, self.attr_y = None, None
+            self.attr_x_upper, self.attr_x_lower = None, None
+            self.attr_y_upper, self.attr_y_lower = None, None
+        self._invalidated = self._invalidated or self._xy_invalidated
+        self._xy_invalidated = False
         super().handleNewSignals()
         if self._domain_invalidated:
             self.graph.update_axes()
+            self.graph.update_error_bars()
             self._domain_invalidated = False
-        self.cb_reg_line.setEnabled(self.can_draw_regresssion_line())
+        if self.attribute_selection_list:
+            self.graph.update_error_bars()
+        can_plot = self.can_draw_regression_line()
+        self.cb_reg_line.setEnabled(can_plot)
+        self.graph.controls.show_ellipse.setEnabled(can_plot)
 
     @Inputs.features
     def set_shown_attributes(self, attributes):
         if attributes and len(attributes) >= 2:
             self.attribute_selection_list = attributes[:2]
-            self._invalidated = self._invalidated \
+            self._xy_invalidated = self._xy_invalidated \
                 or self.attr_x != attributes[0] \
                 or self.attr_y != attributes[1]
         else:
+            if self.attr_x is None or self.attr_y is None:
+                # scenario happens when features input removed and features
+                # were invalid or hidden and those attr_x and attr_h were None
+                self.init_attr_values()
             self.attribute_selection_list = None
 
-    def set_attr(self, attr_x, attr_y):
-        if attr_x != self.attr_x or attr_y != self.attr_y:
-            self.attr_x, self.attr_y = attr_x, attr_y
+    def set_attr(self, attrs):
+        if attrs != [self.attr_x,self.attr_y]:
+            self.attr_x, self.attr_y = attrs
             self.attr_changed()
 
     def set_attr_from_combo(self):
         self.attr_changed()
-        self.xy_changed_manually.emit(self.attr_x, self.attr_y)
+        self.vizrankAutoSelect.emit([self.attr_x, self.attr_y])
 
     def attr_changed(self):
-        self.cb_reg_line.setEnabled(self.can_draw_regresssion_line())
+        can_plot = self.can_draw_regression_line()
+        self.cb_reg_line.setEnabled(can_plot)
+        self.graph.controls.show_ellipse.setEnabled(can_plot)
         self.setup_plot()
         self.commit.deferred()
 
@@ -614,7 +806,7 @@ class OWScatterPlot(OWDataProjectionWidget):
 
     def colors_changed(self):
         super().colors_changed()
-        self._vizrank_color_change()
+        self.init_vizrank()
 
     @gui.deferred
     def commit(self):
@@ -666,6 +858,18 @@ class OWScatterPlot(OWDataProjectionWidget):
         if version < 4:
             if values["attr_x"][1] % 100 == 1 or values["attr_y"][1] % 100 == 1:
                 raise IncompatibleContext()
+
+    __HorizontalBarIcon = None
+    __VerticalBarIcon = None
+
+    @classmethod
+    def __get_bar_icons(cls):
+        if cls.__HorizontalBarIcon is None:
+            cls.__HorizontalBarIcon = load_styled_icon(
+                "Orange.widgets.visualize", "icons/interval-horizontal.svg")
+            cls.__VerticalBarIcon = load_styled_icon(
+                "Orange.widgets.visualize", "icons/interval-vertical.svg")
+        return cls.__HorizontalBarIcon, cls.__VerticalBarIcon
 
 
 if __name__ == "__main__":  # pragma: no cover

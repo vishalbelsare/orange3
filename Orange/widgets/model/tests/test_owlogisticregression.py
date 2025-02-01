@@ -48,7 +48,7 @@ class TestOWLogisticRegression(WidgetTest, WidgetLearnerTestMixin):
 
         self.parameters = [
             ParameterMapping('penalty', self.widget.penalty_combo,
-                             self.widget.penalty_types_short),
+                             self.widget.penalty_types_short[:2]),
             ParameterMapping('C', c_slider,
                              values=[self.widget.C_s[0], self.widget.C_s[-1]],
                              getter=lambda: self.widget.C_s[c_slider.value()],
@@ -57,8 +57,8 @@ class TestOWLogisticRegression(WidgetTest, WidgetLearnerTestMixin):
     def test_output_coefficients(self):
         """Check if coefficients are on output after apply"""
         self.assertIsNone(self.get_output(self.widget.Outputs.coefficients))
-        self.send_signal("Data", self.data)
-        self.widget.apply_button.button.click()
+        self.send_signal(self.widget.Inputs.data, self.data)
+        self.click_apply()
         self.assertIsInstance(self.get_output(self.widget.Outputs.coefficients), Table)
 
     def test_domain_with_more_values_than_table(self):
@@ -73,8 +73,8 @@ class TestOWLogisticRegression(WidgetTest, WidgetLearnerTestMixin):
                             np.arange(120, 140, dtype=int)))]
         for case in cases:
             data = table[case, :]
-            self.send_signal("Data", data)
-            self.widget.apply_button.button.click()
+            self.send_signal(self.widget.Inputs.data, data)
+            self.click_apply()
 
     def test_coefficients_one_value(self):
         """
@@ -93,8 +93,8 @@ class TestOWLogisticRegression(WidgetTest, WidgetLearnerTestMixin):
                 [0., 1.],
                 ["yes", "no"]))
         )
-        self.send_signal("Data", table)
-        self.widget.apply_button.button.click()
+        self.send_signal(self.widget.Inputs.data, table)
+        self.click_apply()
         coef = self.get_output(self.widget.Outputs.coefficients)
         self.assertEqual(coef.domain[0].name, "no")
         self.assertGreater(coef[2][0], 0.)
@@ -107,19 +107,35 @@ class TestOWLogisticRegression(WidgetTest, WidgetLearnerTestMixin):
         table = Table("iris")
         with table.unlocked():
             table.Y[:5] = np.NaN
-        self.send_signal("Data", table)
-        coef1 = self.get_output("Coefficients")
+        self.send_signal(self.widget.Inputs.data, table)
+        coef1 = self.get_output(self.widget.Outputs.coefficients)
         table = table[5:]
-        self.send_signal("Data", table)
-        coef2 = self.get_output("Coefficients")
+        self.send_signal(self.widget.Inputs.data, table)
+        coef2 = self.get_output(self.widget.Outputs.coefficients)
         self.assertTrue(np.array_equal(coef1, coef2))
 
     def test_class_weights(self):
         table = Table("iris")
-        self.send_signal("Data", table)
+        self.send_signal(self.widget.Inputs.data, table)
         self.assertFalse(self.widget.class_weight)
         self.widget.controls.class_weight.setChecked(True)
         self.assertTrue(self.widget.class_weight)
-        self.widget.apply_button.button.click()
+        self.click_apply()
         self.assertEqual(self.widget.model.skl_model.class_weight, "balanced")
         self.assertTrue(self.widget.Warning.class_weights_used.is_shown())
+
+    def test_no_penalty(self):
+        self.widget.set_penalty(None)
+        self.click_apply()
+        lr = self.get_output(self.widget.Outputs.learner)
+        self.assertEqual(lr.penalty, None)
+        self.assertEqual(lr.C, 1.0)
+        self.assertEqual(self.widget.c_label.text(), "N/A")
+        self.assertFalse(self.widget.c_slider.isEnabledTo(self.widget))
+
+        self.widget.set_penalty("l2")
+        self.click_apply()
+        lr = self.get_output(self.widget.Outputs.learner)
+        self.assertEqual(lr.penalty, "l2")
+        self.assertEqual(self.widget.c_label.text(), "C=1")
+        self.assertTrue(self.widget.c_slider.isEnabledTo(self.widget))

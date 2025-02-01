@@ -1,10 +1,12 @@
 import unittest
 
 import numpy as np
+import scipy.sparse as sp
 
 from Orange.data import DiscreteVariable
 from Orange.preprocess.transformation import \
-    Transformation, _Indicator, Normalizer, Lookup
+    Transformation, _Indicator, Normalizer, Lookup, Indicator, Indicator1, \
+    MappingTransform
 
 
 class TestTransformEquality(unittest.TestCase):
@@ -82,6 +84,73 @@ class TestTransformEquality(unittest.TestCase):
         t1a = Lookup(self.disc1a, np.array([0, 2, 1]), 2)
         self.assertNotEqual(t1, t1a)
         self.assertNotEqual(hash(t1), hash(t1a))
+
+    def test_mapping(self):
+        def test_equal(a, b):
+            self.assertEqual(a, b)
+            self.assertEqual(hash(a), hash(b))
+
+        t1 = MappingTransform(self.disc1, {"a": "1", "b": "2", "c":"3"})
+        t1a = MappingTransform(self.disc1a, {"a": "1", "b": "2", "c":"3"})
+        t2 = MappingTransform(self.disc2, {"a": "1", "b": "2", "c":"3"},
+                              unknown="")
+        test_equal(t1, t1a)
+        self.assertNotEqual(t1, t2)
+
+        t1 = MappingTransform(self.disc1, {"a": 1, "b": 2, "c": float("nan")},
+                              unknown=float("nan"))
+        t1_ = MappingTransform(self.disc1, {"a": 1, "b": 2, "c": float("nan")},
+                               unknown=float("nan"))
+        test_equal(t1, t1_)
+        t1_ = MappingTransform(self.disc1, {"a": 1, "b": float("nan"), "c": 2},
+                               unknown=float("nan"))
+        self.assertNotEqual(t1, t1_)
+
+        t1_ = MappingTransform(self.disc1, {}, unknown=float("nan"))
+        self.assertNotEqual(t1, t1_)
+        t1_ = MappingTransform(self.disc1, {"f": 4, "k": 2, "j": 10},
+                               unknown=float("nan"))
+        self.assertNotEqual(t1, t1_)
+
+        with self.assertRaises(ValueError):
+            MappingTransform(self.disc1, {float("nan"): 1})
+
+
+class TestIndicator(unittest.TestCase):
+    def test_nan(self):
+        var = DiscreteVariable("d", tuple("abcde"))
+
+        col = np.array([1.0, 4, 2, np.nan, 2, 0])
+
+        transform = Indicator(var, 2).transform
+        expected = [0, 0, 1, np.nan, 1, 0]
+        np.testing.assert_equal(transform(col), expected)
+        sparse = transform(sp.csr_matrix(col))
+        self.assertTrue(sp.issparse(sparse))
+        np.testing.assert_equal(sparse.toarray().ravel(), expected)
+        self.assertEqual(transform(1), 0)
+        self.assertEqual(transform(2), 1)
+        self.assertTrue(np.isnan(transform(np.nan)))
+
+        transform = Indicator(var, 0).transform
+        expected = [0, 0, 0, np.nan, 0, 1]
+        np.testing.assert_equal(transform(col), expected)
+        sparse = transform(sp.csr_matrix(col))
+        # Currently, this always returns dense array
+        assert not sp.issparse(sparse)
+        np.testing.assert_equal(sparse, expected)
+        self.assertEqual(transform(1), 0)
+        self.assertEqual(transform(0), 1)
+        self.assertTrue(np.isnan(transform(np.nan)))
+
+        transform = Indicator1(var, 2).transform
+        expected = [-1, -1, 1, np.nan, 1, -1]
+        np.testing.assert_equal(transform(col), expected)
+        np.testing.assert_equal(transform(sp.csr_matrix(col).toarray().ravel()),
+                                expected)
+        self.assertEqual(transform(1), -1)
+        self.assertEqual(transform(2), 1)
+        self.assertTrue(np.isnan(transform(np.nan)))
 
 
 if __name__ == '__main__':

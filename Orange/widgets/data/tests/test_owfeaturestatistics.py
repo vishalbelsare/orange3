@@ -288,6 +288,15 @@ class TestVariousDataSets(WidgetTest):
             except Exception as e:
                 raise AssertionError(f"Failed on `{data.name}`") from e
 
+    def test_header_resize_aspect_ratio(self):
+        self.widget.show()  # must be visible for header resize to work
+        size = self.widget.size()
+        self.widget.resize(size.width() + 2000, size.height())
+        self.assertEqual(
+            self.widget.table_view.verticalHeader().defaultSectionSize(),
+            self.widget.table_view.MAXIMUM_HISTOGRAM_HEIGHT
+        )
+
 
 def select_rows(rows: List[int], widget: OWFeatureStatistics):
     """Since the widget sorts the rows, selecting rows isn't trivial."""
@@ -316,7 +325,7 @@ class TestFeatureStatisticsOutputs(WidgetTest):
         self.send_signal(self.widget.Inputs.data, self.data)
         self.select_rows = partial(select_rows, widget=self.widget)
 
-    def test_changing_data_updates_ouput(self):
+    def test_changing_data_updates_output(self):
         # Test behaviour of widget when auto commit is OFF
         self.widget.auto_commit = False
 
@@ -325,33 +334,18 @@ class TestFeatureStatisticsOutputs(WidgetTest):
         self.select_rows([0])
         # By default, nothing should be sent since auto commit is off
         self.assertIsNone(self.get_output(self.widget.Outputs.reduced_data))
-        self.assertIsNone(self.get_output(self.widget.Outputs.statistics))
         # When we commit, the data should be on the output
-        self.widget.unconditional_commit()
+        self.widget.commit.now()
         self.assertIsNotNone(self.get_output(self.widget.Outputs.reduced_data))
-        self.assertIsNotNone(self.get_output(self.widget.Outputs.statistics))
 
         # Send some new data
         iris = Table('iris')
         self.send_signal(self.widget.Inputs.data, iris)
         # By default, there should be nothing on the output
         self.assertIsNone(self.get_output(self.widget.Outputs.reduced_data))
-        self.assertIsNone(self.get_output(self.widget.Outputs.statistics))
         # Nothing should change after commit, since we haven't selected any rows
-        self.widget.unconditional_commit()
+        self.widget.commit.now()
         self.assertIsNone(self.get_output(self.widget.Outputs.reduced_data))
-        self.assertIsNone(self.get_output(self.widget.Outputs.statistics))
-
-        # Now let's switch back to the original data, where we selected row 0
-        self.send_signal(self.widget.Inputs.data, self.data)
-        # Again, since auto commit is off, nothing should be on the output
-        self.assertIsNone(self.get_output(self.widget.Outputs.reduced_data))
-        self.assertIsNone(self.get_output(self.widget.Outputs.statistics))
-        # Since the row selection is saved into context settings, the appropriate
-        # thing should be sent to output
-        self.widget.unconditional_commit()
-        self.assertIsNotNone(self.get_output(self.widget.Outputs.reduced_data))
-        self.assertIsNotNone(self.get_output(self.widget.Outputs.statistics))
 
     def test_changing_data_updates_output_with_autocommit(self):
         # Test behaviour of widget when auto commit is ON
@@ -362,25 +356,22 @@ class TestFeatureStatisticsOutputs(WidgetTest):
         self.select_rows([0])
         # Selecting rows should send data to output
         self.assertIsNotNone(self.get_output(self.widget.Outputs.reduced_data))
-        self.assertIsNotNone(self.get_output(self.widget.Outputs.statistics))
 
         # Send some new data
         iris = Table('iris')
         self.send_signal(self.widget.Inputs.data, iris)
         # Don't select anything, so the outputs should be empty
         self.assertIsNone(self.get_output(self.widget.Outputs.reduced_data))
-        self.assertIsNone(self.get_output(self.widget.Outputs.statistics))
 
         # Now let's switch back to the original data, where we had selected row 0,
         # we expect that to be sent to output
         self.send_signal(self.widget.Inputs.data, self.data)
         self.assertIsNotNone(self.get_output(self.widget.Outputs.reduced_data))
-        self.assertIsNotNone(self.get_output(self.widget.Outputs.statistics))
 
     def test_sends_single_attribute_table_to_output(self):
         # Check if selecting a single attribute row
         self.select_rows([0])
-        self.widget.unconditional_commit()
+        self.widget.commit.now()
 
         desired_domain = Domain(attributes=[continuous_full.variable])
         output = self.get_output(self.widget.Outputs.reduced_data)
@@ -389,7 +380,7 @@ class TestFeatureStatisticsOutputs(WidgetTest):
     def test_sends_multiple_attribute_table_to_output(self):
         # Check if selecting a single attribute row
         self.select_rows([0, 1])
-        self.widget.unconditional_commit()
+        self.widget.commit.now()
 
         desired_domain = Domain(attributes=[
             continuous_full.variable, continuous_missing.variable,
@@ -399,7 +390,7 @@ class TestFeatureStatisticsOutputs(WidgetTest):
 
     def test_sends_single_class_var_table_to_output(self):
         self.select_rows([2])
-        self.widget.unconditional_commit()
+        self.widget.commit.now()
 
         desired_domain = Domain(attributes=[], class_vars=[rgb_full.variable])
         output = self.get_output(self.widget.Outputs.reduced_data)
@@ -407,7 +398,7 @@ class TestFeatureStatisticsOutputs(WidgetTest):
 
     def test_sends_single_meta_table_to_output(self):
         self.select_rows([4])
-        self.widget.unconditional_commit()
+        self.widget.commit.now()
 
         desired_domain = Domain(attributes=[], metas=[ints_full.variable])
         output = self.get_output(self.widget.Outputs.reduced_data)
@@ -415,7 +406,7 @@ class TestFeatureStatisticsOutputs(WidgetTest):
 
     def test_sends_multiple_var_types_table_to_output(self):
         self.select_rows([0, 2, 4])
-        self.widget.unconditional_commit()
+        self.widget.commit.now()
 
         desired_domain = Domain(
             attributes=[continuous_full.variable],
@@ -428,7 +419,7 @@ class TestFeatureStatisticsOutputs(WidgetTest):
     def test_sends_all_samples_to_output(self):
         """All rows should be sent to output for selected column."""
         self.select_rows([0, 2])
-        self.widget.unconditional_commit()
+        self.widget.commit.now()
 
         selected_vars = Domain(
             attributes=[continuous_full.variable],
@@ -442,14 +433,84 @@ class TestFeatureStatisticsOutputs(WidgetTest):
     def test_clearing_selection_sends_none_to_output(self):
         """Clearing all the selected rows should send `None` to output."""
         self.select_rows([0])
-        self.widget.unconditional_commit()
+        self.widget.commit.now()
         self.assertIsNotNone(self.get_output(self.widget.Outputs.reduced_data))
-        self.assertIsNotNone(self.get_output(self.widget.Outputs.statistics))
 
         self.widget.table_view.clearSelection()
-        self.widget.unconditional_commit()
+        self.widget.commit.now()
         self.assertIsNone(self.get_output(self.widget.Outputs.reduced_data))
-        self.assertIsNone(self.get_output(self.widget.Outputs.statistics))
+
+    def test_output_statistics(self):
+        self.widget.auto_commit = True
+
+        data = make_table([continuous_full, continuous_missing,
+                           rgb_full, rgb_missing])
+        self.send_signal(self.widget.Inputs.data, data)
+        output = self.get_output(self.widget.Outputs.statistics)
+        np.testing.assert_almost_equal(
+            output.X,
+            [[2, 2, 0.7071068, 0, 4, 0],
+             [1.75, 1.5, 0.8451543, 0, 4, 1],
+             [np.nan, np.nan, 0.9502705, np.nan, np.nan, 0],
+             [np.nan, np.nan, 1.0397208, np.nan, np.nan, 1]],
+        )
+        np.testing.assert_equal(
+            output.metas,
+            [["continuous_full", "0"],
+             ["continuous_missing", "0"],
+             ["rgb_full", "g"],
+             ["rgb_missing", "g"]])
+
+        data = make_table([continuous_full, continuous_missing])
+        self.send_signal(self.widget.Inputs.data, data)
+        output = self.get_output(self.widget.Outputs.statistics)
+        np.testing.assert_almost_equal(
+            output.X,
+            [[2, 2, 0.7071068, 0, 4, 0],
+             [1.75, 1.5, 0.8451543, 0, 4, 1]]
+        )
+        np.testing.assert_equal(
+            output.metas,
+            [["continuous_full", "0"],
+             ["continuous_missing", "0"]])
+
+        data = make_table([rgb_full, rgb_missing])
+        self.send_signal(self.widget.Inputs.data, data)
+        output = self.get_output(self.widget.Outputs.statistics)
+        np.testing.assert_almost_equal(
+            output.X,
+            [[0.9502705, 0],
+             [1.0397208, 1]],
+        )
+        np.testing.assert_equal(
+            output.metas,
+            [["rgb_full", "g"],
+             ["rgb_missing", "g"]])
+
+        self.send_signal(self.widget.Inputs.data, None)
+        output = self.get_output(self.widget.Outputs.statistics)
+        self.assertIsNone(output)
+
+    def test_output_combinations(self):
+        # No selection -> reduced_data is not output, statistics is present
+        self.widget.commit.now()
+        self.assertIsNone(self.get_output(self.widget.Outputs.reduced_data))
+        self.assertEqual(len(self.get_output(self.widget.Outputs.statistics)),
+                         self.widget.model.rowCount())
+
+        # Has selection -> all outputs present
+        self.select_rows([0, 1])
+        self.widget.commit.now()
+        outp = self.get_output(self.widget.Outputs.reduced_data)
+        self.assertEqual(len(outp), len(self.data))
+        self.assertEqual(len(outp.domain.variables), 2)
+        self.assertEqual(len(self.get_output(self.widget.Outputs.statistics)),
+                         self.widget.model.rowCount())
+
+        # No data -> no output
+        self.send_signal(self.widget.Inputs.data, None)
+        self.assertIsNone(self.get_output(self.widget.Outputs.reduced_data))
+        self.assertIsNone(self.get_output(self.widget.Outputs.reduced_data))
 
 
 class TestFeatureStatisticsUI(WidgetTest):
@@ -510,6 +571,39 @@ class TestFeatureStatisticsUI(WidgetTest):
 
         self.assertIn("<table>", report_text)
         self.assertEqual(6, report_text.count("<tr>"))  # header + 5 rows
+
+    def test_color_legend(self):
+        w = self.widget
+        data = Table("heart_disease")
+        self.send_signal(self.widget.Inputs.data, data)
+
+        self.assertIs(w.color_var, data.domain.class_var)
+        self.assertEqual(len(w.legend_items), 2)
+        self.assertFalse(w.legend_view.isHidden())
+
+        w.cb_color_var.setCurrentIndex(4)  # age (numeric, no legend)
+        w.cb_color_var.activated.emit(4)
+        self.assertEqual(len(w.legend_items), 0)
+        self.assertTrue(w.legend_view.isHidden())
+
+        w.cb_color_var.setCurrentIndex(6)  # chest pain
+        w.cb_color_var.activated.emit(6)
+        self.assertEqual(len(w.legend_items), 4)
+        self.assertFalse(w.legend_view.isHidden())
+
+        w.cb_color_var.setCurrentIndex(0)  # None
+        w.cb_color_var.activated.emit(0)
+        self.assertEqual(len(w.legend_items), 0)
+        self.assertTrue(w.legend_view.isHidden())
+
+        # Show
+        w.cb_color_var.setCurrentIndex(6)  # chest pain
+        w.cb_color_var.activated.emit(6)
+
+        # to check that the legend is hidden when the data is removed
+        self.send_signal(self.widget.Inputs.data, None)
+        self.assertEqual(len(w.legend_items), 0)
+        self.assertTrue(w.legend_view.isHidden())
 
 
 class TestSummary(WidgetTest):

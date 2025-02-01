@@ -31,6 +31,12 @@ class Filter(Reprable):
     def __call__(self, data):
         return
 
+    def __eq__(self, other):
+        return type(self) is type(other) and self.negate == other.negate
+
+    def __hash__(self):
+        return hash(self.negate)
+
 
 class IsDefined(Filter):
     """
@@ -53,7 +59,7 @@ class IsDefined(Filter):
 
     def __init__(self, columns=None, negate=False):
         super().__init__(negate)
-        self.columns = columns
+        self.columns = tuple(columns) if columns is not None else None
 
     def __call__(self, data):
         if isinstance(data, Instance):
@@ -69,6 +75,12 @@ class IsDefined(Filter):
         if self.negate:
             r = np.logical_not(r)
         return data[r]
+
+    def __eq__(self, other):
+        return super().__eq__(other) and self.columns == other.columns
+
+    def __hash__(self):
+        return hash((super().__hash__(), hash(self.columns)))
 
 
 class HasClass(Filter):
@@ -407,7 +419,7 @@ class FilterString(ValueFilter):
 
         The operator; should be `FilterString.Equal`, `NotEqual`, `Less`,
         `LessEqual`, `Greater`, `GreaterEqual`, `Between`, `Outside`,
-        `Contains`, `StartsWith`, `EndsWith` or `IsDefined`.
+        `Contains`, `NotContain`, `StartsWith`, `NotStartsWith`, `EndsWith`, `NotEndsWith`, `IsDefined` or `NotIsDefined`.
 
     .. attribute:: case_sensitive
 
@@ -415,10 +427,10 @@ class FilterString(ValueFilter):
     """
     Type = Enum('FilterString',
                 'Equal, NotEqual, Less, LessEqual, Greater,'
-                'GreaterEqual, Between, Outside, Contains,'
-                'StartsWith, EndsWith, IsDefined')
+                'GreaterEqual, Between, Outside, Contains, NotContain,'
+                'StartsWith, NotStartsWith, EndsWith, NotEndsWith, IsDefined, NotIsDefined')
     (Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual,
-     Between, Outside, Contains, StartsWith, EndsWith, IsDefined) = Type
+     Between, Outside, Contains, NotContain, StartsWith, NotStartsWith, EndsWith, NotEndsWith, IsDefined, NotIsDefined) = Type
 
     def __init__(self, position, oper, ref=None, max=None,
                  case_sensitive=True, **a):
@@ -448,6 +460,8 @@ class FilterString(ValueFilter):
         value = inst[inst.domain.index(self.column)]
         if self.oper == self.IsDefined:
             return not np.isnan(value)
+        if self.oper == self.NotIsDefined:
+            return np.isnan(value)
         if self.case_sensitive:
             value = str(value)
             refval = str(self.ref)
@@ -468,10 +482,16 @@ class FilterString(ValueFilter):
             return value >= refval
         if self.oper == self.Contains:
             return refval in value
+        if self.oper == self.NotContain:
+            return refval not in value
         if self.oper == self.StartsWith:
             return value.startswith(refval)
+        if self.oper == self.NotStartsWith:
+            return not value.startswith(refval)
         if self.oper == self.EndsWith:
             return value.endswith(refval)
+        if self.oper == self.NotEndsWith:
+            return not value.endswith(refval)
         high = self.max if self.case_sensitive else self.max.lower()
         if self.oper == self.Between:
             return refval <= value <= high

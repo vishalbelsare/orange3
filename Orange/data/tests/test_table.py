@@ -1,6 +1,7 @@
 import pickle
 import unittest
 import os
+import warnings
 
 import numpy as np
 import scipy.sparse as sp
@@ -40,7 +41,7 @@ class TestTableInit(unittest.TestCase):
         Y = np.arange(5) % 2
         metas = np.array(list("abcde")).reshape(5, 1)
         W = np.arange(5) / 5
-        ids = np.arange(100, 105, dtype=np.int)
+        ids = np.arange(100, 105, dtype=int)
         attributes = dict(a=5, b="foo")
 
         dom = Domain([ContinuousVariable(x) for x in "abcd"],
@@ -199,6 +200,16 @@ class TestTableInit(unittest.TestCase):
         joined = Table.concatenate((tab1, tab2, tab3), axis=1)
         self.assertEqual(joined.name, "tab2")
 
+    def test_concatenate_check_domain(self):
+        a, b, c, d, e, f = map(ContinuousVariable, "abcdef")
+        tables = (self._new_table((a, b), (c, ), (d, e), 5),
+                 self._new_table((a, b), (c, ), (d, e), 5),
+                 self._new_table((a, b), (f, ), (d, e), 5))
+
+        with self.assertRaises(ValueError):
+            Table.concatenate(tables, axis=0)
+        Table.concatenate(tables, axis=0, ignore_domains=True)
+
     def test_with_column(self):
         a, b, c, d, e, f, g = map(ContinuousVariable, "abcdefg")
         col = np.arange(9, 14)
@@ -251,6 +262,41 @@ class TestTableInit(unittest.TestCase):
         np.testing.assert_equal(
             tabw.metas,
             np.hstack((tab.metas, np.array(list("abcde")).reshape(5, -1))))
+
+    def test_add_column_empty(self):
+        a, b = ContinuousVariable("a"), ContinuousVariable("b")
+        table = Table.from_list(Domain([a]), [])
+
+        new_table = table.add_column(b, [], to_metas=True)
+        self.assertTupleEqual(new_table.domain.attributes, (a,))
+        self.assertTupleEqual(new_table.domain.metas, (b,))
+        self.assertTupleEqual((0, 1), new_table.X.shape)
+        self.assertTupleEqual((0, 1), new_table.metas.shape)
+
+        new_table = table.add_column(ContinuousVariable("b"), [], to_metas=False)
+        self.assertTupleEqual(new_table.domain.attributes, (a, b))
+        self.assertTupleEqual(new_table.domain.metas, ())
+        self.assertTupleEqual((0, 2), new_table.X.shape)
+        self.assertTupleEqual((0, 0), new_table.metas.shape)
+
+    def test_copy(self):
+        domain = Domain([ContinuousVariable("x")],
+                        ContinuousVariable("y"),
+                        [ContinuousVariable("z")])
+        data1 = Table.from_list(domain, [[1, 2, 3]], weights=[4])
+        data1.ids[0]= 5
+        data2 = data1.copy()
+        with data2.unlocked():
+            data2.X += 1
+            data2.Y += 1
+            data2.metas += 1
+            data2.W += 1
+            data2.ids += 1
+        self.assertEqual(data1.X, [[1]])
+        self.assertEqual(data1.Y, [[2]])
+        self.assertEqual(data1.metas, [[3]])
+        self.assertEqual(data1.W, [[4]])
+        self.assertEqual(data1.ids, [[5]])
 
 
 class TestTableLocking(unittest.TestCase):
@@ -380,10 +426,20 @@ class TestTableLocking(unittest.TestCase):
             Table.LOCKING = default
 
         unpickled = pickle.loads(pickle.dumps(table))
-        self.assertFalse(unpickled.is_view())
-        self.assertTrue(unpickled.is_copy())
+        self.assertTrue(all(ar.base is None
+                            for ar in (unpickled.X, unpickled.Y, unpickled.W, unpickled.metas)))
         with unpickled.unlocked():
             unpickled.X[0, 0] = 42
+
+    @staticmethod
+    def test_unlock_table_derived():
+        # pylint: disable=abstract-method
+        class ExtendedTable(Table):
+            pass
+
+        t = ExtendedTable.from_file("iris")
+        with t.unlocked():
+            pass
 
 
 class TestTableFilters(unittest.TestCase):
@@ -495,6 +551,251 @@ class TestTableFilters(unittest.TestCase):
         val_filter = IsDefined(columns=["c3"])
         filtered = val_filter(self.table)
         self.assertEqual(list(filtered.metas[:, -2].flatten()), list("abcdeg"))
+
+
+class TableColumnViewTests(unittest.TestCase):
+    def setUp(self) -> None:
+        y = ContinuousVariable("y")
+        d = DiscreteVariable("d", values=("a", "b"))
+        t = ContinuousVariable("t")
+        m = StringVariable("m")
+        self.data = Table.from_numpy(
+            Domain([y, d], t, [m]),
+            np.array([[1, 2, 3], [0, 0, 1]]).T,
+            np.array([100, 200, 200]),
+            np.array(["abc def ghi".split()]).T
+        )
+        self.y2 = ContinuousVariable(
+            "y2", compute_value=lambda data: 2 * data[:, y].X[:, 0])
+
+
+class TestTableGetColumn(TableColumnViewTests):
+    def test_get_column_proper_view(self):
+        data, y = self.data, self.data.domain["y"]
+
+        col = data.get_column(y)
+        np.testing.assert_equal(col, data.X[:, 0])
+        self.assertIs(col.base, data.X)
+
+        col = data.get_column(y, copy=True)
+        np.testing.assert_equal(col, data.X[:, 0])
+        self.assertIsNone(col.base)
+
+    def test_get_column_computed(self):
+        data, y2 = self.data, self.y2
+
+        col2 = data.get_column(y2)
+        np.testing.assert_equal(col2, [2, 4, 6])
+        self.assertIsNone(col2.base)
+
+        col2 = data.get_column(y2, copy=True)
+        np.testing.assert_equal(col2, [2, 4, 6])
+        self.assertIsNone(col2.base)
+
+    def test_get_column_discrete(self):
+        data, d = self.data, self.data.domain["d"]
+
+        col = data.get_column(d)
+        np.testing.assert_equal(col, [0, 0, 1])
+        self.assertIs(col.base, data.X)
+
+        col = data.get_column(d, copy=True)
+        np.testing.assert_equal(col, [0, 0, 1])
+        self.assertIsNone(col.base)
+
+        e = DiscreteVariable("d", values=("a", "b"))
+        assert e == d
+        col = data.get_column(e)
+        np.testing.assert_equal(col, [0, 0, 1])
+        self.assertIs(col.base, data.X)
+
+        e = DiscreteVariable("d", values=("a", "b", "c"))
+        assert e == d  # because that's how Variable mapping works
+        col = data.get_column(e)
+        np.testing.assert_equal(col, [0, 0, 1])
+
+        e = DiscreteVariable("d", values=("a", "c", "b"))
+        assert e == d  # because that's how Variable mapping works
+        col = data.get_column(e)
+        np.testing.assert_equal(col, [0, 0, 2])
+
+        with data.unlocked(data.X):
+            data.X = sp.csr_matrix(data.X)
+        e = DiscreteVariable("d", values=("a", "c", "b"))
+        assert e == d  # because that's how Variable mapping works
+        col = data.get_column(e)
+        np.testing.assert_equal(col, [0, 0, 2])
+
+
+    def test_sparse(self):
+        data, y = self.data, self.data.domain["y"]
+        with data.unlocked(data.X):
+            orig_y = data.X[:, 0]
+            data.X = sp.csr_matrix(data.X)
+
+        col = data.get_column(y)
+        self.assertFalse(sp.issparse(col))
+        np.testing.assert_equal(col, orig_y)
+
+        col = data.get_column(y, copy=True)
+        self.assertFalse(sp.issparse(col))
+        np.testing.assert_equal(col, orig_y)
+
+    def test_get_column_no_variable(self):
+        self.assertRaises(ValueError, self.data.get_column,
+                          ContinuousVariable("y3"))
+
+    def test_index_by_int(self):
+        data = self.data
+
+        col = data.get_column(0)
+        np.testing.assert_equal(col, data.X[:, 0])
+        self.assertIs(col.base, data.X)
+
+        col = data.get_column(0, copy=True)
+        np.testing.assert_equal(col, data.X[:, 0])
+        self.assertIsNone(col.base)
+
+        col = data.get_column(2)
+        np.testing.assert_equal(col, data.Y)
+        self.assertIs(col, data.Y)
+
+        col = data.get_column(-1)
+        np.testing.assert_equal(col, data.metas[:, 0])
+        self.assertIs(col.base, data.metas)
+
+    def test_index_by_str(self):
+        data = self.data
+
+        col = data.get_column("y")
+        np.testing.assert_equal(col, data.X[:, 0])
+        self.assertIs(col.base, data.X)
+
+        col = data.get_column("y", copy=True)
+        np.testing.assert_equal(col, data.X[:, 0])
+        self.assertIsNone(col.base)
+
+        col = data.get_column("t")
+        np.testing.assert_equal(col, data.Y)
+        self.assertIs(col, data.Y)
+
+        col = data.get_column("m")
+        np.testing.assert_equal(col, data.metas[:, 0])
+        self.assertIs(col.base, data.metas)
+
+
+class TestTableGetColumnView(TableColumnViewTests):
+    def test_get_column_view_by_var(self):
+        data = self.data
+
+        with self.assertWarns(OrangeDeprecationWarning):
+            col, sparse = data.get_column_view(self.data.domain["y"])
+        np.testing.assert_equal(col, data.X[:, 0])
+        self.assertFalse(sparse)
+
+        with self.assertWarns(OrangeDeprecationWarning):
+            col, sparse = data.get_column_view(self.data.domain["t"])
+        np.testing.assert_equal(col, data.Y)
+        self.assertFalse(sparse)
+
+        with self.assertWarns(OrangeDeprecationWarning):
+            col, sparse = data.get_column_view(self.data.domain["m"])
+        np.testing.assert_equal(col, data.metas[:, 0])
+        self.assertFalse(sparse)
+
+        with self.assertWarns(OrangeDeprecationWarning):
+            self.assertRaises(ValueError, data.get_column_view, self.y2)
+
+    def test_get_column_view_by_name(self):
+        data = self.data
+
+        with self.assertWarns(OrangeDeprecationWarning):
+            col, sparse = data.get_column_view("y")
+        np.testing.assert_equal(col, data.X[:, 0])
+        self.assertFalse(sparse)
+
+        with self.assertWarns(OrangeDeprecationWarning):
+            col, sparse = data.get_column_view("t")
+        np.testing.assert_equal(col, data.Y)
+        self.assertFalse(sparse)
+
+        with self.assertWarns(OrangeDeprecationWarning):
+            col, sparse = data.get_column_view("m")
+        np.testing.assert_equal(col, data.metas[:, 0])
+        self.assertFalse(sparse)
+
+        with self.assertWarns(OrangeDeprecationWarning):
+            self.assertRaises(ValueError, data.get_column_view, "y2")
+
+    def test_get_column_view_by_index(self):
+        data = self.data
+
+        with self.assertWarns(OrangeDeprecationWarning):
+            col, sparse = data.get_column_view(0)
+        np.testing.assert_equal(col, data.X[:, 0])
+        self.assertFalse(sparse)
+
+        with self.assertWarns(OrangeDeprecationWarning):
+            col, sparse = data.get_column_view(2)
+        np.testing.assert_equal(col, data.Y)
+        self.assertFalse(sparse)
+
+        with self.assertWarns(OrangeDeprecationWarning):
+            col, sparse = data.get_column_view(-1)
+        np.testing.assert_equal(col, data.metas[:, 0])
+        self.assertFalse(sparse)
+
+        with self.assertWarns(OrangeDeprecationWarning):
+            self.assertRaises(ValueError, data.get_column_view, "y2")
+
+    def test_sparse(self):
+        warnings.simplefilter("ignore", OrangeDeprecationWarning)
+
+        data, y = self.data, self.data.domain["y"]
+        with data.unlocked(data.X):
+            orig_y = data.X[:, 0]
+            data.X = sp.csr_matrix(data.X)
+
+        # self.assertWarns does not work with multiple warnings
+        warnings.filterwarnings("error", ".*dense copy.*")
+        self.assertRaises(UserWarning, data.get_column_view, y)
+
+        warnings.filterwarnings("ignore", ".*dense copy.*")
+        col, sparse = data.get_column_view(y)
+        np.testing.assert_equal(col, orig_y)
+        self.assertTrue(sparse)
+
+    def test_mapped(self):
+        warnings.simplefilter("ignore", OrangeDeprecationWarning)
+        data, d = self.data, self.data.domain["d"]
+
+        e = DiscreteVariable("d", values=("a", "b"))
+        assert e == d
+        col, _ = data.get_column_view(e)
+        np.testing.assert_equal(col, [0, 0, 1])
+
+        e = DiscreteVariable("d", values=("a", "b", "c"))
+        assert e == d  # because that's how Variable mapping works
+        warnings.filterwarnings("error", ".*mapped copy.*")
+        self.assertRaises(UserWarning, data.get_column_view, e)
+
+        warnings.filterwarnings("ignore", ".*mapped copy.*")
+        col, _ = data.get_column_view(e)
+        np.testing.assert_equal(col, [0, 0, 1])
+
+        e = DiscreteVariable("d", values=("a", "c", "b"))
+        assert e == d  # because that's how Variable mapping works
+        col, _ = data.get_column_view(e)
+        np.testing.assert_equal(col, [0, 0, 2])
+
+    def test_meta_is_float(self):
+        data = Table.from_list(
+            Domain([], None, [ContinuousVariable("x"),
+                              DiscreteVariable("y", values=["a", "b"])]),
+            [[0, 0]])
+        self.assertEqual(data.get_column("x").dtype, float)
+        self.assertEqual(data.get_column("y").dtype, float)
+
 
 
 if __name__ == "__main__":

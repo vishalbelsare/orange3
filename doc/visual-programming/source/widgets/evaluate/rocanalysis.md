@@ -37,9 +37,15 @@ The diagonal dotted line represents the behavior of a random classifier. The ful
     computer in a .svg or .png format.
 7. Produce a report.
 
+The widget will output a model with a new operating threshold if
+
+- input results come from testing on a single data set and not in some type of cross validation (which produces multiple potentially different models),
+- only a single curve is shown,
+- and the widget shows the performance line, which indicates the new operating threshold - the one that corresponds to the point at which the line touches the curve.
+
 Example
 -------
 
-At the moment, the only widget which gives the right type of signal needed by the **ROC Analysis** is [Test & Score](../evaluate/testandscore.md). Below, we compare two classifiers, namely [Tree](../model/tree.md) and [Naive Bayes](../model/naivebayes.md), in **Test\&Score** and then compare their performance in **ROC Analysis**, [Life Curve](../evaluate/liftcurve.md) and [Calibration Plot](../evaluate/calibrationplot.md).
+At the moment, the only widget which gives the right type of signal needed by the **ROC Analysis** is [Test & Score](../evaluate/testandscore.md). Below, we compare two classifiers, namely [Tree](../model/tree.md) and [Naive Bayes](../model/naivebayes.md), in **Test\&Score** and then compare their performance in **ROC Analysis**, [Life Curve](../evaluate/performancecurve.md) and [Calibration Plot](../evaluate/calibrationplot.md).
 
 ![](images/ROCAnalysis-example.png)

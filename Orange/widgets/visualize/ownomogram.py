@@ -12,13 +12,14 @@ from AnyQt.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsItem, QGraphicsSimpleTextItem,
     QGraphicsTextItem, QGraphicsLineItem, QGraphicsWidget, QGraphicsRectItem,
     QGraphicsEllipseItem, QGraphicsLinearLayout, QGridLayout, QLabel, QFrame,
-    QSizePolicy
+    QSizePolicy, QFormLayout
 )
-from AnyQt.QtGui import QColor, QPainter, QFont, QPen, QBrush
+from AnyQt.QtGui import QColor, QPainter, QFont, QPen, QBrush, QFontMetrics
 from AnyQt.QtCore import Qt, QRectF, QSize, QPropertyAnimation, QObject, \
     pyqtProperty
 
-from Orange.data import Table, Domain, DiscreteVariable, ContinuousVariable
+from Orange.data import Table, Domain, DiscreteVariable, ContinuousVariable, \
+    Variable
 from Orange.statistics.util import nanmin, nanmax, nanmean, unique
 from Orange.classification import Model
 from Orange.classification.naive_bayes import NaiveBayesModel
@@ -40,7 +41,7 @@ class SortBy(IntEnum):
 
     @staticmethod
     def items():
-        return ["No sorting", "Name", "Absolute importance",
+        return ["Original order", "Alphabetically", "Absolute importance",
                 "Positive influence", "Negative influence"]
 
 
@@ -301,7 +302,6 @@ class GraphicsColorAnimator(QObject):
         for item in self.__items:
             item.unhookOnMousePress()
         self.__items = []
-
 
 
 class ContinuousItemMixin:
@@ -651,7 +651,7 @@ class OWNomogram(OWWidget):
                   " and Logistic Regression Classifiers."
     icon = "icons/Nomogram.svg"
     priority = 2000
-    keywords = []
+    keywords = "nomogram"
 
     class Inputs:
         classifier = Input("Classifier", Model)
@@ -674,7 +674,7 @@ class OWNomogram(OWWidget):
     sort_index = Setting(SortBy.ABSOLUTE)
     cont_feature_dim_index = Setting(0)
 
-    graph_name = "scene"
+    graph_name = "scene"  # QGraphicsScene
 
     class Error(OWWidget.Error):
         invalid_classifier = Msg("Nomogram accepts only Naive Bayes and "
@@ -704,45 +704,70 @@ class OWNomogram(OWWidget):
         self.repaint = False
 
         # GUI
-        box = gui.vBox(self.controlArea, "Target class")
+        lab_align = QFormLayout().labelAlignment()
+
+        grid = QGridLayout()
+        grid.setColumnStretch(1, 1)
+        gui.widgetBox(self.controlArea, True, orientation=grid)
         self.class_combo = gui.comboBox(
-            box, self, "target_class_index", callback=self._class_combo_changed,
-            contentsLength=12, searchable=True)
+            None, self, "target_class_index",
+            callback=self._class_combo_changed,
+            sizePolicy=(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed),
+            searchable=True)
+        grid.addWidget(QLabel("Target class: "), 0, 0, lab_align)
+        grid.addWidget(self.class_combo, 0, 1)
+
         self.norm_check = gui.checkBox(
-            box, self, "normalize_probabilities", "Normalize probabilities",
+            None, self, "normalize_probabilities", "Normalize probabilities",
             hidden=True, callback=self.update_scene,
             tooltip="For multiclass data 1 vs. all probabilities do not"
                     " sum to 1 and therefore could be normalized.")
+        self.norm_check.setStyleSheet("margin-bottom: 12px")
+        grid.addWidget(self.norm_check, 1, 1)
 
-        self.scale_radio = gui.radioButtons(
-            self.controlArea, self, "scale", ["Point scale", "Log odds ratios"],
-            box="Scale", callback=self.update_scene)
+        group = gui.radioButtons(
+            None, self, "scale", callback=self.update_scene)
+        grid.addWidget(QLabel("Scale: "), 2, 0, lab_align)
+        grid.addWidget(gui.appendRadioButton(
+            group, "Point scale", addToLayout=False), 2, 1)
+        grid.addWidget(gui.appendRadioButton(
+            group, "Log odds ratios", addToLayout=False), 3, 1)
 
-        box = gui.vBox(self.controlArea, "Display features")
         grid = QGridLayout()
-        radio_group = gui.radioButtonsInBox(
-            box, self, "display_index", [], orientation=grid,
-            callback=self.update_scene)
-        radio_all = gui.appendRadioButton(
-            radio_group, "All", addToLayout=False)
-        radio_best = gui.appendRadioButton(
-            radio_group, "Best ranked:", addToLayout=False)
-        spin_box = gui.hBox(None, margin=0)
-        self.n_spin = gui.spin(
-            spin_box, self, "n_attributes", 1, self.MAX_N_ATTRS, label=" ",
-            controlWidth=60, callback=self._n_spin_changed)
-        grid.addWidget(radio_all, 1, 1)
-        grid.addWidget(radio_best, 2, 1)
-        grid.addWidget(spin_box, 2, 2)
+        gui.widgetBox(self.controlArea, "Displayed features", orientation=grid)
 
         self.sort_combo = gui.comboBox(
-            box, self, "sort_index", label="Rank by:", items=SortBy.items(),
-            orientation=Qt.Horizontal, callback=self.update_scene)
+            None, self, "sort_index", items=SortBy.items(),
+            callback=self.update_scene,
+            sizePolicy=(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
+        )
+        grid.addWidget(QLabel("Order: "), 0, 0, lab_align)
+        grid.addWidget(self.sort_combo, 0, 1, 1, 2)
+
+        radio_group = gui.radioButtons(
+            None, self, "display_index", callback=self.update_scene)
+        radio_all = gui.appendRadioButton(
+            radio_group, "All features", addToLayout=False)
+        radio_best = gui.appendRadioButton(
+            radio_group, "Best ranked:", addToLayout=False)
+        self.n_spin = gui.spin(
+            None, self, "n_attributes", 1, self.MAX_N_ATTRS,
+            callback=self._n_spin_changed, alignment=Qt.AlignRight,
+            sizePolicy=(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
+        )
+        grid.addWidget(QLabel("Show: "), 1, 0, lab_align)
+        grid.addWidget(radio_all, 1, 1, 1, 2)
+        grid.addWidget(radio_best, 2, 1)
+        grid.addWidget(self.n_spin, 2, 2, Qt.AlignLeft)
 
         self.cont_feature_dim_combo = gui.comboBox(
-            box, self, "cont_feature_dim_index", label="Numeric features: ",
+            None, self, "cont_feature_dim_index", label="Numeric features:",
             items=["1D projection", "2D curve"], orientation=Qt.Horizontal,
-            callback=self.update_scene)
+            callback=self.update_scene,
+            sizePolicy=(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed))
+        grid.setRowMinimumHeight(3, 12)
+        grid.addWidget(self.cont_feature_dim_combo.box, 4, 0, 1, 3)
+
 
         gui.rubber(self.controlArea)
 
@@ -784,7 +809,7 @@ class OWNomogram(OWWidget):
                 return self._is_resizing
 
             def sizeHint(self):
-                return QSize(400, 200)
+                return QSize(500, 200)
 
         class FixedSizeGraphicsView(_GraphicsView):
             def __init__(self, scene, parent):
@@ -910,8 +935,7 @@ class OWNomogram(OWWidget):
         if not isinstance(self.classifier, LogisticRegressionClassifier):
             return
 
-        self.domain = self.reconstruct_domain(self.classifier.original_domain,
-                                              self.domain)
+        self.domain = self.reconstruct_domain(self.classifier, self.domain)
         self.data = self.classifier.original_data.transform(self.domain)
         attrs, ranges, start = self.domain.attributes, [], 0
         for attr in attrs:
@@ -936,7 +960,7 @@ class OWNomogram(OWWidget):
                 coef = self.log_reg_coeffs[i]
                 self.log_reg_coeffs[i] = np.hstack((coef * min_t, coef * max_t))
                 self.log_reg_cont_data_extremes.append(
-                    [sorted([min_t, max_t], reverse=(c < 0)) for c in coef.flat])
+                    [sorted([min_t, max_t], reverse=bool(c < 0)) for c in coef.flat])
             else:
                 self.log_reg_cont_data_extremes.append([None])
 
@@ -950,11 +974,20 @@ class OWNomogram(OWWidget):
         attr_inds, attributes = zip(*self.get_ordered_attributes()[:n_attrs])
         self.Outputs.features.send(AttributeList(attributes))
 
-        name_items = [QGraphicsTextItem(attr.name) for attr in attributes]
         point_text = QGraphicsTextItem("Points")
+        metric = QFontMetrics(point_text.font())
+
+        def text_item(text):
+            elided_text = metric.elidedText(text, Qt.ElideRight, 200)
+            item = QGraphicsTextItem(elided_text)
+            item.setToolTip(text)
+            return item
+
+        name_items = [text_item(attr.name) for attr in attributes]
+
         probs_text = QGraphicsTextItem("Probabilities (%)")
         all_items = name_items + [point_text, probs_text]
-        name_offset = -max(t.boundingRect().width() for t in all_items) - 10
+        name_offset = -max(t.boundingRect().width() for t in all_items) - 30
         w = self.view.viewport().rect().width()
         max_width = w + name_offset - 30
 
@@ -1273,18 +1306,28 @@ class OWNomogram(OWWidget):
         self.report_plot()
 
     @staticmethod
-    def reconstruct_domain(original, preprocessed):
+    def reconstruct_domain(classifier: Model, preprocessed: Domain) -> Domain:
         # abuse dict to make "in" comparisons faster
+        original = classifier.original_domain
         attrs = OrderedDict()
         for attr in preprocessed.attributes:
             cv = attr._compute_value.variable._compute_value
-            var = cv.variable if cv else original[attr.name]
+            if cv and isinstance(getattr(cv, "variable", None), Variable):
+                var = cv.variable
+            else:
+                var = original[attr.name]
             var = original[var.name] if var.name in original else attr
             if var in attrs:    # the reason for OrderedDict
                 continue
             attrs[var] = None   # we only need keys
         attrs = list(attrs.keys())
-        return Domain(attrs, original.class_var, original.metas)
+
+        orig_clv = original.class_var
+        orig_data = classifier.original_data
+        values = (orig_clv.values[int(i)]
+                  for i in np.unique(orig_data.get_column(orig_clv)))
+        class_var = DiscreteVariable(original.class_var.name, values)
+        return Domain(attrs, class_var, original.metas)
 
     @staticmethod
     def get_ruler_values(start, stop, max_width, round_to_nearest=True):

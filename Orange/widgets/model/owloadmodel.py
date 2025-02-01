@@ -3,26 +3,27 @@ import pickle
 from typing import Any, Dict
 
 from AnyQt.QtWidgets import QSizePolicy, QStyle, QFileDialog
-from AnyQt.QtCore import QTimer
+from AnyQt.QtCore import QTimer, QUrl
 
 from orangewidget.workflow.drophandler import SingleFileDropHandler
 
 from Orange.base import Model
 from Orange.widgets import widget, gui
 from Orange.widgets.model import owsavemodel
-from Orange.widgets.utils.filedialogs import RecentPathsWComboMixin, RecentPath
+from Orange.widgets.utils.filedialogs import RecentPathsWComboMixin, RecentPath, \
+    stored_recent_paths_prepend, OWUrlDropBase
 from Orange.widgets.utils import stdpaths
 from Orange.widgets.utils.widgetpreview import WidgetPreview
 from Orange.widgets.widget import Msg, Output
 
 
-class OWLoadModel(widget.OWWidget, RecentPathsWComboMixin):
+class OWLoadModel(OWUrlDropBase, RecentPathsWComboMixin):
     name = "Load Model"
     description = "Load a model from an input file."
     priority = 3050
     replaces = ["Orange.widgets.classify.owloadclassifier.OWLoadClassifier"]
     icon = "icons/LoadModel.svg"
-    keywords = ["file", "open", "model"]
+    keywords = "load model, file, open, model"
 
     class Outputs:
         model = Output("Model", Model)
@@ -63,7 +64,7 @@ class OWLoadModel(widget.OWWidget, RecentPathsWComboMixin):
     def browse_file(self):
         start_file = self.last_path() or stdpaths.Documents
         filename, _ = QFileDialog.getOpenFileName(
-            self, 'Open Distance File', start_file, self.FILTER)
+            self, 'Open Model File', start_file, self.FILTER)
         if not filename:
             return
         self.add_path(filename)
@@ -90,6 +91,17 @@ class OWLoadModel(widget.OWWidget, RecentPathsWComboMixin):
         else:
             self.Outputs.model.send(model)
 
+    def canDropUrl(self, url: QUrl) -> bool:
+        if url.isLocalFile():
+            return OWLoadModelDropHandler().canDropFile(url.toLocalFile())
+        else:
+            return False
+
+    def handleDroppedUrl(self, url: QUrl) -> None:
+        if url.isLocalFile():
+            self.add_path(url.toLocalFile())
+            self.open_file()
+
 
 class OWLoadModelDropHandler(SingleFileDropHandler):
     WIDGET = OWLoadModel
@@ -100,8 +112,7 @@ class OWLoadModelDropHandler(SingleFileDropHandler):
     def parametersFromFile(self, path: str) -> Dict[str, Any]:
         r = RecentPath(os.path.abspath(path), None, None,
                        os.path.basename(path))
-        parameters = {"recent_paths": [r]}
-        return parameters
+        return {"recent_paths": stored_recent_paths_prepend(self.WIDGET, r)}
 
 
 if __name__ == "__main__":  # pragma: no cover

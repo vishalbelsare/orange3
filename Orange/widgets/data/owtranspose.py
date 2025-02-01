@@ -37,8 +37,8 @@ class OWTranspose(OWWidget, ConcurrentWidgetMixin):
     description = "Transpose data table."
     category = "Transform"
     icon = "icons/Transpose.svg"
-    priority = 2000
-    keywords = []
+    priority = 110
+    keywords = "transpose"
 
     class Inputs:
         data = Input("Data", Table)
@@ -140,7 +140,7 @@ class OWTranspose(OWWidget, ConcurrentWidgetMixin):
         variable = self.feature_type == self.FROM_VAR and \
             self.feature_names_column
         if variable and self.data:
-            names = self.data.get_column_view(variable)[0]
+            names = self.data.get_column(variable)
             if len(names) != len(set(names)):
                 self.Warning.duplicate_names(variable)
         if self.data and self.data.domain.has_discrete_attributes():

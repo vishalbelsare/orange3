@@ -4,6 +4,7 @@ from unittest.mock import Mock
 import numpy as np
 
 from AnyQt.QtCore import QItemSelectionModel
+from AnyQt.QtTest import QSignalSpy
 
 from Orange.data import Table, Domain, DiscreteVariable, ContinuousVariable
 from Orange.widgets.settings import Context
@@ -13,9 +14,9 @@ from Orange.widgets.tests.base import (
 )
 from Orange.widgets.tests.utils import simulate
 from Orange.widgets.visualize.owlinearprojection import (
-    OWLinearProjection, LinearProjectionVizRank, Placement
+    OWLinearProjection, Placement
 )
-from Orange.widgets.visualize.utils import run_vizrank
+from Orange.widgets.visualize.utils.vizrank import RunState
 
 
 class TestOWLinearProjection(WidgetTest, AnchorProjectionWidgetTestMixin,
@@ -25,7 +26,7 @@ class TestOWLinearProjection(WidgetTest, AnchorProjectionWidgetTestMixin,
         super().setUpClass()
         WidgetOutputsTestMixin.init(cls)
 
-        cls.signal_name = "Data"
+        cls.signal_name = OWLinearProjection.Inputs.data
         cls.signal_data = cls.data
         cls.same_input_output_domain = False
 
@@ -59,9 +60,9 @@ class TestOWLinearProjection(WidgetTest, AnchorProjectionWidgetTestMixin,
                     self.widget.controls.attr_color.model():
                 self.widget.attr_color = data.domain.class_var
             if self.widget.btn_vizrank.isEnabled():
-                vizrank = LinearProjectionVizRank(self.widget)
-                states = [state for state in vizrank.iterate_states(None)]
-                self.assertIsNotNone(vizrank.compute_score(states[0]))
+                vizrank = self.widget.vizrank_dialog
+                self.assertIsNotNone(
+                    vizrank.compute_score(next(vizrank.state_generator())))
 
         check_vizrank(self.data)
         check_vizrank(self.data[:, :3])
@@ -85,9 +86,24 @@ class TestOWLinearProjection(WidgetTest, AnchorProjectionWidgetTestMixin,
         self.send_signal(self.widget.Inputs.data, self.data)
         self.widget.radio_placement.buttons[Placement.LDA].click()
         self.assertTrue(buttons[Placement.LDA].isEnabled())
+        output = self.get_output(self.widget.Outputs.components)
+        self.assertTrue(output and len(output) == 2)
         self.send_signal(self.widget.Inputs.data, Table("housing"))
         self.assertFalse(buttons[Placement.LDA].isEnabled())
         self.send_signal(self.widget.Inputs.data, None)
+        self.assertTrue(buttons[Placement.LDA].isEnabled())
+
+    def test_lda_not_enough_distinct(self):
+        buttons = self.widget.radio_placement.buttons
+        self.send_signal(self.widget.Inputs.data, self.data)
+        self.assertTrue(buttons[Placement.LDA].isEnabled())
+        self.send_signal(self.widget.Inputs.data, self.data[:10])
+        self.assertFalse(buttons[Placement.LDA].isEnabled())
+        self.send_signal(self.widget.Inputs.data, None)
+        self.assertTrue(buttons[Placement.LDA].isEnabled())
+        self.send_signal(self.widget.Inputs.data, self.data[40:60])
+        self.assertFalse(buttons[Placement.LDA].isEnabled())
+        self.send_signal(self.widget.Inputs.data, self.data[40:110])
         self.assertTrue(buttons[Placement.LDA].isEnabled())
 
     def test_data_no_cont_features(self):
@@ -211,30 +227,32 @@ class LinProjVizRankTests(WidgetTest):
 
     def setUp(self):
         self.widget = self.create_widget(OWLinearProjection)
-        self.vizrank = self.widget.vizrank
+
+    def tearDown(self):
+        self.widget.onDeleteWidget()
+        super().tearDown()
 
     def test_discrete_class(self):
         self.send_signal(self.widget.Inputs.data, self.data)
-        run_vizrank(self.vizrank.compute_score,
-                    self.vizrank.iterate_states, None,
-                    [], 0, self.vizrank.state_count(), Mock())
+        self.widget.vizrank_button().click()
 
     def test_continuous_class(self):
         data = Table("housing")[::100]
         self.send_signal(self.widget.Inputs.data, data)
-        run_vizrank(self.vizrank.compute_score,
-                    self.vizrank.iterate_states, None,
-                    [], 0, self.vizrank.state_count(), Mock())
+        self.widget.vizrank_button().click()
 
     def test_set_attrs(self):
         self.send_signal(self.widget.Inputs.data, self.data)
+        vizrank = self.widget.vizrank_dialog
         prev_selected = self.widget.selected_vars[:]
         c1 = self.get_output(self.widget.Outputs.components)
-        self.vizrank.toggle()
-        self.process_events(until=lambda: not self.vizrank.keep_running)
-        self.assertEqual(len(self.vizrank.scores), self.vizrank.state_count())
-        self.vizrank.rank_table.selectionModel().select(
-            self.vizrank.rank_model.item(0, 0).index(),
+        spy = QSignalSpy(self.widget.vizrankRunStateChanged)
+        self.widget.vizrank_button().click()
+        while spy.wait() and spy[-1][0] != RunState.Done:
+            pass
+        self.assertEqual(len(vizrank.scores), vizrank.state_count())
+        vizrank.rank_table.selectionModel().select(
+            vizrank.rank_model.item(0, 0).index(),
             QItemSelectionModel.ClearAndSelect
         )
         self.assertNotEqual(self.widget.selected_vars, prev_selected)

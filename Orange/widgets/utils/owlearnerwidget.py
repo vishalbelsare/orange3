@@ -234,7 +234,7 @@ class OWBaseLearner(OWWidget, metaclass=OWBaseLearnerMeta, openclass=True):
             except BaseException as exc:
                 self.show_fitting_failed(exc)
             else:
-                self.model.name = self.learner_name or self.captionTitle
+                self.model.name = self.effective_learner_name()
                 self.model.instances = self.data
         self._send_model()
 
@@ -246,8 +246,10 @@ class OWBaseLearner(OWWidget, metaclass=OWBaseLearnerMeta, openclass=True):
         self.Error.sparse_not_supported.clear()
         if self.data is not None and self.learner is not None:
             self.Error.data_error.clear()
-            if not self.learner.check_learner_adequacy(self.data.domain):
-                self.Error.data_error(self.learner.learner_adequacy_err_msg)
+
+            reason = self.learner.incompatibility_reason(self.data.domain)
+            if reason is not None:
+                self.Error.data_error(reason)
             elif not len(self.data):
                 self.Error.data_error("Dataset is empty.")
             elif len(ut.unique(self.data.Y)) < 2:
@@ -258,6 +260,7 @@ class OWBaseLearner(OWWidget, metaclass=OWBaseLearnerMeta, openclass=True):
                 self.Error.sparse_not_supported()
             else:
                 self.valid_data = True
+
         return self.valid_data
 
     def settings_changed(self, *args, **kwargs):
